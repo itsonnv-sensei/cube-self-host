@@ -1,0 +1,10 @@
+{
+  "version": "1.8.34",
+  "npmClient": "yarn",
+  "command": {
+    "version": {
+      "allowBranch": ["master", "lts/*", "release/*"]
+    }
+  },
+  "$schema": "node_modules/lerna/schemas/lerna-schema.json"
+}

@@ -1,0 +1,180 @@
+use super::super::context::PushDownBuilderContext;
+use super::super::{LogicalNodeProcessor, ProcessableNode};
+use crate::logical_plan::MultiStageTimeSeries;
+use crate::physical_plan::{
+    CalendarPeriodSource, QueryPlan, TimeSeries, TimeSeriesDateRange, TimeSeriesSource,
+};
+use crate::physical_plan_builder::PhysicalPlanBuilder;
+use crate::planner::query_tools::QueryTools;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::QueryDateTimeHelper;
+use chrono_tz::Tz;
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+pub struct MultiStageTimeSeriesProcessor<'a> {
+    builder: &'a PhysicalPlanBuilder,
+}
+
+impl<'a> LogicalNodeProcessor<'a, MultiStageTimeSeries> for MultiStageTimeSeriesProcessor<'a> {
+    type PhysycalNode = QueryPlan;
+    fn new(builder: &'a PhysicalPlanBuilder) -> Self {
+        Self { builder }
+    }
+
+    fn process(
+        &self,
+        time_series: &MultiStageTimeSeries,
+        context: &PushDownBuilderContext,
+    ) -> Result<Self::PhysycalNode, CubeError> {
+        let (query_tools, plan_sql_templates) = self.builder.qtools_and_templates();
+        let time_dimension = time_series.time_dimension().clone();
+        let time_dimension_symbol = time_dimension.as_time_dimension()?;
+        let date_range = time_series.date_range().clone();
+        let granularity_obj = if let Some(granularity_obj) = time_dimension_symbol.granularity_obj()
+        {
+            granularity_obj.clone()
+        } else {
+            return Err(CubeError::user(
+                "Time dimension granularity is required for rolling window".to_string(),
+            ));
+        };
+
+        if let Some(calendar_source) = time_series.calendar_source() {
+            let source = self
+                .builder
+                .process_node(calendar_source.as_ref(), context)?;
+            let schema = source.schema();
+            let date_from_alias = schema.resolve_member_alias(&time_dimension);
+            let period_aliases = time_series
+                .period_dimensions()
+                .iter()
+                .map(|dimension| {
+                    let Some(granularity) = dimension.as_time_dimension()?.granularity().clone()
+                    else {
+                        return Err(CubeError::internal(format!(
+                            "Calendar period dimension '{}' must have a granularity",
+                            dimension.full_name()
+                        )));
+                    };
+                    Ok((granularity, schema.resolve_member_alias(dimension)))
+                })
+                .collect::<Result<Vec<_>, CubeError>>()?;
+
+            // Taken raw: the aligned range snaps its start to the granularity's
+            // interval, which for a calendar period means an arbitrary point
+            // inside the period the range opens in.
+            let range = if let Some(date_range) = &date_range {
+                if date_range.len() != 2 {
+                    return Err(CubeError::user(format!(
+                        "Invalid date range: {:?}",
+                        date_range
+                    )));
+                }
+                filter_range(
+                    query_tools,
+                    plan_sql_templates,
+                    &date_range[0],
+                    &date_range[1],
+                )?
+            } else if let Some(date_range_cte) = time_series.get_date_range_multistage_ref() {
+                TimeSeriesDateRange::Generated(date_range_cte.name().clone())
+            } else {
+                return Err(CubeError::internal(
+                    "Date range cte is required for time series without date range".to_string(),
+                ));
+            };
+
+            let time_series = TimeSeries::new(
+                time_series.name().clone(),
+                &time_dimension,
+                TimeSeriesSource::Calendar(CalendarPeriodSource::new(
+                    Rc::new(QueryPlan::Select(source)),
+                    date_from_alias,
+                    period_aliases,
+                    range,
+                )),
+                granularity_obj,
+            );
+            return Ok(QueryPlan::TimeSeries(Rc::new(time_series)));
+        }
+
+        let ts_date_range = if plan_sql_templates
+            .supports_generated_time_series(granularity_obj.is_predefined_granularity())?
+        {
+            if let Some(date_range) = time_dimension_symbol
+                .get_range_for_time_series(date_range, query_tools.timezone())?
+            {
+                filter_range(
+                    query_tools,
+                    plan_sql_templates,
+                    &date_range.0,
+                    &date_range.1,
+                )?
+            } else {
+                if let Some(date_range_cte) = time_series.get_date_range_multistage_ref() {
+                    TimeSeriesDateRange::Generated(date_range_cte.name().clone())
+                } else {
+                    return Err(CubeError::internal(
+                        "Date range cte is required for time series without date range".to_string(),
+                    ));
+                }
+            }
+        } else {
+            if let Some(date_range) = time_series.date_range() {
+                filter_range(
+                    query_tools,
+                    plan_sql_templates,
+                    &date_range[0],
+                    &date_range[1],
+                )?
+            } else {
+                return Err(CubeError::user(
+                    "Date range is required for time series".to_string(),
+                ));
+            }
+        };
+
+        let time_series = TimeSeries::new(
+            time_series.name().clone(),
+            &time_dimension,
+            TimeSeriesSource::Range(ts_date_range),
+            granularity_obj,
+        );
+        let query_plan = QueryPlan::TimeSeries(Rc::new(time_series));
+        Ok(query_plan)
+    }
+}
+
+/// Partition range placeholders are substituted in the bound params only, so
+/// the series must read its bounds from params rather than from SQL literals.
+fn filter_range(
+    query_tools: &Rc<QueryTools>,
+    templates: &PlanSqlTemplates,
+    from: &str,
+    to: &str,
+) -> Result<TimeSeriesDateRange, CubeError> {
+    if !QueryDateTimeHelper::is_partition_range(from)
+        && !QueryDateTimeHelper::is_partition_range(to)
+    {
+        return Ok(TimeSeriesDateRange::Filter(
+            from.to_string(),
+            to.to_string(),
+        ));
+    }
+    // The orchestrator binds the partition range converted to UTC, while the
+    // series is laid out in the query's time zone.
+    let bound = |value: &str| -> Result<String, CubeError> {
+        let param = query_tools.allocate_param(value);
+        if query_tools.timezone() == Tz::UTC {
+            Ok(param)
+        } else {
+            templates.convert_tz(templates.time_stamp_cast(param)?)
+        }
+    };
+    Ok(TimeSeriesDateRange::Params(bound(from)?, bound(to)?))
+}
+
+impl ProcessableNode for MultiStageTimeSeries {
+    type ProcessorType<'a> = MultiStageTimeSeriesProcessor<'a>;
+}

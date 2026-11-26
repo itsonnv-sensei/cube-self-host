@@ -1,0 +1,2396 @@
+/* eslint-disable no-restricted-syntax */
+import { get } from 'env-var';
+import { displayCLIWarning, displayCLIWarningOnce } from './cli';
+import { isNativeSupported } from './platform';
+import { canonicalTimezone } from './timezone';
+
+export class InvalidConfiguration extends Error {
+  public constructor(key: string, value: any, description: string) {
+    super(`Value "${value}" is not valid for ${key}. ${description}`);
+  }
+}
+
+export function convertTimeStrToSeconds(
+  input: string,
+  envName: string,
+  description: string = 'Must be a number in seconds or duration string (1s, 1m, 1h).',
+) {
+  if (/^\d+$/.test(input)) {
+    return parseInt(input, 10);
+  }
+
+  if (input.length > 1) {
+    // eslint-disable-next-line default-case
+    switch (input.slice(-1).toLowerCase()) {
+      case 'h':
+        return parseInt(input.slice(0, -1), 10) * 60 * 60;
+      case 'm':
+        return parseInt(input.slice(0, -1), 10) * 60;
+      case 's':
+        return parseInt(input.slice(0, -1), 10);
+    }
+  }
+
+  throw new InvalidConfiguration(envName, input, description);
+}
+
+export function convertSizeToBytes(
+  input: string,
+  envName: string,
+  description: string = 'Must be a number in bytes or size string (1kb, 1mb, 1gb).',
+): number {
+  if (/^\d+$/.test(input)) {
+    return parseInt(input, 10);
+  }
+
+  if (input.length > 2) {
+    switch (input.slice(-2).toLowerCase()) {
+      case 'kb':
+        return parseInt(input.slice(0, -2), 10) * 1024;
+      case 'mb':
+        return parseInt(input.slice(0, -2), 10) * 1024 * 1024;
+      case 'gb':
+        return parseInt(input.slice(0, -2), 10) * 1024 * 1024 * 1024;
+      default: {
+        throw new InvalidConfiguration(envName, input, description);
+      }
+    }
+  }
+
+  throw new InvalidConfiguration(envName, input, description);
+}
+
+export function asPortNumber(input: number, envName: string) {
+  if (input < 0) {
+    throw new InvalidConfiguration(envName, input, 'Should be a positive integer.');
+  }
+
+  if (input > 65535) {
+    throw new InvalidConfiguration(envName, input, 'Should be lower or equal than 65535.');
+  }
+
+  return input;
+}
+
+/**
+ * Determines whether multiple data sources were declared or not.
+ */
+function isMultipleDataSources(): boolean {
+  // eslint-disable-next-line no-use-before-define
+  return getEnv('dataSources').length > 0;
+}
+
+/**
+ * Returns the specified data source if assertions are passed, throws
+ * an error otherwise.
+ * @param dataSource The data source to assert.
+ */
+export function assertDataSource(dataSource = 'default'): string {
+  if (!isMultipleDataSources()) {
+    return dataSource;
+    // eslint-disable-next-line no-use-before-define
+  } else if (getEnv('dataSources').indexOf(dataSource) >= 0) {
+    return dataSource;
+  } else {
+    throw new Error(
+      `The ${
+        dataSource
+      } data source is missing in the declared CUBEJS_DATASOURCES.`
+    );
+  }
+}
+
+/**
+ * Returns data source specific environment variable name.
+ */
+export function keyByDataSource(origin: string, dataSource?: string, preAggregations?: boolean): string {
+  if (dataSource) {
+    assertDataSource(dataSource);
+  }
+
+  let key: string;
+
+  if (!isMultipleDataSources() || dataSource === 'default' || !dataSource) {
+    key = origin;
+  } else {
+    const s = origin.split('CUBEJS_');
+    if (s.length === 2) {
+      key = `CUBEJS_DS_${dataSource.toUpperCase()}_${s[1]}`;
+    } else {
+      throw new Error(
+        `The ${
+          origin
+        } environment variable can not be converted for the ${
+          dataSource
+        } data source.`
+      );
+    }
+  }
+
+  if (preAggregations) {
+    const dsMatch = key.match(/^(CUBEJS_DS_[A-Z0-9_]+?_)(DB_|JDBC_|AWS_|DATABASE|FIREBOLT_)(.*)/);
+    if (dsMatch) {
+      return `${dsMatch[1]}PRE_AGGREGATIONS_${dsMatch[2]}${dsMatch[3]}`;
+    }
+
+    if (key.startsWith('CUBEJS_')) {
+      return key.replace(/^CUBEJS_/, 'CUBEJS_PRE_AGGREGATIONS_');
+    }
+  }
+
+  return key;
+}
+
+type DataSourceOpts = { dataSource: string, preAggregations?: boolean };
+
+/**
+ * Checks if at least one PRE_AGGREGATIONS env var is set for a given data source.
+ */
+export function hasPreAggregationsEnvVars(dataSource: string = 'default'): boolean {
+  if (dataSource === 'default') {
+    /**
+     * Non-credential env vars that share the CUBEJS_PRE_AGGREGATIONS_ prefix
+     * but should NOT trigger separate pre-aggregation credentials.
+     */
+    const PRE_AGGREGATIONS_NON_CREDENTIAL_KEYS = new Set([
+      'CUBEJS_PRE_AGGREGATIONS_SCHEMA',
+      'CUBEJS_PRE_AGGREGATIONS_BUILDER',
+      'CUBEJS_PRE_AGGREGATIONS_BACKOFF_MAX_TIME',
+      'CUBEJS_PRE_AGGREGATIONS_ALLOW_NON_STRICT_DATE_RANGE_MATCH',
+    ]);
+
+    for (const key of Object.keys(process.env)) {
+      if (key.startsWith('CUBEJS_PRE_AGGREGATIONS_') && !PRE_AGGREGATIONS_NON_CREDENTIAL_KEYS.has(key)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  for (const key of Object.keys(process.env)) {
+    if (key.startsWith(`CUBEJS_DS_${dataSource.toUpperCase()}_PRE_AGGREGATIONS_`)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function asPortOrSocket(input: string, envName: string): number | string {
+  if (/^-?\d+$/.test(input)) {
+    return asPortNumber(parseInt(input, 10), envName);
+  }
+
+  // @todo Can we check that path for socket is valid?
+  return input;
+}
+
+function asFalseOrPort(input: string, envName: string): number | false {
+  if (input.toLowerCase() === 'false' || input === '0' || input === undefined) {
+    return false;
+  }
+
+  return asPortNumber(parseInt(input, 10), envName);
+}
+
+function asBoolOrTime(input: string, envName: string): number | boolean {
+  if (input.toLowerCase() === 'true') {
+    return true;
+  }
+
+  if (input.toLowerCase() === 'false' || input === '0') {
+    return false;
+  }
+
+  return convertTimeStrToSeconds(
+    input,
+    envName,
+    'Should be boolean or number (in seconds) or string in time format (1s, 1m, 1h)'
+  );
+}
+
+let devModeResolvedByCaller = false;
+
+/**
+ * Without this the deprecation warning below fires on every dev server run, telling a
+ * user already in development mode to turn development mode on.
+ */
+export const markDevModeResolvedByCaller = () => {
+  devModeResolvedByCaller = true;
+};
+
+let pinnedPreAggregationsSchema: string | undefined;
+// Which instances hold it, not how many: a drop has to be able to invalidate the shares
+// it drops, or one taken before it is later spent against the pin taken after
+const pinnedPreAggregationsSchemaHolders = new Set<symbol>();
+
+/**
+ * Drops the pin outright, whatever is still holding it, which is what a reload of the
+ * whole process wants. To give up one instance's share, release that share instead.
+ */
+export const dropPreAggregationsSchemaPin = () => {
+  // Only what this process pinned. A value the user set outlives any reload
+  if (
+    pinnedPreAggregationsSchema !== undefined &&
+    process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA === pinnedPreAggregationsSchema
+  ) {
+    delete process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA;
+  }
+
+  pinnedPreAggregationsSchema = undefined;
+  pinnedPreAggregationsSchemaHolders.clear();
+};
+
+/**
+ * Gives up the share `pinPreAggregationsSchema` returned. Without it the next instance's
+ * drivers stay on the schema the previous one resolved. A share a drop already
+ * invalidated is unknown here and releases nothing, so it cannot spend a later pin's.
+ */
+export const releasePreAggregationsSchemaPin = (holder: symbol) => {
+  if (!pinnedPreAggregationsSchemaHolders.delete(holder)) {
+    return;
+  }
+
+  if (pinnedPreAggregationsSchemaHolders.size === 0) {
+    dropPreAggregationsSchemaPin();
+  }
+};
+
+/**
+ * A driver cannot see CreateOptions, so it falls back to CUBEJS_DEV_MODE, which both
+ * `devServer` and `preAggregationsSchema` contradict; pinning makes both sides agree.
+ */
+export const pinPreAggregationsSchema = (schema: string): symbol | undefined => {
+  const takeShare = () => {
+    const holder = Symbol('preAggregationsSchemaPin');
+
+    pinnedPreAggregationsSchemaHolders.add(holder);
+
+    return holder;
+  };
+
+  // Falsy, not undefined: every consumer treats an empty value as absent and falls back,
+  // so leaving one in place would be the mismatch this exists to prevent
+  if (!process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA) {
+    process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA = schema;
+    pinnedPreAggregationsSchema = schema;
+
+    return takeShare();
+  }
+
+  // Another instance pinned this same schema, and nothing else records that this one
+  // is relying on it, so the first to shut down would take it from the rest
+  if (
+    process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA === schema &&
+    pinnedPreAggregationsSchema === schema
+  ) {
+    return takeShare();
+  }
+
+  const setSchema = process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA;
+
+  if (setSchema !== schema) {
+    const remedy = pinnedPreAggregationsSchema !== undefined
+      ? 'Run one Cube instance per process, or give both instances the same schema.'
+      : 'Drop either CUBEJS_PRE_AGGREGATIONS_SCHEMA or the preAggregationsSchema option, '
+        + 'so one of them names the schema.';
+
+    // Keyed on the pair, so a third instance naming a third schema is reported
+    // rather than silenced by the second
+    displayCLIWarningOnce(
+      `pre-aggregations-schema-pinned:${setSchema}:${schema}`,
+      `Pre-aggregation schema '${setSchema}' is already set for this process, but this ` +
+      `instance resolved '${schema}'. A Databricks driver with a 'catalog' configured ` +
+      `reads CUBEJS_PRE_AGGREGATIONS_SCHEMA directly and so will qualify its queries ` +
+      `with '${setSchema}'; every other driver follows '${schema}'. ${remedy}`
+    );
+  }
+};
+
+/**
+ * The variable as the user set it: a value this process pinned reads as unset, so a
+ * second instance resolves its own default instead of inheriting the first's. Only
+ * server-core reads this — a driver reads the variable, and cannot tell them apart.
+ */
+export const userPreAggregationsSchema = (): string | undefined => {
+  const schema = process.env.CUBEJS_PRE_AGGREGATIONS_SCHEMA;
+
+  return schema === pinnedPreAggregationsSchema ? undefined : schema;
+};
+
+/**
+ * Development mode is opt-in through CUBEJS_DEV_MODE and off by default.
+ * NODE_ENV is deprecated for this decision and ignored — see DEPRECATION.md.
+ */
+const devMode = () => {
+  const enabled = get('CUBEJS_DEV_MODE')
+    .default('false')
+    .asBoolStrict();
+
+  // No NODE_ENV guard: development mode used to be on when NODE_ENV was unset too,
+  // so that instance is part of the population this warning exists for
+  if (
+    !devModeResolvedByCaller &&
+    process.env.CUBEJS_DEV_MODE === undefined &&
+    process.env.NODE_ENV !== 'production'
+  ) {
+    displayCLIWarningOnce(
+      'NODE_ENV_DEV_MODE',
+      'Development mode used to be on whenever NODE_ENV was not \'production\', including ' +
+      'when NODE_ENV was unset. NODE_ENV is no longer taken into account: development ' +
+      'mode is enabled by CUBEJS_DEV_MODE, or by CreateOptions.devServer when embedding ' +
+      'server-core. If this instance was meant to run in development mode, set ' +
+      'CUBEJS_DEV_MODE=true; otherwise no action is needed.'
+    );
+  }
+
+  return enabled;
+};
+
+const variables: Record<string, (...args: any) => any> = {
+  devMode,
+  logLevel: () => get('CUBEJS_LOG_LEVEL').asString(),
+  // Off in development mode: there the console is the log sink and runnable SQL is wanted.
+  // Callers that resolved dev mode themselves (CreateOptions.devServer beats the env var)
+  // pass it in, so the default cannot disagree with the instance it is describing
+  logRedaction: (resolvedDevMode?: boolean) => get('CUBEJS_LOG_REDACTION')
+    .default((resolvedDevMode ?? devMode()) ? 'false' : 'true')
+    .asBoolStrict(),
+  port: () => asPortOrSocket(process.env.PORT || '4000', 'PORT'),
+  tls: () => get('CUBEJS_ENABLE_TLS')
+    .default('false')
+    .asBoolStrict(),
+  webSockets: () => get('CUBEJS_WEB_SOCKETS')
+    .default('false')
+    .asBoolStrict(),
+  serverHeadersTimeout: () => get('CUBEJS_SERVER_HEADERS_TIMEOUT')
+    .asInt(),
+  serverKeepAliveTimeout: () => get('CUBEJS_SERVER_KEEP_ALIVE_TIMEOUT')
+    .asInt(),
+  maxRequestSize: () => {
+    const value = process.env.CUBEJS_MAX_REQUEST_SIZE || '50mb';
+    const bytes = convertSizeToBytes(value, 'CUBEJS_MAX_REQUEST_SIZE');
+
+    const minBytes = 100 * 1024; // 100kb
+    const maxBytes = 64 * 1024 * 1024; // 64mb
+
+    if (bytes < minBytes || bytes > maxBytes) {
+      throw new InvalidConfiguration(
+        'CUBEJS_MAX_REQUEST_SIZE',
+        value,
+        'Must be between 100kb and 64mb.'
+      );
+    }
+
+    return bytes;
+  },
+  rollupOnlyMode: () => get('CUBEJS_ROLLUP_ONLY')
+    .default('false')
+    .asBoolStrict(),
+  sqlIncludeTraceId: () => get('CUBEJS_SQL_INCLUDE_TRACE_ID')
+    .default('false')
+    .asBoolStrict(),
+  schemaPath: () => get('CUBEJS_SCHEMA_PATH')
+    .default('model')
+    .asString(),
+  /**
+   * Refresh worker mode as set by env, or `undefined` when no env sets it.
+   */
+  refreshWorkerModeExplicit: (): boolean | number | undefined => {
+    const refreshWorkerMode = get('CUBEJS_REFRESH_WORKER').asBool();
+    if (refreshWorkerMode !== undefined) {
+      return refreshWorkerMode;
+    }
+
+    // @deprecated Please use CUBEJS_REFRESH_WORKER
+    const scheduledRefresh = get('CUBEJS_SCHEDULED_REFRESH').asBool();
+    if (scheduledRefresh !== undefined) {
+      return scheduledRefresh;
+    }
+
+    // @deprecated Please use CUBEJS_REFRESH_WORKER
+    if (process.env.CUBEJS_SCHEDULED_REFRESH_TIMER) {
+      return asBoolOrTime(process.env.CUBEJS_SCHEDULED_REFRESH_TIMER, 'CUBEJS_SCHEDULED_REFRESH_TIMER');
+    }
+
+    return undefined;
+  },
+  refreshWorkerMode: () => {
+    // eslint-disable-next-line no-use-before-define
+    const refreshWorkerMode = getEnv('refreshWorkerModeExplicit');
+    if (refreshWorkerMode !== undefined) {
+      return refreshWorkerMode;
+    }
+
+    // Deliberately NOT the dev mode decision: background refresh ran in dev mode too,
+    // so aligning this on getEnv('devMode') would silently stop it for bare instances
+    return process.env.NODE_ENV !== 'production';
+  },
+  // When set, a numeric `scheduledRefreshTimer` from the config only sets the
+  // refresh interval: the refresh worker runs only when an env enables it
+  scheduledRefreshTimerIntervalOnly: () => get('CUBEJS_SCHEDULED_REFRESH_TIMER_INTERVAL_ONLY')
+    .default('false')
+    .asBoolStrict(),
+  scheduledRefreshQueriesPerAppId: () => get('CUBEJS_SCHEDULED_REFRESH_QUERIES_PER_APP_ID').asIntPositive(),
+  refreshWorkerConcurrency: () => get('CUBEJS_REFRESH_WORKER_CONCURRENCY')
+    .asIntPositive(),
+  scheduledRefreshTimezones: () => {
+    const timezones = get('CUBEJS_SCHEDULED_REFRESH_TIMEZONES')
+      .default('')
+      .asArray()
+      .map(timezone => timezone.trim())
+      .filter(Boolean);
+
+    return timezones.map(raw => {
+      const timezone = canonicalTimezone(raw);
+      if (!timezone) {
+        throw new InvalidConfiguration(
+          'CUBEJS_SCHEDULED_REFRESH_TIMEZONES',
+          raw,
+          'Must be a comma-separated list of valid IANA time zone names, e.g. UTC,America/Los_Angeles.'
+        );
+      }
+
+      return timezone;
+    });
+  },
+  preAggregationsBuilder: () => get('CUBEJS_PRE_AGGREGATIONS_BUILDER').asBool(),
+  /**
+   * Use `contextToCubeStoreRouterId` as the default `contextToPreAggregationOrchestratorId`,
+   * so orchestrators routed to one Cube Store share its pre-aggregation queues and caches.
+   */
+  preAggregationsOrchestratorIdFromRouter: () => get('CUBEJS_PRE_AGGREGATIONS_ORCHESTRATOR_ID_FROM_ROUTER')
+    .default('false')
+    .asBoolStrict(),
+  gracefulShutdown: () => get('CUBEJS_GRACEFUL_SHUTDOWN')
+    .asIntPositive(),
+  dockerImageVersion: () => get('CUBEJS_DOCKER_IMAGE_VERSION')
+    .asString(),
+  concurrency: ({
+    dataSource,
+  }: {
+    dataSource: string,
+  }) => get(keyByDataSource('CUBEJS_CONCURRENCY', dataSource)).asInt(),
+  // It's only excepted for CI, nothing else.
+  internalExceptions: () => get('INTERNAL_EXCEPTIONS_YOU_WILL_BE_FIRED')
+    .default('false')
+    .asEnum(['exit', 'log', 'false']),
+  preAggregationsSchema: () => get('CUBEJS_PRE_AGGREGATIONS_SCHEMA')
+    .asString(),
+  maxPartitionsPerCube: () => get('CUBEJS_MAX_PARTITIONS_PER_CUBE')
+    .default('10000')
+    .asInt(),
+  scheduledRefreshBatchSize: () => get('CUBEJS_SCHEDULED_REFRESH_BATCH_SIZE')
+    .default('1')
+    .asInt(),
+  /**
+   * Maximum number of compiled data models to keep in the in-memory compiler cache.
+   */
+  compilerCacheSize: () => {
+    const size = get('CUBEJS_COMPILER_CACHE_SIZE')
+      .default('250')
+      .asIntPositive();
+
+    // env-var's asIntPositive() lets 0 through, but every consumer of this option
+    // falls back to the default on a falsy value, so 0 would quietly mean 250
+    // instead of doing what it looks like it does.
+    if (size === 0) {
+      throw new InvalidConfiguration(
+        'CUBEJS_COMPILER_CACHE_SIZE',
+        size,
+        'Must be a positive integer. The compiler cache can not be disabled.',
+      );
+    }
+
+    return size;
+  },
+  /**
+   * Total measures/dimensions/segments the compiler cache may hold; unset leaves only CUBEJS_COMPILER_CACHE_SIZE.
+   */
+  maxCompiledMembers: (): number | undefined => {
+    if (!get('CUBEJS_MAX_COMPILED_MEMBERS').asString()) {
+      return undefined;
+    }
+
+    const members = get('CUBEJS_MAX_COMPILED_MEMBERS').asIntPositive();
+
+    // asIntPositive() lets 0 through; reject it rather than read it as "unset".
+    if (members === 0) {
+      throw new InvalidConfiguration(
+        'CUBEJS_MAX_COMPILED_MEMBERS',
+        members,
+        'Must be a positive integer. Unset it to disable the member budget.',
+      );
+    }
+
+    return members;
+  },
+  /**
+   * Experimental: compiled apps share one VM realm, process-wide script/YAML caches and interned strings.
+   */
+  compilerMultiTenantSharing: () => get('CUBEJS_COMPILER_MULTI_TENANT_SHARING')
+    .default('false')
+    .asBoolStrict(),
+  nativeSqlPlanner: () => {
+    const explicitlySet = process.env.CUBEJS_TESSERACT_SQL_PLANNER !== undefined;
+    const enabled = get('CUBEJS_TESSERACT_SQL_PLANNER').default('true').asBool();
+
+    if (explicitlySet && !enabled) {
+      displayCLIWarningOnce(
+        'CUBEJS_TESSERACT_SQL_PLANNER',
+        'Tesseract planner is a default one, but you are trying to use a legacy planner which will be removed in the near future.'
+      );
+    }
+
+    return enabled;
+  },
+  tesseractMultiStageLeafMerge: () => get('CUBEJS_TESSERACT_MULTI_STAGE_LEAF_MERGE')
+    .default('true')
+    .asBoolStrict(),
+  /**
+   * In queries served by Cube Store pre-aggregations, multi-stage leaves reading
+   * the same rows share one scan, and calculations over the same inputs at one
+   * grain become one calculation.
+   */
+  tesseractMultiStageScanSharing: () => get('CUBEJS_TESSERACT_MULTI_STAGE_SCAN_SHARING')
+    .default('true')
+    .asBoolStrict(),
+  tesseractCubeStoreUnionFullKeyAggregate: () => get('CUBEJS_TESSERACT_CUBESTORE_UNION_FULL_KEY_AGGREGATE')
+    .default('true')
+    .asBoolStrict(),
+  tesseractTrinoUnionFullKeyAggregate: () => get('CUBEJS_TESSERACT_TRINO_UNION_FULL_KEY_AGGREGATE')
+    .default('true')
+    .asBoolStrict(),
+  transpilationWorkerThreads: () => {
+    const enabled = get('CUBEJS_TRANSPILATION_WORKER_THREADS')
+      .default('true')
+      .asBoolStrict();
+
+    if (!enabled) {
+      console.warn(
+        'Worker thread transpilation is enabled by default and cannot be disabled with CUBEJS_TRANSPILATION_WORKER_THREADS.'
+      );
+    }
+
+    return true;
+  },
+  allowNonStrictDateRangeMatching: () => get('CUBEJS_PRE_AGGREGATIONS_ALLOW_NON_STRICT_DATE_RANGE_MATCH')
+    .default('true')
+    .asBoolStrict(),
+  transpilationWorkerThreadsCount: () => get('CUBEJS_TRANSPILATION_WORKER_THREADS_COUNT')
+    .default('0')
+    .asInt(),
+  // This one takes precedence over CUBEJS_TRANSPILATION_WORKER_THREADS
+  transpilationNative: () => get('CUBEJS_TRANSPILATION_NATIVE')
+    .default('false')
+    .asBoolStrict(),
+  nestedFoldersDelimiter: () => get('CUBEJS_NESTED_FOLDERS_DELIMITER')
+    .default('')
+    .asString(),
+  defaultTimezone: () => {
+    const value = (get('CUBEJS_DEFAULT_TIMEZONE').asString() || '').trim() || 'UTC';
+
+    const timezone = canonicalTimezone(value);
+    if (!timezone) {
+      throw new InvalidConfiguration(
+        'CUBEJS_DEFAULT_TIMEZONE',
+        value,
+        'Must be a valid IANA time zone name, e.g. UTC or America/Los_Angeles.'
+      );
+    }
+
+    return timezone;
+  },
+  preciseDecimalInCubestore: () => get('CUBEJS_DB_PRECISE_DECIMAL_IN_CUBESTORE')
+    .default('false')
+    .asBoolStrict(),
+  refreshKeyLocalTime: () => get('CUBEJS_REFRESH_KEY_LOCAL_TIME')
+    .default('false')
+    .asBoolStrict(),
+
+  /** ****************************************************************
+   * Common db options                                               *
+   ***************************************************************** */
+
+  /**
+   * Configured datasources.
+   */
+  dataSources: (): string[] => {
+    const dataSources = process.env.CUBEJS_DATASOURCES;
+    if (dataSources) {
+      return dataSources.trim().split(',').map(ds => ds.trim());
+    }
+    return [];
+  },
+
+  /**
+   * Driver type.
+   */
+  dbType: ({ dataSource }: DataSourceOpts) => (
+    // We don't support different driverType for pre-aggregations right now
+    get(keyByDataSource('CUBEJS_DB_TYPE', dataSource, false)).asString()
+  ),
+
+  /**
+   * Use SSL connection flag.
+   */
+  dbSsl: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_SSL', dataSource, preAggregations)).default('false').asString();
+    if (val.toLocaleLowerCase() === 'true') {
+      return true;
+    } else if (val.toLowerCase() === 'false') {
+      return false;
+    } else {
+      throw new TypeError(
+        `The ${
+          keyByDataSource('CUBEJS_DB_SSL', dataSource)
+        } must be either 'true' or 'false'.`
+      );
+    }
+  },
+
+  /**
+   * Reject unauthorized SSL connection flag.
+   */
+  dbSslRejectUnauthorized: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_SSL_REJECT_UNAUTHORIZED', dataSource, preAggregations)).default('false').asString();
+    if (val.toLocaleLowerCase() === 'true') {
+      return true;
+    } else if (val.toLowerCase() === 'false') {
+      return false;
+    } else {
+      throw new TypeError(
+        `The ${
+          keyByDataSource('CUBEJS_DB_SSL_REJECT_UNAUTHORIZED', dataSource)
+        } must be either 'true' or 'false'.`
+      );
+    }
+  },
+
+  /**
+   * Database URL.
+   */
+  dbUrl: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_URL', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Database host.
+   */
+  dbHost: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_HOST', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Use `SELECT 1` query for testConnection.
+   * It might be used in any driver where there is a specific testConnection
+   * like a REST call, but for some reason it's not possible to use it in
+   * deployment environment.
+   */
+  dbUseSelectTestConnection: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_USE_SELECT_TEST_CONNECTION', dataSource, preAggregations)).default('false').asString();
+    if (val.toLocaleLowerCase() === 'true') {
+      return true;
+    } else if (val.toLowerCase() === 'false') {
+      return false;
+    } else {
+      throw new TypeError(
+        `The ${
+          keyByDataSource('CUBEJS_DB_USE_SELECT_TEST_CONNECTION', dataSource)
+        } must be either 'true' or 'false'.`
+      );
+    }
+  },
+
+  /**
+   * Kafka host for direct downloads from ksqlDb
+   */
+  dbKafkaHost: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_KAFKA_HOST', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Kafka user for direct downloads from ksqlDb
+   */
+  dbKafkaUser: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_KAFKA_USER', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Kafka password for direct downloads from ksqlDb
+   */
+  dbKafkaPass: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_KAFKA_PASS', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * `true` if Kafka should use SASL_SSL for direct downloads from ksqlDb
+   */
+  dbKafkaUseSsl: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_KAFKA_USE_SSL', dataSource, preAggregations))
+      .default('false')
+      .asBool()
+  ),
+
+  /**
+   * Database domain.
+   */
+  dbDomain: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DOMAIN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Database port.
+   */
+  dbPort: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_PORT', dataSource, preAggregations)).asInt()
+  ),
+
+  /**
+   * Database socket path.
+   */
+  dbSocketPath: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SOCKET_PATH', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Database user.
+   */
+  dbUser: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_USER', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Database pass.
+   */
+  dbPass: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_PASS', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Database name.
+   */
+  dbName: ({
+    required,
+    dataSource,
+    preAggregations,
+  }: {
+    dataSource: string,
+    required?: boolean,
+    preAggregations?: boolean,
+  }) => {
+    const val = get(keyByDataSource('CUBEJS_DB_NAME', dataSource, preAggregations)).asString();
+    if (required && !val) {
+      throw new Error(
+        `The ${
+          keyByDataSource('CUBEJS_DB_NAME', dataSource)
+        } is required and missing.`
+      );
+    }
+    return val;
+  },
+
+  /**
+   * Database name.
+   * @deprecated
+   */
+  dbSchema: ({
+    required,
+    dataSource,
+    preAggregations,
+  }: {
+    dataSource: string,
+    required?: boolean,
+    preAggregations?: boolean,
+  }) => {
+    const val = get(keyByDataSource('CUBEJS_DB_SCHEMA', dataSource, preAggregations)).asString();
+    if (val) {
+      console.warn(
+        `The ${
+          keyByDataSource('CUBEJS_DB_SCHEMA', dataSource)
+        } is deprecated. Please, use the ${
+          keyByDataSource('CUBEJS_DB_NAME', dataSource)
+        } instead.`
+      );
+    }
+    if (required && !val) {
+      throw new Error(
+        `The ${
+          keyByDataSource('CUBEJS_DB_SCHEMA', dataSource)
+        } is required and missing.`
+      );
+    }
+    return val;
+  },
+
+  /**
+   * Database name.
+   * @deprecated
+   */
+  dbDatabase: ({
+    required,
+    dataSource,
+    preAggregations,
+  }: {
+    dataSource: string,
+    required?: boolean,
+    preAggregations?: boolean,
+  }) => {
+    const val = get(keyByDataSource('CUBEJS_DATABASE', dataSource, preAggregations)).asString();
+    if (val) {
+      console.warn(
+        `The ${
+          keyByDataSource('CUBEJS_DATABASE', dataSource)
+        } is deprecated. Please, use the ${
+          keyByDataSource('CUBEJS_DB_NAME', dataSource)
+        } instead.`
+      );
+    }
+    if (required && !val) {
+      throw new Error(
+        `The ${
+          keyByDataSource('CUBEJS_DATABASE', dataSource)
+        } is required and missing.`
+      );
+    }
+    return val;
+  },
+
+  /**
+   * Database max pool size.
+   */
+  dbMaxPoolSize: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_MAX_POOL', dataSource, preAggregations)).asInt()
+  ),
+
+  /**
+   * Database min pool size.
+   */
+  dbMinPoolSize: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_MIN_POOL', dataSource, preAggregations))
+      .asIntPositive()
+  ),
+
+  /**
+   * Max polling interval. Currently used in BigQuery and Databricks.
+   * TODO: clarify this env.
+   */
+  dbPollMaxInterval: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const key = keyByDataSource('CUBEJS_DB_POLL_MAX_INTERVAL', dataSource, preAggregations);
+    const value = get(keyByDataSource('CUBEJS_DB_POLL_MAX_INTERVAL', dataSource, preAggregations)).default('5s').asString();
+    return convertTimeStrToSeconds(value, key);
+  },
+
+  /**
+   * Polling timeout. Currently used in BigQuery, Dremio and Athena.
+   * TODO: clarify this env.
+   */
+  dbPollTimeout: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const key = keyByDataSource('CUBEJS_DB_POLL_TIMEOUT', dataSource, preAggregations);
+    const value = get(keyByDataSource('CUBEJS_DB_POLL_TIMEOUT', dataSource, preAggregations)).asString();
+    if (value) {
+      return convertTimeStrToSeconds(value, key);
+    } else {
+      return null;
+    }
+  },
+
+  /**
+   * Query timeout. Currently used in BigQuery, ClickHouse, Dremio, Postgres, Snowflake
+   * and Athena drivers and the orchestrator (queues, pre-aggs). For the
+   * orchestrator this variable did not split by the datasource.
+   *
+   * TODO (buntarb): check the possibility to split this for the
+   * orchestrator. This will allows us to make dataSource required.
+   */
+  dbQueryTimeout: ({
+    dataSource,
+    preAggregations,
+  }: {
+    dataSource?: string,
+    preAggregations?: boolean,
+  } = {}) => {
+    const key = keyByDataSource('CUBEJS_DB_QUERY_TIMEOUT', dataSource, preAggregations);
+    const value = get(keyByDataSource('CUBEJS_DB_QUERY_TIMEOUT', dataSource, preAggregations)).default('10m').asString();
+    return convertTimeStrToSeconds(value, key);
+  },
+
+  /**
+   * Max limit which can be specified in the incoming query.
+   */
+  dbQueryLimit: (): number => get('CUBEJS_DB_QUERY_LIMIT')
+    .default(50000)
+    .asInt(),
+
+  /**
+   * Query limit wich will be used in the query to the data source if
+   * limit property was not specified in the query.
+   */
+  dbQueryDefaultLimit: (): number => get('CUBEJS_DB_QUERY_DEFAULT_LIMIT')
+    .default(10000)
+    .asInt(),
+
+  /**
+   * Whether queries are executed automatically without requiring an
+   * explicit user confirmation. Only used in Cube Cloud.
+   */
+  autoRunMode: (): boolean => get('CUBEJS_AUTO_RUN_MODE')
+    .default('true')
+    .asBoolStrict(),
+
+  /**
+   * Query stream `highWaterMark` value.
+   */
+  dbQueryStreamHighWaterMark: (): number => get('CUBEJS_DB_QUERY_STREAM_HIGH_WATER_MARK')
+    .default(8192)
+    .asInt(),
+
+  /**
+   * Max number of elements
+   */
+  usedPreAggregationCacheMaxCount: (): number => get('CUBEJS_USED_PRE_AGG_CACHE_MAX_COUNT')
+    .default(8192)
+    .asInt(),
+
+  /**
+   * Max number of elements
+   */
+  touchPreAggregationCacheMaxCount: (): number => get('CUBEJS_TOUCH_PRE_AGG_CACHE_MAX_COUNT')
+    .default(8192)
+    .asInt(),
+
+  /**
+   * Max cache
+   */
+  touchPreAggregationCacheMaxAge: (): number => {
+    // eslint-disable-next-line no-use-before-define
+    const touchPreAggregationTimeout = getEnv('touchPreAggregationTimeout');
+
+    const maxAge = get('CUBEJS_TOUCH_PRE_AGG_CACHE_MAX_AGE')
+      .default(Math.round(touchPreAggregationTimeout / 2))
+      .asIntPositive();
+
+    if (maxAge > touchPreAggregationTimeout) {
+      throw new InvalidConfiguration(
+        'CUBEJS_TOUCH_PRE_AGG_CACHE_MAX_AGE',
+        maxAge,
+        `Must be less or equal then CUBEJS_TOUCH_PRE_AGG_TIMEOUT (${touchPreAggregationTimeout}).`
+      );
+    }
+
+    return maxAge;
+  },
+
+  /**
+   * Expire time for touch records
+   */
+  touchPreAggregationTimeout: (): number => get('CUBEJS_TOUCH_PRE_AGG_TIMEOUT')
+    .default(60 * 60 * 24)
+    .asIntPositive(),
+
+  /**
+   * Maximum time for exponential backoff for pre-aggs (in seconds)
+   */
+  preAggBackoffMaxTime: (): number => get('CUBEJS_PRE_AGGREGATIONS_BACKOFF_MAX_TIME')
+    .default(10 * 60)
+    .asIntPositive(),
+
+  /**
+   * Expire time for touch records
+   */
+  dropPreAggregationsWithoutTouch: (): boolean => get('CUBEJS_DROP_PRE_AGG_WITHOUT_TOUCH')
+    .default('true')
+    .asBoolStrict(),
+
+  /**
+   * Fetch Columns by Ordinal Position
+   *
+   * Currently defaults to 'false' as changing this in a live deployment could break existing pre-aggregations.
+   * This will eventually default to true.
+   */
+  fetchColumnsByOrdinalPosition: (): boolean => get('CUBEJS_DB_FETCH_COLUMNS_BY_ORDINAL_POSITION')
+    .default('true')
+    .asBoolStrict(),
+
+  /** ****************************************************************
+   * JDBC options                                                    *
+   ***************************************************************** */
+
+  /**
+   * JDBC URL.
+   */
+  jdbcUrl: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_JDBC_URL', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * JDBC driver.
+   */
+  jdbcDriver: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_JDBC_DRIVER', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Number of rows the JDBC driver reads from a result set per round trip to the JVM.
+   */
+  jdbcBatchSize: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const key = keyByDataSource('CUBEJS_JDBC_BATCH_SIZE', dataSource, preAggregations);
+    const value = get(key).default(1024).asIntPositive();
+
+    // eslint-disable-next-line no-bitwise
+    if (value < 16 || value > 32768 || (value & (value - 1)) !== 0) {
+      throw new InvalidConfiguration(key, value, 'Must be a power of two between 16 and 32768.');
+    }
+
+    return value;
+  },
+
+  /** ****************************************************************
+   * Export Bucket options                                           *
+   ***************************************************************** */
+
+  /**
+   * Export bucket CSV escape symbol.
+   */
+  dbExportBucketCsvEscapeSymbol: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_CSV_ESCAPE_SYMBOL', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Export bucket storage type.
+   */
+  dbExportBucketType: ({
+    supported,
+    dataSource,
+    preAggregations,
+  }: {
+    supported: ('s3' | 'gcp' | 'azure')[],
+    dataSource: string,
+    preAggregations?: boolean,
+  }) => {
+    const val = get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_TYPE', dataSource, preAggregations)).asString();
+    if (
+      val &&
+      supported &&
+      supported.indexOf(<'s3' | 'gcp' | 'azure'>val) === -1
+    ) {
+      throw new TypeError(
+        `The ${
+          keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_TYPE', dataSource)
+        } must be one of the [${supported.join(', ')}].`
+      );
+    }
+    return val;
+  },
+
+  /**
+   * Export bucket storage URI.
+   */
+  dbExportBucket: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Mounted export bucket directory for the cases, when the storage
+   * mounted to the datasource.
+   */
+  dbExportBucketMountDir: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_MOUNT_DIR', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * AWS Key for the AWS based export bucket storage.
+   */
+  dbExportBucketAwsKey: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AWS_KEY', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * AWS Secret for the AWS based export bucket storage.
+   */
+  dbExportBucketAwsSecret: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AWS_SECRET', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * AWS Region for the AWS based export bucket storage.
+   */
+  dbExportBucketAwsRegion: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AWS_REGION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Azure Key for the Azure based export bucket storage.
+   */
+  dbExportBucketAzureKey: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AZURE_KEY', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Azure SAS Token for the Azure based export bucket storage.
+   */
+  dbExportAzureSasToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AZURE_SAS_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Azure Client ID for the Azure based export bucket storage.
+   */
+  dbExportBucketAzureClientId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AZURE_CLIENT_ID', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+    * Client Secret for the Azure based export bucket storage.
+    */
+  dbExportBucketAzureClientSecret: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AZURE_CLIENT_SECRET', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Azure Federated Token File Path for the Azure based export bucket storage.
+   */
+  dbExportBucketAzureTokenFilePAth: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AZURE_FEDERATED_TOKEN_FILE', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Azure Tenant ID for the Azure based export bucket storage.
+   */
+  dbExportBucketAzureTenantId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_AZURE_TENANT_ID', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Export bucket options for Integration based.
+   */
+  dbExportIntegration: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_INTEGRATION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Export bucket options for GCS.
+   */
+  dbExportGCSCredentials: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const credentials = get(keyByDataSource('CUBEJS_DB_EXPORT_GCS_CREDENTIALS', dataSource, preAggregations)).asString();
+    if (credentials) {
+      return JSON.parse(
+        Buffer.from(credentials, 'base64').toString('utf8')
+      );
+    }
+    return undefined;
+  },
+
+  /** ****************************************************************
+   * MySQL Driver                                                    *
+   ***************************************************************** */
+
+  /**
+   * Use timezone names for date/time conversions.
+   * Defaults to FALSE, meaning that numeric offsets for timezone will be used.
+   * @see https://dev.mysql.com/doc/refman/8.4/en/date-and-time-functions.html#function_convert-tz
+   * @see https://dev.mysql.com/doc/refman/8.4/en/time-zone-support.html
+   */
+  mysqlUseNamedTimezones: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_MYSQL_USE_NAMED_TIMEZONES', dataSource, preAggregations))
+      // It's true in schema-compiler integration tests
+      .default('false')
+      .asBool()
+  ),
+
+  /**
+   * Use the generated (recursive CTE based) time series for the Tesseract SQL
+   * planner instead of the portable VALUES/UNION ALL series. Defaults to TRUE.
+   * Recursive CTEs require MySQL 8.0+ — set this to FALSE for MySQL < 8.0,
+   * which has no CTE support. When disabled, time series are materialized as a
+   * VALUES list.
+   */
+  mysqlUseGeneratedTimeSeries: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_MYSQL_USE_GENERATED_TIME_SERIES', dataSource, preAggregations))
+      .default('true')
+      .asBool()
+  ),
+
+  /** ****************************************************************
+   * MSSQL Driver                                                    *
+   ***************************************************************** */
+
+  /**
+   * Use named timezones for date/time conversions via AT TIME ZONE.
+   * Defaults to FALSE, meaning that numeric offsets for timezone will be used.
+   *
+   * @see https://learn.microsoft.com/en-us/sql/t-sql/queries/at-time-zone-transact-sql
+   */
+  mssqlUseNamedTimezones: ({ dataSource, preAggregations }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_MSSQL_USE_NAMED_TIMEZONES', dataSource, preAggregations))
+      // It's true in schema-compiler integration tests
+      .default('false')
+      .asBool()
+  ),
+
+  /** ****************************************************************
+   * Databricks Driver                                               *
+   ***************************************************************** */
+
+  /**
+   * Databricks jdbc-connection url.
+   */
+  databricksUrl: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_DATABRICKS_URL', dataSource, preAggregations)).asString();
+    if (!val) {
+      throw new Error(
+        `The ${
+          keyByDataSource('CUBEJS_DB_DATABRICKS_URL', dataSource)
+        } is required and missing.`
+      );
+    }
+    return val;
+  },
+
+  /**
+   * Databricks jdbc-connection token.
+   */
+  databricksToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DATABRICKS_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Databricks catalog name.
+   * https://www.databricks.com/product/unity-catalog
+   */
+  databricksCatalog: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => get(keyByDataSource('CUBEJS_DB_DATABRICKS_CATALOG', dataSource, preAggregations)).asString(),
+
+  /**
+   * Databricks OAuth Client ID (Same as the service principal UUID)
+   */
+  databricksOAuthClientId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DATABRICKS_OAUTH_CLIENT_ID', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Databricks OAuth Client Secret.
+   */
+  databricksOAuthClientSecret: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DATABRICKS_OAUTH_CLIENT_SECRET', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Athena Driver                                                   *
+   ***************************************************************** */
+
+  /**
+   * Athena AWS key.
+   */
+  athenaAwsKey: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    // TODO (buntarb): this name is a common. Deprecate and replace?
+    get(keyByDataSource('CUBEJS_AWS_KEY', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS secret.
+   */
+  athenaAwsSecret: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    // TODO (buntarb): this name is a common. Deprecate and replace?
+    get(keyByDataSource('CUBEJS_AWS_SECRET', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS region.
+   */
+  athenaAwsRegion: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    // TODO (buntarb): this name is a common. Deprecate and replace?
+    get(keyByDataSource('CUBEJS_AWS_REGION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS S3 output location.
+   */
+  athenaAwsS3OutputLocation: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    // TODO (buntarb): this name is a common. Deprecate and replace?
+    get(keyByDataSource('CUBEJS_AWS_S3_OUTPUT_LOCATION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS workgroup.
+   */
+  athenaAwsWorkgroup: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    // TODO (buntarb): Deprecate and replace?
+    get(keyByDataSource('CUBEJS_AWS_ATHENA_WORKGROUP', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS Catalog.
+   */
+  athenaAwsCatalog: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    // TODO (buntarb): Deprecate and replace?
+    get(keyByDataSource('CUBEJS_AWS_ATHENA_CATALOG', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS Assume Role ARN.
+   */
+  athenaAwsAssumeRoleArn: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_AWS_ATHENA_ASSUME_ROLE_ARN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Athena AWS Assume Role External ID.
+   */
+  athenaAwsAssumeRoleExternalId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_AWS_ATHENA_ASSUME_ROLE_EXTERNAL_ID', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * BigQuery Driver                                                 *
+   ***************************************************************** */
+
+  /**
+   * BigQuery project ID.
+   */
+  bigqueryProjectId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_BQ_PROJECT_ID', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * BigQuery Key file.
+   */
+  bigqueryKeyFile: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_BQ_KEY_FILE', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * BigQuery credentials.
+   */
+  bigqueryCredentials: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_BQ_CREDENTIALS', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * BigQuery location.
+   */
+  bigqueryLocation: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_BQ_LOCATION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * BigQuery export bucket.
+   * @deprecated
+   */
+  bigqueryExportBucket: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    console.warn(
+      'The CUBEJS_DB_BQ_EXPORT_BUCKET is deprecated. ' +
+      'Please, use the CUBEJS_DB_EXPORT_BUCKET instead.'
+    );
+    return get(keyByDataSource('CUBEJS_DB_BQ_EXPORT_BUCKET', dataSource, preAggregations)).asString();
+  },
+
+  /** ****************************************************************
+   * ClickHouse Driver                                               *
+   ***************************************************************** */
+
+  /**
+   * ClickHouse read only flag.
+   */
+  clickhouseReadOnly: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_CLICKHOUSE_READONLY', dataSource, preAggregations))
+      .default('false')
+      .asBool()
+  ),
+
+  /**
+   * ClickHouse compression flag.
+   */
+  clickhouseCompression: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_CLICKHOUSE_COMPRESSION', dataSource, preAggregations))
+      .default('false')
+      .asBool()
+  ),
+
+  /** ****************************************************************
+   * Firebolt Driver                                                 *
+   ***************************************************************** */
+
+  /**
+   * Firebolt API endpoint.
+   */
+  fireboltApiEndpoint: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_FIREBOLT_API_ENDPOINT', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Firebolt engine name.
+   */
+  fireboltEngineName: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_FIREBOLT_ENGINE_NAME', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Firebolt engine endpoint.
+   */
+  fireboltEngineEndpoint: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_FIREBOLT_ENGINE_ENDPOINT', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Firebolt account name.
+   */
+  fireboltAccount: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_FIREBOLT_ACCOUNT', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Hive Driver                                                     *
+   ***************************************************************** */
+
+  /**
+   * Hive type.
+   */
+  hiveType: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_HIVE_TYPE', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Hive version.
+   */
+  hiveVer: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_HIVE_VER', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Hive thrift version.
+   */
+  hiveThriftVer: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_HIVE_THRIFT_VER', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Hive CDH version.
+   */
+  hiveCdhVer: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_HIVE_CDH_VER', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Aurora Driver                                                   *
+   ***************************************************************** */
+
+  /**
+   * Aurora secret ARN.
+   */
+  auroraSecretArn: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DATABASE_SECRET_ARN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Aurora cluster ARN.
+   */
+  auroraClusterArn: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DATABASE_CLUSTER_ARN', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Redshift Driver                                                 *
+   ***************************************************************** */
+
+  /**
+   * Redshift export bucket unload ARN.
+   */
+  redshiftUnloadArn: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_EXPORT_BUCKET_REDSHIFT_ARN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Redshift AWS region for IAM authentication.
+   */
+  redshiftAwsRegion: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_REDSHIFT_AWS_REGION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Redshift provisioned cluster identifier for IAM authentication.
+   */
+  redshiftClusterIdentifier: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_REDSHIFT_CLUSTER_IDENTIFIER', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Redshift Serverless workgroup name for IAM authentication.
+   */
+  redshiftWorkgroupName: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_REDSHIFT_WORKGROUP_NAME', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Redshift IAM Assume Role ARN for cross-account access.
+   */
+  redshiftAssumeRoleArn: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_REDSHIFT_ASSUME_ROLE_ARN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Redshift IAM Assume Role External ID.
+   */
+  redshiftAssumeRoleExternalId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_REDSHIFT_ASSUME_ROLE_EXTERNAL_ID', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Materialize Driver                                              *
+   ***************************************************************** */
+
+  /**
+   * Materialize cluster.
+   */
+  materializeCluster: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_MATERIALIZE_CLUSTER', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Snowflake Driver                                                *
+   ***************************************************************** */
+
+  /**
+   * Snowflake account.
+   */
+  snowflakeAccount: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_ACCOUNT', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake region.
+   */
+  snowflakeRegion: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_REGION', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake warehouse.
+   */
+  snowflakeWarehouse: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_WAREHOUSE', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake role.
+   */
+  snowflakeRole: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_ROLE', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake session keep alive flag.
+   */
+  snowflakeSessionKeepAlive: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_CLIENT_SESSION_KEEP_ALIVE', dataSource, preAggregations)).asString();
+    if (val) {
+      if (val.toLocaleLowerCase() === 'true') {
+        return true;
+      } else if (val.toLowerCase() === 'false') {
+        return false;
+      } else {
+        throw new TypeError(
+          `The ${
+            keyByDataSource(
+              'CUBEJS_DB_SNOWFLAKE_CLIENT_SESSION_KEEP_ALIVE',
+              dataSource,
+            )
+          } must be either 'true' or 'false'.`
+        );
+      }
+    } else {
+      return true;
+    }
+  },
+
+  /**
+   * Snowflake authenticator.
+   */
+  snowflakeAuthenticator: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_AUTHENTICATOR', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake OAuth token (string).
+   */
+  snowflakeOAuthToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_OAUTH_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake OAuth token path.
+   */
+  snowflakeOAuthTokenPath: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_OAUTH_TOKEN_PATH', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake host.
+   */
+  snowflakeHost: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_HOST', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake private key.
+   */
+  snowflakePrivateKey: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_PRIVATE_KEY', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake private key path.
+   */
+  snowflakePrivateKeyPath: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_PRIVATE_KEY_PATH', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake private key pass.
+   */
+  snowflakePrivateKeyPass: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_PRIVATE_KEY_PASS', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Snowflake case sensitivity for identifiers (like database columns).
+   */
+  snowflakeQuotedIdentIgnoreCase: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_SNOWFLAKE_QUOTED_IDENTIFIERS_IGNORE_CASE', dataSource, preAggregations)).asString();
+    if (val) {
+      if (val.toLocaleLowerCase() === 'true') {
+        return true;
+      } else if (val.toLowerCase() === 'false') {
+        return false;
+      } else {
+        throw new TypeError(
+          `The ${
+            keyByDataSource(
+              'CUBEJS_DB_SNOWFLAKE_QUOTED_IDENTIFIERS_IGNORE_CASE',
+              dataSource,
+            )
+          } must be either 'true' or 'false'.`
+        );
+      }
+    } else {
+      return false;
+    }
+  },
+  /** ****************************************************************
+   * Presto Driver                                                   *
+   ***************************************************************** */
+
+  /**
+   * Presto catalog.
+   */
+  dbCatalog: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_CATALOG', dataSource, preAggregations)).asString();
+    if (val) {
+      console.warn(
+        `The ${
+          keyByDataSource('CUBEJS_DB_CATALOG', dataSource)
+        } is deprecated. Please, use the ${
+          keyByDataSource('CUBEJS_DB_PRESTO_CATALOG', dataSource)
+        } instead.`
+      );
+    }
+    return val;
+  },
+
+  /** ****************************************************************
+   * duckdb                                                         *
+   ***************************************************************** */
+
+  duckdbMotherDuckToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_MOTHERDUCK_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbDatabasePath: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_DATABASE_PATH', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3Region: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_REGION', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3AccessKeyId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_ACCESS_KEY_ID', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3SecretAccessKeyId: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_SECRET_ACCESS_KEY', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3Endpoint: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_ENDPOINT', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbMemoryLimit: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_MEMORY_LIMIT', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbSchema: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_SCHEMA', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3UseSsl: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_USE_SSL', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3UrlStyle: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_URL_STYLE', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbS3SessionToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_SESSION_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  duckdbExtensions: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const extensions = get(keyByDataSource('CUBEJS_DB_DUCKDB_EXTENSIONS', dataSource, preAggregations)).asString();
+    if (extensions) {
+      return extensions.split(',').map(e => e.trim());
+    }
+    return [];
+  },
+
+  duckdbCommunityExtensions: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const extensions = get(keyByDataSource('CUBEJS_DB_DUCKDB_COMMUNITY_EXTENSIONS', dataSource, preAggregations)).asString();
+    if (extensions) {
+      return extensions.split(',').map(e => e.trim());
+    }
+    return [];
+  },
+
+  duckdbS3UseCredentialChain: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_DUCKDB_S3_USE_CREDENTIAL_CHAIN', dataSource, preAggregations)).asString();
+
+    if (val) {
+      if (val.toLocaleLowerCase() === 'true') {
+        return true;
+      } else if (val.toLowerCase() === 'false') {
+        return false;
+      } else {
+        throw new TypeError(
+          `The ${
+            keyByDataSource(
+              'CUBEJS_DB_DUCKDB_S3_USE_CREDENTIAL_CHAIN',
+              dataSource,
+            )
+          } must be either 'true' or 'false'.`
+        );
+      }
+    } else {
+      return false;
+    }
+  },
+
+  /** ***************************************************************
+   * Presto/Trino Driver                                                  *
+   **************************************************************** */
+
+  /**
+   * Presto catalog.
+   */
+  prestoCatalog: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_PRESTO_CATALOG', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Presto/Trino Auth Token
+   */
+  prestoAuthToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_PRESTO_AUTH_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  /** ***************************************************************
+   * Pinot Driver                                                  *
+   **************************************************************** */
+
+  /**
+   * Pinot/Startree Auth Token
+   */
+  pinotAuthToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_PINOT_AUTH_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  /**
+   * Pinot / Startree Null value support
+   */
+
+  pinotNullHandling: ({ dataSource, preAggregations }: DataSourceOpts) => {
+    const val = get(keyByDataSource('CUBEJS_DB_PINOT_NULL_HANDLING', dataSource, preAggregations)).asString();
+
+    if (val) {
+      if (val.toLocaleLowerCase() === 'true') {
+        return true;
+      } else if (val.toLowerCase() === 'false') {
+        return false;
+      } else {
+        throw new TypeError(
+          `The ${
+            keyByDataSource(
+              'CUBEJS_DB_PINOT_NULL_HANDLING',
+              dataSource,
+            )
+          } must be either 'true' or 'false'.`
+        );
+      }
+    } else {
+      return false;
+    }
+  },
+
+  /** ****************************************************************
+   * Dremio Driver                                                   *
+   ***************************************************************** */
+
+  /**
+   * Dremio Auth Token
+   */
+  dremioAuthToken: ({
+    dataSource,
+    preAggregations,
+  }: DataSourceOpts) => (
+    get(keyByDataSource('CUBEJS_DB_DREMIO_AUTH_TOKEN', dataSource, preAggregations)).asString()
+  ),
+
+  /** ****************************************************************
+   * Cube Store Driver                                               *
+   ***************************************************************** */
+
+  cubeStoreHost: () => get('CUBEJS_CUBESTORE_HOST')
+    .asString(),
+  cubeStorePort: () => get('CUBEJS_CUBESTORE_PORT')
+    .asPortNumber(),
+  cubeStoreUser: () => get('CUBEJS_CUBESTORE_USER')
+    .asString(),
+  cubeStorePass: () => get('CUBEJS_CUBESTORE_PASS')
+    .asString(),
+  cubeStoreMaxConnectRetries: () => get('CUBEJS_CUBESTORE_MAX_CONNECT_RETRIES')
+    .default('20')
+    .asInt(),
+  cubeStoreNoHeartBeatTimeout: () => get('CUBEJS_CUBESTORE_NO_HEART_BEAT_TIMEOUT')
+    .default('30')
+    .asInt(),
+  /**
+   * Maximum size in bytes of a single message exchanged with Cube Store, both
+   * of a query sent to it and of a response received from it.
+   *
+   * It is the only limit that applies to responses, since Cube Store doesn't
+   * cap what it sends. For queries it is independent of, and by default looser
+   * than, CUBESTORE_TRANSPORT_MAX_MESSAGE_SIZE (64 MB), which is what Cube
+   * Store itself accepts: a query over that but under this one is refused by
+   * Cube Store rather than by this limit.
+   */
+  cubeStoreMaxMessageSize: () => get('CUBEJS_CUBESTORE_MAX_MESSAGE_SIZE')
+    .default(String(100 * 1024 * 1024))
+    .asIntPositive(),
+  cubeStoreRollingWindowJoin: () => get('CUBEJS_CUBESTORE_ROLLING_WINDOW_JOIN')
+    .default('true')
+    .asBoolStrict(),
+  /**
+   * Multi-stage members a single dependency path may carry. Each one is planned as its own
+   * stage, by a descent that costs stack, so a long enough chain overflows it and takes the
+   * process down with no error to report. Unset leaves the planner's own default.
+   */
+  maxMultiStageDepth: () => get('CUBEJS_MAX_MULTI_STAGE_DEPTH')
+    .asIntPositive(),
+  /**
+   * How many multi-stage stages one query may plan in total. Depth does not bound it: a member
+   * reading its child in two states doubles the stages per level. Unset leaves the planner's
+   * own default.
+   */
+  maxMultiStageStages: () => get('CUBEJS_MAX_MULTI_STAGE_STAGES')
+    .asIntPositive(),
+  /**
+   * How deep members may reference members. The planner resolves each referenced member inside
+   * the one that references it, calling into JS at every level, so a long enough chain runs the
+   * JS stack out with a bare RangeError. Unset leaves the planner's own default.
+   */
+  maxMemberResolutionDepth: () => get('CUBEJS_MAX_MEMBER_RESOLUTION_DEPTH')
+    .asIntPositive(),
+  allowUngroupedWithoutPrimaryKey: () => get('CUBEJS_ALLOW_UNGROUPED_WITHOUT_PRIMARY_KEY')
+    .default(get('CUBESQL_SQL_PUSH_DOWN').default('true').asString())
+    .asBoolStrict(),
+  nodeEnv: () => get('NODE_ENV')
+    .asString(),
+  cacheAndQueueDriver: () => get('CUBEJS_CACHE_AND_QUEUE_DRIVER')
+    .asString(),
+  defaultApiScope: () => get('CUBEJS_DEFAULT_API_SCOPES')
+    .asArray(','),
+  jwkUrl: () => get('CUBEJS_JWK_URL')
+    .asString(),
+  jwtKey: () => get('CUBEJS_JWT_KEY')
+    .asString(),
+  jwtAlgorithms: () => get('CUBEJS_JWT_ALGS')
+    .asArray(','),
+  jwtAudience: () => get('CUBEJS_JWT_AUDIENCE')
+    .asString(),
+  jwtIssuer: () => get('CUBEJS_JWT_ISSUER')
+    .asArray(','),
+  jwtSubject: () => get('CUBEJS_JWT_SUBJECT')
+    .asString(),
+  jwtClaimsNamespace: () => get('CUBEJS_JWT_CLAIMS_NAMESPACE')
+    .asString(),
+  playgroundAuthSecret: () => get('CUBEJS_PLAYGROUND_AUTH_SECRET')
+    .asString(),
+  apiSecret: () => get('CUBEJS_API_SECRET')
+    .asString(),
+  // Comma-separated rotation list. Trimmed, empties dropped, deduplicated.
+  // Takes precedence over the singular `apiSecret` when non-empty.
+  apiSecrets: (): string[] | undefined => {
+    const raw = get('CUBEJS_API_SECRETS').asString();
+    if (!raw) {
+      return undefined;
+    }
+    const unique = Array.from(
+      new Set(raw.split(',').map((s) => s.trim()).filter(Boolean))
+    );
+    return unique.length > 0 ? unique : undefined;
+  },
+  agentFrameSize: () => get('CUBEJS_AGENT_FRAME_SIZE')
+    .default('200')
+    .asInt(),
+  agentEndpointUrl: () => get('CUBEJS_AGENT_ENDPOINT_URL')
+    .asString(),
+  agentFlushInterval: () => get('CUBEJS_AGENT_FLUSH_INTERVAL')
+    .default(1000)
+    .asInt(),
+  agentMaxSockets: () => get('CUBEJS_AGENT_MAX_SOCKETS')
+    .default(100)
+    .asInt(),
+  instanceId: () => get('CUBEJS_INSTANCE_ID')
+    .asString(),
+  telemetry: () => get('CUBEJS_TELEMETRY')
+    .default('true')
+    .asBool(),
+  // SQL Interface
+  sqlPort: () => {
+    const port = asFalseOrPort(process.env.CUBEJS_SQL_PORT || 'false', 'CUBEJS_SQL_PORT');
+    if (port) {
+      return port;
+    }
+
+    return undefined;
+  },
+  nativeApiGatewayPort: () => {
+    if (process.env.CUBEJS_NATIVE_API_GATEWAY_PORT === 'false') {
+      return undefined;
+    }
+
+    const port = asFalseOrPort(process.env.CUBEJS_NATIVE_API_GATEWAY_PORT || 'false', 'CUBEJS_NATIVE_API_GATEWAY_PORT');
+    if (port) {
+      return port;
+    }
+
+    return undefined;
+  },
+  pgSqlPort: () => {
+    if (process.env.CUBEJS_PG_SQL_PORT === 'false') {
+      return undefined;
+    }
+
+    const port = asFalseOrPort(process.env.CUBEJS_PG_SQL_PORT || 'false', 'CUBEJS_PG_SQL_PORT');
+    if (port) {
+      return port;
+    }
+
+    if (devMode()) {
+      if (isNativeSupported()) {
+        return 15432;
+      } else {
+        displayCLIWarning(
+          'Native module is not supported on your platform. Please use official docker image as a recommended way'
+        );
+
+        return false;
+      }
+    }
+
+    return undefined;
+  },
+  sqlUser: () => get('CUBEJS_SQL_USER').asString(),
+  sqlPassword: () => get('CUBEJS_SQL_PASSWORD').asString(),
+  sqlSuperUser: () => get('CUBEJS_SQL_SUPER_USER').asString(),
+  // Internal testing, please don't enable it. It's not ready for public preview
+  nativeApiGateway: () => get('CUBE_JS_NATIVE_API_GATEWAY_INTERNAL')
+    .asBool(),
+  // Experiments & Preview flags
+  livePreview: () => get('CUBEJS_LIVE_PREVIEW')
+    .default('true')
+    .asBoolStrict(),
+  cubestoreSendableParameters: () => get('CUBEJS_CUBESTORE_SENDABLE_PARAMETERS')
+    .default('true')
+    .asBoolStrict(),
+  externalDefault: () => get('CUBEJS_EXTERNAL_DEFAULT')
+    .default('true')
+    .asBoolStrict(),
+  queueExternalId: () => get('CUBEJS_QUEUE_EXTERNAL_ID').default('false').asBool(),
+  queueFastTrack: () => get('CUBEJS_QUEUE_FAST_TRACK').default('false').asBool(),
+  scheduledRefreshDefault: () => get(
+    'CUBEJS_SCHEDULED_REFRESH_DEFAULT'
+  ).default('true').asBoolStrict(),
+  previewFeatures: () => get('CUBEJS_PREVIEW_FEATURES')
+    .default('false')
+    .asBoolStrict(),
+  batchingRowSplitCount: () => get('CUBEJS_BATCHING_ROW_SPLIT_COUNT')
+    .default(256 * 1024)
+    .asInt(),
+  maxSourceRowLimit: () => get('CUBEJS_MAX_SOURCE_ROW_LIMIT')
+    .default(200000)
+    .asInt(),
+  convertTzForRawTimeDimension: () => get('CUBESQL_SQL_PUSH_DOWN').default('true').asBoolStrict(),
+  // Read by cubesql too: whether pushed down SQL may read Cube Store pre-aggregations
+  sqlPushDownPreAggregations: () => get('CUBESQL_SQL_PUSH_DOWN_PRE_AGGREGATIONS').default('true').asBoolStrict(),
+  // Deprecated section
+
+  // Support for Redis as queue & cache driver was removed in 0.36
+  // This code is used to detect Redis and throw an error
+  // TODO(ovr): Remove in after 1.0 + LTS
+  redisUseIORedis: () => get('CUBEJS_REDIS_USE_IOREDIS')
+    .default('false')
+    .asBoolStrict(),
+  // TODO(ovr): Remove in after 1.0 + LTS
+  redisUrl: () => {
+    const redisUrl = get('CUBEJS_REDIS_URL')
+      .asString();
+    if (redisUrl) {
+      return redisUrl;
+    }
+
+    const legacyRedisUrl = get('REDIS_URL')
+      .asString();
+    if (legacyRedisUrl) {
+      return legacyRedisUrl;
+    }
+
+    return undefined;
+  },
+  fastReload: () => get('CUBEJS_FAST_RELOAD_ENABLED')
+    .default('false')
+    .asBoolStrict(),
+  accessPolicyMaskString: () => get('CUBEJS_ACCESS_POLICY_MASK_STRING')
+    .asString(),
+  accessPolicyMaskTime: () => get('CUBEJS_ACCESS_POLICY_MASK_TIME')
+    .asString(),
+  accessPolicyMaskBoolean: () => get('CUBEJS_ACCESS_POLICY_MASK_BOOLEAN')
+    .asString(),
+  accessPolicyMaskNumber: () => get('CUBEJS_ACCESS_POLICY_MASK_NUMBER')
+    .asString(),
+};
+
+type Vars = typeof variables;
+
+export function getEnv<T extends keyof Vars>(key: T, opts?: Parameters<Vars[T]>[0]): ReturnType<Vars[T]> {
+  if (key in variables) {
+    return variables[key](opts);
+  }
+
+  throw new Error(
+    `Unsupported env variable: "${key}"`,
+  );
+}
+
+// trigger warning
+getEnv('transpilationWorkerThreads');
+
+export function isDockerImage(): boolean {
+  return Boolean(process.env.CUBEJS_DOCKER_IMAGE_TAG);
+}

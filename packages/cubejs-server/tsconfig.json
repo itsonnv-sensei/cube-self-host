@@ -1,0 +1,23 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "command",
+    "src",
+    "test"
+  ],
+  "compilerOptions": {
+    "types": ["node", "jest"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "allowJs": true,
+    "resolveJsonModule": true
+  },
+  "references": [
+    { "path": "../cubejs-api-gateway" },
+    { "path": "../cubejs-backend-native" },
+    { "path": "../cubejs-backend-shared" },
+    { "path": "../cubejs-cubestore-driver" },
+    { "path": "../cubejs-query-orchestrator" },
+    { "path": "../cubejs-server-core" }
+  ]
+}

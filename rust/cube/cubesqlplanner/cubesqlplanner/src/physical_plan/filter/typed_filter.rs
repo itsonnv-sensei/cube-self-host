@@ -1,0 +1,372 @@
+use super::operators::{FilterOperationSql, FilterSqlContext};
+use super::ToSql;
+use crate::cube_bridge::member_sql::FilterParamsColumn;
+use crate::physical_plan::sql_nodes::{PreAggregationColumns, SqlNode};
+use crate::physical_plan::SqlEvaluatorVisitor;
+use crate::planner::filter::typed_filter::{
+    resolve_base_symbol, FilterOp, RollingScanBand, TypedFilter,
+};
+use crate::planner::query_tools::QueryTools;
+use crate::planner::sql_call::SqlCallFilterParamsItem;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::SqlInterval;
+use crate::planner::{FiltersContext, MemberSymbol};
+use chrono_tz::Tz;
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+impl ToSql for TypedFilter {
+    fn to_sql(
+        &self,
+        visitor: &SqlEvaluatorVisitor,
+        node_processor: Rc<dyn SqlNode>,
+        query_tools: Rc<QueryTools>,
+        templates: &PlanSqlTemplates,
+        filters_ctx: &FiltersContext,
+    ) -> Result<String, CubeError> {
+        if let FilterOp::MeasureFilter(op) = self.operation() {
+            return op.to_sql(
+                self.member_evaluator(),
+                visitor,
+                node_processor,
+                query_tools,
+                templates,
+            );
+        }
+
+        let resolved = resolve_base_symbol(self.member_evaluator());
+        let name = resolved.peel_refs().full_name();
+        let columns = &filters_ctx.pre_aggregation_columns;
+        // A filter reads a grain column its bounds fall on, else the raw one, and
+        // its bounds take that column's timezone. The read mode of an enclosing
+        // render, such as the member a mask wraps, does not carry into it.
+        let visitor = visitor.with_default_read();
+        let aligned_grain = || match self.date_bounds() {
+            Some((from, to)) => {
+                columns.grain_column_for_range(&name, &from, &to, query_tools.timezone())
+            }
+            None => Ok(None),
+        };
+        let (visitor, reads_grain) = if !filters_ctx.use_local_tz {
+            (visitor, false)
+        } else if self.member_evaluator().as_time_dimension().is_ok() {
+            let reads_grain = reads_a_grain_column(columns, &resolved);
+            (visitor.with_time_dimension_read(), reads_grain)
+        } else if !columns.has_grain(&name) {
+            (visitor, false)
+        } else if let Some(column) = aligned_grain()? {
+            (
+                visitor.with_stored_column(name.clone(), column.clone()),
+                true,
+            )
+        } else if !columns.has_raw(&name) {
+            (visitor.with_time_dimension_read(), true)
+        } else {
+            (visitor, false)
+        };
+        let member_sql = visitor.apply_for_filter(&resolved, node_processor, templates)?;
+
+        let ctx = FilterSqlContext::new(
+            &member_sql,
+            &query_tools,
+            templates,
+            !reads_grain,
+            self.use_raw_values(),
+        );
+
+        dispatch_to_sql(self.operation(), &ctx)
+    }
+}
+
+// A member computed from stored ones reads a grain column through any of them.
+fn reads_a_grain_column(columns: &PreAggregationColumns, member: &Rc<MemberSymbol>) -> bool {
+    let member = member.peel_refs();
+    let name = member.full_name();
+    if columns.contains_key(&name) {
+        return columns.has_grain(&name);
+    }
+    member
+        .get_dependencies()
+        .iter()
+        .any(|dependency| reads_a_grain_column(columns, dependency))
+}
+
+impl TypedFilter {
+    pub fn to_sql_for_filter_params(
+        &self,
+        item: &SqlCallFilterParamsItem,
+        time_shift: Option<&SqlInterval>,
+        visitor: &SqlEvaluatorVisitor,
+        node_processor: Rc<dyn SqlNode>,
+        query_tools: &Rc<QueryTools>,
+        plan_templates: &PlanSqlTemplates,
+        filters_context: &FiltersContext,
+    ) -> Result<String, CubeError> {
+        // A binding written for a time shift restates a band the stage reads,
+        // which takes both of its bounds. An operator supplying fewer describes
+        // no band to restate, and the binding would emit a predicate holding
+        // whatever its unfilled bounds happened to render as. A shifted stage
+        // can equally be a rolling window's base scan, and a rolling filter
+        // carries the same two bounds a date range does.
+        if let Some(shift_name) = &item.time_shift_name {
+            if !matches!(
+                self.operation(),
+                FilterOp::DateRange(_)
+                    | FilterOp::RegularRollingWindow(_)
+                    | FilterOp::RollingWindowOffset(_)
+                    | FilterOp::ToDateRollingWindow(_)
+            ) {
+                return Err(CubeError::user(format!(
+                    "FILTER_PARAMS binding for time shift `{}` of `{}` needs a date-range filter, \
+                     but the query filters that member with `{:?}`",
+                    shift_name,
+                    item.filter_symbol_name,
+                    self.operator()
+                )));
+            }
+        }
+
+        let use_db_time_zone = !filters_context.use_local_tz;
+
+        match &item.column {
+            FilterParamsColumn::String(column_sql) => {
+                // Inside a time-shifted CTE the FILTER_PARAMS column must carry the
+                // same shift as the regular time-dimension filter, otherwise its
+                // current-period bounds contradict the shifted predicate and empty
+                // the CTE.
+                let shifted_column;
+                let member_sql = if let Some(interval) = time_shift {
+                    shifted_column = format!(
+                        "({})",
+                        plan_templates
+                            .add_timestamp_interval(column_sql.clone(), interval.to_sql())?
+                    );
+                    shifted_column.as_str()
+                } else {
+                    column_sql.as_str()
+                };
+                let ctx = FilterSqlContext::new(
+                    member_sql,
+                    query_tools,
+                    plan_templates,
+                    use_db_time_zone,
+                    self.use_raw_values(),
+                );
+                dispatch_to_sql(self.operation(), &ctx)
+            }
+            FilterParamsColumn::Compiled(compiled) => {
+                if time_shift.is_some() {
+                    return Err(CubeError::user(format!(
+                        "FILTER_PARAMS column for `{}` is a callback, which cannot carry the time \
+                         shift the surrounding query applies; pass the column as a string instead",
+                        item.filter_symbol_name
+                    )));
+                }
+                // A column applies what its filter supplies, and nothing when the
+                // filter cannot supply what the column takes — a `set` or `notSet`
+                // operator carries no values at all, a one-sided date operator
+                // carries one where the column takes both bounds, and a rolling
+                // window whose band is not derivable can state no band at all. The
+                // filter still reaches the query on its own; only its restatement
+                // inside this SQL is dropped, which is narrower than binding a
+                // bound the filter never gave.
+                let Some(values) =
+                    self.filter_param_values(query_tools, plan_templates, use_db_time_zone)?
+                else {
+                    return plan_templates.always_true();
+                };
+                if values.len() < compiled.value_params_count {
+                    return plan_templates.always_true();
+                }
+                let Some(call) = &item.compiled_call else {
+                    return Err(CubeError::internal(format!(
+                        "Compiled filter params column for `{}` has no call",
+                        item.filter_symbol_name
+                    )));
+                };
+                call.eval_with_filter_values(
+                    visitor,
+                    node_processor,
+                    query_tools.clone(),
+                    plan_templates,
+                    &values,
+                )
+            }
+            FilterParamsColumn::Callback(callback) => {
+                // A callback column is opaque SQL produced by user code, so a
+                // time shift can't be wrapped around it; it is rendered as-is.
+                let Some(args) =
+                    self.filter_param_values(query_tools, plan_templates, use_db_time_zone)?
+                else {
+                    return plan_templates.always_true();
+                };
+                callback.call(&args)
+            }
+        }
+    }
+
+    // The filter's values, formatted the way a `FILTER_PARAMS` column expects to
+    // receive them. `None` where the filter states a band the column cannot be
+    // given, which leaves the binding to widen rather than restate the band
+    // narrower than it is.
+    fn filter_param_values(
+        &self,
+        query_tools: &Rc<QueryTools>,
+        plan_templates: &PlanSqlTemplates,
+        use_db_time_zone: bool,
+    ) -> Result<Option<Vec<String>>, CubeError> {
+        let ctx = FilterSqlContext::new(
+            "",
+            query_tools,
+            plan_templates,
+            use_db_time_zone,
+            self.use_raw_values(),
+        );
+        let args = match self.operation() {
+            FilterOp::DateRange(_) | FilterOp::DateSingle(_) => {
+                let from = self
+                    .values()
+                    .first()
+                    .and_then(|v| v.to_param_string())
+                    .map(|v| ctx.format_and_allocate_from_date_no_cast(&v))
+                    .transpose()?;
+                let to = self
+                    .values()
+                    .get(1)
+                    .and_then(|v| v.to_param_string())
+                    .map(|v| ctx.format_and_allocate_to_date_no_cast(&v))
+                    .transpose()?;
+                [from, to].into_iter().flatten().collect()
+            }
+            // A rolling window reads a band wider than the period reported: its
+            // own frame, and for a to_date window the period it counts from. A
+            // column restating the reported period instead would cut the scan
+            // to less than the window sums, and every window would undercount
+            // its tail. The band's own bounds are what the column gets.
+            FilterOp::RegularRollingWindow(_)
+            | FilterOp::RollingWindowOffset(_)
+            | FilterOp::ToDateRollingWindow(_) => {
+                let Some((from, to)) = self.rolling_window_band(&ctx, query_tools.timezone())?
+                else {
+                    return Ok(None);
+                };
+                vec![
+                    ctx.format_and_allocate_from_date_no_cast(&from)?,
+                    ctx.format_and_allocate_to_date_no_cast(&to)?,
+                ]
+            }
+            _ => self
+                .values()
+                .iter()
+                .filter_map(|v| v.to_param_string())
+                .map(|v| query_tools.allocate_param(&v))
+                .collect::<Vec<_>>(),
+        };
+        Ok(Some(args))
+    }
+
+    /// The band a rolling window's base scan reads, as `[from, to]` dates.
+    /// `None` where either end is not derivable here — an unbounded side has no
+    /// bound to state, and a window whose series is only known at run time
+    /// carries no dates to shift.
+    fn rolling_window_band(
+        &self,
+        ctx: &FilterSqlContext,
+        tz: Tz,
+    ) -> Result<Option<(String, String)>, CubeError> {
+        let band = self
+            .operation()
+            .rolling_scan_band(tz, |span| Ok(ctx.series_span_end(span)?.clone()))?;
+        Ok(match band {
+            Some(RollingScanBand::Bounded(from, to)) => Some((from, to)),
+            _ => None,
+        })
+    }
+}
+
+fn dispatch_to_sql(op: &FilterOp, ctx: &FilterSqlContext) -> Result<String, CubeError> {
+    match op {
+        FilterOp::Comparison(op) => op.to_sql(ctx),
+        FilterOp::DateRange(op) => op.to_sql(ctx),
+        FilterOp::DateSingle(op) => op.to_sql(ctx),
+        FilterOp::Equality(op) => op.to_sql(ctx),
+        FilterOp::InList(op) => op.to_sql(ctx),
+        FilterOp::Like(op) => op.to_sql(ctx),
+        FilterOp::MeasureFilter(_) => {
+            unreachable!("MeasureFilter is handled in TypedFilter::to_sql")
+        }
+        FilterOp::Nullability(op) => op.to_sql(ctx),
+        FilterOp::RegularRollingWindow(op) => op.to_sql(ctx),
+        FilterOp::RollingWindowOffset(op) => op.to_sql(ctx),
+        FilterOp::ToDateRollingWindow(op) => op.to_sql(ctx),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::time_dimension::shift_bound_wall_clock;
+
+    fn shifted(date: &str, interval: &str, subtract: bool) -> String {
+        shift_bound_wall_clock(
+            Tz::America__Los_Angeles,
+            date,
+            &Some(interval.to_string()),
+            subtract,
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    // An hour of interval is an hour of wall clock, on both sides of a
+    // spring-forward. Absolute arithmetic would answer 17:00 / 13:00 here,
+    // putting the band an hour inside the one the stage's SQL reads.
+    #[test]
+    fn a_sub_day_shift_moves_the_wall_clock_across_a_dst_boundary() {
+        assert_eq!(
+            shifted("2024-03-10T12:00:00.000", "18 hour", true),
+            "2024-03-09T18:00:00.000"
+        );
+        assert_eq!(
+            shifted("2024-03-09T18:00:00.000", "18 hour", false),
+            "2024-03-10T12:00:00.000"
+        );
+    }
+
+    // A day is a calendar day, which the spring-forward makes 23 hours long.
+    #[test]
+    fn a_day_shift_stays_on_the_same_clock_time() {
+        assert_eq!(
+            shifted("2024-03-11T09:00:00.000", "1 day", true),
+            "2024-03-10T09:00:00.000"
+        );
+    }
+
+    // A quarter lives in a field of its own, so anything reading months alone
+    // drops it and the band comes back equal to the bare series bounds.
+    #[test]
+    fn a_quarter_shift_moves_three_months() {
+        assert_eq!(
+            shifted("2024-06-15T00:00:00.000", "1 quarter", true),
+            shifted("2024-06-15T00:00:00.000", "3 month", true)
+        );
+        assert_eq!(
+            shifted("2024-06-15T00:00:00.000", "2 quarter", true),
+            "2023-12-15T00:00:00.000"
+        );
+    }
+
+    #[test]
+    fn an_unbounded_side_states_no_bound() {
+        assert_eq!(
+            shift_bound_wall_clock(
+                Tz::America__Los_Angeles,
+                "2024-03-10T12:00:00.000",
+                &Some("unbounded".to_string()),
+                true
+            )
+            .unwrap(),
+            None
+        );
+    }
+}

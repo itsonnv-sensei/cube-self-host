@@ -1,0 +1,1154 @@
+/* eslint-disable global-require,no-return-assign */
+import crypto from 'crypto';
+import fs from 'fs-extra';
+import { LRUCache } from 'lru-cache';
+import isDocker from 'is-docker';
+import pLimit from 'p-limit';
+
+import {
+  ApiGateway,
+  ApiGatewayOptions,
+  UserBackgroundContext
+} from '@cubejs-backend/api-gateway';
+import {
+  CancelableInterval,
+  createCancelableInterval,
+  formatDuration,
+  getEnv,
+  assertDataSource,
+  getRealType,
+  hasPreAggregationsEnvVars,
+  internalExceptions,
+  INVALID_REQUEST_ID_MESSAGE,
+  isValidRequestId,
+  memoizeByObject,
+  pinPreAggregationsSchema,
+  releasePreAggregationsSchemaPin,
+  track,
+  FileRepository,
+  SchemaFileRepository,
+  withLogRedaction,
+} from '@cubejs-backend/shared';
+
+import type { Application as ExpressApplication, Response as ExpressResponse, NextFunction as ExpressNextFunction } from 'express';
+
+import { BaseDriver, DriverFactoryByDataSource } from '@cubejs-backend/query-orchestrator';
+import type { Request as ApiGatewayRequest, SubscriptionServer, WebSocketSendMessageFn } from '@cubejs-backend/api-gateway';
+
+import { RefreshScheduler, ScheduledRefreshOptions } from './RefreshScheduler';
+import { OrchestratorApi, OrchestratorApiOptions } from './OrchestratorApi';
+import { CompilerApi, type CompilerApiOptions } from './CompilerApi';
+import { DevServer } from './DevServer';
+import { agentCollect } from './agentCollect';
+import { OrchestratorStorage } from './OrchestratorStorage';
+import { createLogger } from './logger';
+import { OptsHandler } from './OptsHandler';
+import {
+  driverDependencies,
+  lookupDriverClass,
+  isDriver,
+  createDriver,
+  getDriverMaxPool,
+} from './DriverResolvers';
+
+import type {
+  CreateOptions,
+  SystemOptions,
+  ServerCoreInitializedOptions,
+  ContextToAppIdFn,
+  DatabaseType,
+  DbTypeInternalFn,
+  DbTypeInternalContext,
+  ExternalDbTypeFn,
+  OrchestratorOptionsFn,
+  OrchestratorInitedOptions,
+  PreAggregationsSchemaFn,
+  RequestContext,
+  DriverContext,
+  LoggerFn,
+  DriverConfig,
+  ScheduledRefreshTimeZonesFn,
+  ContextToCubeStoreRouterIdFn,
+  ContextToPreAggregationOrchestratorIdFn,
+  LoggerFnParams,
+} from './types';
+import {
+  ContextToOrchestratorIdFn,
+  ContextAcceptanceResult,
+  ContextAcceptanceResultHttp,
+  ContextAcceptanceResultWs,
+  ContextAcceptor
+} from './types';
+
+const { version } = require('../../../package.json');
+
+function wrapToFnIfNeeded<T, R>(possibleFn: T | ((a: R) => T)): (a: R) => T {
+  if (typeof possibleFn === 'function') {
+    return <any>possibleFn;
+  }
+
+  return () => possibleFn;
+}
+
+class AcceptAllAcceptor implements ContextAcceptor {
+  public async shouldAccept(): Promise<ContextAcceptanceResult> {
+    return { accepted: true };
+  }
+
+  public async shouldAcceptHttp(): Promise<ContextAcceptanceResultHttp> {
+    return { accepted: true };
+  }
+
+  public async shouldAcceptWs(): Promise<ContextAcceptanceResultWs> {
+    return { accepted: true };
+  }
+}
+
+export class CubejsServerCore {
+  /**
+   * Returns core version based on package.json.
+   */
+  public static version() {
+    return version;
+  }
+
+  /**
+   * Resolve driver module name by db type.
+   */
+  public static driverDependencies = driverDependencies;
+
+  /**
+   * Resolve driver module object by db type.
+   */
+  public static lookupDriverClass = lookupDriverClass;
+
+  /**
+   * Create new driver instance by specified database type.
+   */
+  public static createDriver = createDriver;
+
+  /**
+   * Calculate and returns driver's max pool number.
+   */
+  public static getDriverMaxPool = getDriverMaxPool;
+
+  public repository: FileRepository;
+
+  protected devServer: DevServer | undefined;
+
+  protected readonly orchestratorStorage: OrchestratorStorage = new OrchestratorStorage();
+
+  /**
+   * In-flight orchestrator api builds, by id. Concurrent callers of a cold id must
+   * share one build: `OrchestratorStorage` releases a replaced entry, so a second
+   * build closes the Cube Store connection of the api the first caller is using.
+   */
+  protected readonly buildingOrchestratorApis: Map<string, Promise<OrchestratorApi>> = new Map();
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  protected repositoryFactory: ((context: RequestContext) => SchemaFileRepository) | (() => FileRepository);
+
+  protected contextToDbType: DbTypeInternalFn;
+
+  protected contextToExternalDbType: ExternalDbTypeFn;
+
+  protected compilerCache: LRUCache<string, CompilerApi>;
+
+  protected readonly contextToOrchestratorId: ContextToOrchestratorIdFn;
+
+  protected readonly contextToCubeStoreRouterId: ContextToCubeStoreRouterIdFn | null;
+
+  protected readonly contextToPreAggregationOrchestratorId: ContextToPreAggregationOrchestratorIdFn;
+
+  protected readonly preAggregationsSchema: PreAggregationsSchemaFn;
+
+  /**
+   * This instance's share of the process-wide pre-aggregation schema pin, when it took
+   * one. Undefined when it did not, or once shutdown has released it.
+   */
+  private heldPreAggregationsSchemaPin: symbol | undefined;
+
+  protected readonly scheduledRefreshTimeZones: ScheduledRefreshTimeZonesFn;
+
+  protected readonly orchestratorOptions: OrchestratorOptionsFn;
+
+  public logger: LoggerFn;
+
+  protected optsHandler: OptsHandler;
+
+  protected preAgentLogger: any;
+
+  protected readonly options: ServerCoreInitializedOptions;
+
+  protected readonly contextToAppId: ContextToAppIdFn = () => process.env.CUBEJS_APP || 'STANDALONE';
+
+  protected readonly standalone: boolean = true;
+
+  protected maxCompilerCacheKeep: NodeJS.Timeout | null = null;
+
+  protected scheduledRefreshTimerInterval: CancelableInterval | null = null;
+
+  protected driver: BaseDriver | null = null;
+
+  protected apiGatewayInstance: ApiGateway | null = null;
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  public readonly event: (name: string, props?: object) => Promise<void>;
+
+  public projectFingerprint: string | null = null;
+
+  public coreServerVersion: string | null = null;
+
+  protected contextAcceptor: ContextAcceptor;
+
+  public constructor(
+    opts: CreateOptions = {},
+    protected readonly systemOptions?: SystemOptions,
+  ) {
+    this.coreServerVersion = version;
+
+    // Same resolution the gateway and OptsHandler do, so a `devServer: true` embedder
+    // gets the dev logger and unredacted SQL, and a `devServer: false` one gets neither
+    // from the env var alone
+    const devMode = opts.devServer ?? getEnv('devMode');
+
+    const logger = opts.logger || createLogger(
+      !devMode,
+      getEnv('logLevel'),
+    );
+    // Wraps the log sink only: the agent and telemetry wrappers installed below
+    // sit outside it and forward the original params
+    this.logger = getEnv('logRedaction', devMode) ? withLogRedaction(logger) : logger;
+
+    this.optsHandler = new OptsHandler(this, opts, systemOptions);
+    this.options = this.optsHandler.getCoreInitializedOptions();
+
+    this.repository = new FileRepository(this.options.schemaPath);
+    this.repositoryFactory = this.options.repositoryFactory || (() => this.repository);
+
+    this.contextToDbType = this.options.dbType;
+    this.contextToExternalDbType = wrapToFnIfNeeded(this.options.externalDbType);
+    this.preAggregationsSchema = wrapToFnIfNeeded(this.options.preAggregationsSchema);
+    this.orchestratorOptions = wrapToFnIfNeeded(this.options.orchestratorOptions);
+    this.scheduledRefreshTimeZones = wrapToFnIfNeeded(this.options.scheduledRefreshTimeZones || []);
+
+    this.compilerCache = new LRUCache<string, CompilerApi>({
+      max: this.options.compilerCacheSize || 250,
+      ttl: this.options.maxCompilerCacheKeepAlive,
+      updateAgeOnGet: this.options.updateCompilerCacheKeepAlive,
+      // needed to clear the setInterval timer for proactive cache internal cleanups
+      dispose: (v) => v.dispose(),
+    });
+
+    // A request reaches the context functions through many code paths, while they can be costly
+    // user code, so each runs once per request context
+    if (this.options.contextToAppId) {
+      this.contextToAppId = memoizeByObject(this.options.contextToAppId);
+      this.standalone = false;
+    }
+
+    this.contextAcceptor = this.createContextAcceptor();
+
+    if (this.options.contextToDataSourceId) {
+      throw new Error('contextToDataSourceId has been deprecated and removed. Use contextToOrchestratorId instead.');
+    }
+
+    this.contextToOrchestratorId = this.options.contextToOrchestratorId
+      ? memoizeByObject(this.options.contextToOrchestratorId)
+      : () => 'STANDALONE';
+    this.contextToCubeStoreRouterId = this.options.contextToCubeStoreRouterId
+      ? memoizeByObject(this.options.contextToCubeStoreRouterId)
+      : this.options.contextToCubeStoreRouterId;
+    this.contextToPreAggregationOrchestratorId = this.resolveContextToPreAggregationOrchestratorId();
+
+    // proactively free up old cache values occasionally
+    if (this.options.maxCompilerCacheKeepAlive) {
+      this.maxCompilerCacheKeep = setInterval(
+        () => this.compilerCache.purgeStale(),
+        this.options.maxCompilerCacheKeepAlive
+      );
+    }
+
+    this.startScheduledRefreshTimer();
+
+    this.event = async (event, props: LoggerFnParams) => {
+      if (!this.options.telemetry) {
+        return;
+      }
+
+      if (!this.projectFingerprint) {
+        try {
+          this.projectFingerprint = crypto.createHash('md5')
+            .update(JSON.stringify(fs.readJsonSync('package.json')))
+            .digest('hex');
+        } catch (e) {
+          internalExceptions(e as Error);
+        }
+      }
+
+      const internalExceptionsEnv = getEnv('internalExceptions');
+
+      try {
+        await track({
+          timestamp: new Date().toJSON(),
+          event,
+          projectFingerprint: this.projectFingerprint,
+          coreServerVersion: this.coreServerVersion,
+          dockerVersion: getEnv('dockerImageVersion'),
+          isDocker: isDocker(),
+          internalExceptions: internalExceptionsEnv !== 'false' ? internalExceptionsEnv : undefined,
+          ...props
+        });
+      } catch (e) {
+        internalExceptions(e as Error);
+      }
+    };
+
+    this.initAgent();
+
+    if (this.options.devServer && !this.isReadyForQueryProcessing()) {
+      this.event('first_server_start');
+    }
+
+    if (this.options.devServer) {
+      this.devServer = new DevServer(this, {
+        dockerVersion: getEnv('dockerImageVersion'),
+        externalDbTypeFn: this.contextToExternalDbType,
+        isReadyForQueryProcessing: this.isReadyForQueryProcessing.bind(this)
+      });
+      const oldLogger = this.logger;
+      this.logger = ((msg, params) => {
+        if (
+          msg === 'Load Request' ||
+          msg === 'Load Request Success' ||
+          msg === 'Orchestrator error' ||
+          msg === 'Internal Server Error' ||
+          msg === 'User Error' ||
+          msg === 'Compiling schema' ||
+          msg === 'Recompiling schema' ||
+          msg === 'Slow Query Warning' ||
+          msg === 'Cube SQL Error'
+        ) {
+          const props = {
+            error: params.redactedError ?? params.error,
+            ...(params.apiType ? { apiType: params.apiType } : {}),
+            ...(params.protocol ? { protocol: params.protocol } : {}),
+            ...(params.appName ? { appName: params.appName } : {}),
+            ...(params.sanitizedQuery ? { query: params.sanitizedQuery } : {}),
+          };
+
+          this.event(msg, props);
+        }
+        oldLogger(msg, params);
+      });
+
+      if (!process.env.CI) {
+        process.on('uncaughtException', this.onUncaughtException);
+      }
+    } else {
+      const oldLogger = this.logger;
+      let loadRequestCount = 0;
+      let loadSqlRequestCount = 0;
+
+      this.logger = ((msg, params) => {
+        if (msg === 'Load Request Success') {
+          if (params.apiType === 'sql') {
+            loadSqlRequestCount++;
+          } else {
+            loadRequestCount++;
+          }
+        } else if (msg === 'Cube SQL Error') {
+          const props = {
+            error: params.redactedError ?? params.error,
+            apiType: params.apiType,
+            protocol: params.protocol,
+            ...(params.appName ? { appName: params.appName } : {}),
+            ...(params.sanitizedQuery ? { query: params.sanitizedQuery } : {}),
+          };
+          this.event(msg, props);
+        }
+        oldLogger(msg, params);
+      });
+
+      if (this.options.telemetry) {
+        setInterval(() => {
+          if (loadRequestCount > 0 || loadSqlRequestCount > 0) {
+            this.event('Load Request Success Aggregated', { loadRequestSuccessCount: loadRequestCount, loadSqlRequestSuccessCount: loadSqlRequestCount });
+          }
+          loadRequestCount = 0;
+          loadSqlRequestCount = 0;
+        }, 60000);
+      }
+
+      this.event('Server Start');
+    }
+
+    // Last in the constructor, so anything that throws above takes no pin; shutdown
+    // releases it
+    if (typeof this.options.preAggregationsSchema === 'string') {
+      this.heldPreAggregationsSchemaPin =
+        pinPreAggregationsSchema(this.options.preAggregationsSchema);
+    }
+  }
+
+  protected createContextAcceptor(): ContextAcceptor {
+    return new AcceptAllAcceptor();
+  }
+
+  /**
+   * Determines whether current instance is ready to process queries.
+   */
+  protected isReadyForQueryProcessing(): boolean {
+    return this.optsHandler.configuredForQueryProcessing();
+  }
+
+  public startScheduledRefreshTimer(): [boolean, string | null] {
+    if (!this.isReadyForQueryProcessing()) {
+      return [false, 'Instance is not ready for query processing, refresh scheduler is disabled'];
+    }
+
+    if (this.scheduledRefreshTimerInterval) {
+      return [true, null];
+    }
+    if (this.optsHandler.configuredForScheduledRefresh()) {
+      const scheduledRefreshTimer = this.optsHandler.getScheduledRefreshInterval();
+      this.scheduledRefreshTimerInterval = createCancelableInterval(
+        () => this.handleScheduledRefreshInterval({}),
+        {
+          interval: scheduledRefreshTimer,
+          onDuplicatedExecution: (intervalId) => this.logger('Refresh Scheduler Interval', {
+            warning: `Previous interval #${intervalId} was not finished with ${scheduledRefreshTimer} interval`
+          }),
+          onDuplicatedStateResolved: (intervalId, elapsed) => this.logger('Refresh Scheduler Long Execution', {
+            warning: `Interval #${intervalId} finished after ${formatDuration(elapsed)}. Please consider reducing total number of partitions by using rollup_lambda pre-aggregations.`
+          })
+        }
+      );
+
+      return [true, null];
+    }
+
+    return [false, 'Instance configured without scheduler refresh timer, refresh scheduler is disabled'];
+  }
+
+  /**
+   * Reload global variables and updates drivers according to new values.
+   *
+   * Note: currently there is no way to change CubejsServerCore.options,
+   * as so, we are not refreshing CubejsServerCore.options.dbType and
+   * CubejsServerCore.options.driverFactory here. If this will be changed,
+   * we will need to do this in order to update driver.
+   */
+  protected reloadEnvVariables() {
+    this.driver = null;
+    this.options.externalDbType = this.options.externalDbType ||
+      <DatabaseType | undefined>process.env.CUBEJS_EXT_DB_TYPE;
+    this.options.schemaPath = process.env.CUBEJS_SCHEMA_PATH || this.options.schemaPath;
+    this.contextToExternalDbType = wrapToFnIfNeeded(this.options.externalDbType);
+  }
+
+  protected initAgent() {
+    const agentEndpointUrl = getEnv('agentEndpointUrl');
+    if (agentEndpointUrl) {
+      const oldLogger = this.logger;
+      this.preAgentLogger = oldLogger;
+
+      this.logger = (msg, params) => {
+        // Filling timestamp as much as earlier as we can, otherwise it can be incorrect. Because next code is async
+        // with await points which can be delayed with Node.js micro-tasking.
+        params.timestamp = params.timestamp || new Date().toJSON();
+
+        oldLogger(msg, params);
+        agentCollect(
+          {
+            msg,
+            ...params
+          },
+          agentEndpointUrl,
+          oldLogger
+        );
+      };
+    }
+  }
+
+  protected async flushAgent() {
+    const agentEndpointUrl = getEnv('agentEndpointUrl');
+    if (agentEndpointUrl) {
+      await agentCollect(
+        { msg: 'Flush Agent' },
+        agentEndpointUrl,
+        this.preAgentLogger
+      );
+    }
+  }
+
+  public async initApp(app: ExpressApplication) {
+    const apiGateway = this.apiGateway();
+    apiGateway.initApp(app);
+
+    if (this.options.devServer) {
+      this.devServer.initDevEnv(app, this.options);
+    } else {
+      app.get('/', (req, res) => {
+        res.status(200)
+          .send('<html><body>Cube server is running in production mode. <a href="https://docs.cube.dev/cube-core/deployment#production-checklist">Learn more about production mode</a>.</body></html>');
+      });
+    }
+  }
+
+  public initSubscriptionServer(sendMessage: WebSocketSendMessageFn): SubscriptionServer {
+    const apiGateway = this.apiGateway();
+    return apiGateway.initSubscriptionServer(sendMessage);
+  }
+
+  public initSQLServer() {
+    const apiGateway = this.apiGateway();
+    return apiGateway.getSQLServer();
+  }
+
+  protected apiGateway(): ApiGateway {
+    if (this.apiGatewayInstance) {
+      return this.apiGatewayInstance;
+    }
+
+    return (this.apiGatewayInstance = this.createApiGatewayInstance(
+      this.options.apiSecret,
+      this.getCompilerApi.bind(this),
+      this.getOrchestratorApi.bind(this),
+      this.logger,
+      {
+        standalone: this.standalone,
+        devServer: this.options.devServer,
+        dataSourceStorage: this.orchestratorStorage,
+        basePath: this.options.basePath,
+        contextRejectionMiddleware: this.contextRejectionMiddleware.bind(this),
+        wsContextAcceptor: this.contextAcceptor.shouldAcceptWs.bind(this.contextAcceptor),
+        checkAuth: this.options.checkAuth,
+        queryRewrite:
+          this.options.queryRewrite || this.options.queryTransformer,
+        extendContext: this.options.extendContext,
+        playgroundAuthSecret: getEnv('playgroundAuthSecret'),
+        apiSecrets: this.options.apiSecrets,
+        jwt: this.options.jwt,
+        refreshScheduler: this.getRefreshScheduler.bind(this),
+        scheduledRefreshContexts: this.options.scheduledRefreshContexts,
+        scheduledRefreshTimeZones: this.scheduledRefreshTimeZones,
+        serverCoreVersion: this.coreServerVersion,
+        contextToApiScopes: this.options.contextToApiScopes,
+        gatewayPort: this.options.gatewayPort,
+        event: this.event,
+      }
+    ));
+  }
+
+  protected createApiGatewayInstance(
+    apiSecret: string,
+    getCompilerApi: (context: RequestContext) => Promise<CompilerApi>,
+    getOrchestratorApi: (context: RequestContext) => Promise<OrchestratorApi>,
+    logger: LoggerFn,
+    options: ApiGatewayOptions
+  ): ApiGateway {
+    return new ApiGateway(apiSecret, getCompilerApi, getOrchestratorApi, logger, options);
+  }
+
+  protected async contextRejectionMiddleware(req: ApiGatewayRequest, res: ExpressResponse, next: ExpressNextFunction) {
+    if (!this.standalone) {
+      const result = await this.contextAcceptor.shouldAcceptHttp(req.context);
+      if (!result.accepted) {
+        res.writeHead(result.rejectStatusCode!, result.rejectHeaders!);
+        res.send();
+        return;
+      }
+    }
+    if (next) {
+      next();
+    }
+  }
+
+  public async getCompilerApi(context: RequestContext) {
+    const appId = await this.contextToAppId(context);
+    let compilerApi = this.compilerCache.get(appId);
+    const currentSchemaVersion = this.options.schemaVersion && (() => this.options.schemaVersion(context));
+
+    if (!compilerApi) {
+      compilerApi = this.createCompilerApi(
+        this.repositoryFactory(context),
+        {
+          dbType: async (dataSourceContext: DbTypeInternalContext) => {
+            const dbType = await this.contextToDbType({ ...context, ...dataSourceContext });
+            return dbType;
+          },
+          externalDbType: this.contextToExternalDbType(context),
+          dialectClass: (dialectContext: { dataSource: string; dbType: string }) => (
+            this.options.dialectFactory &&
+            this.options.dialectFactory({ ...context, ...dialectContext })
+          ),
+          externalDialectClass: this.options.externalDialectFactory && this.options.externalDialectFactory(context),
+          schemaVersion: currentSchemaVersion,
+          contextToGroups: this.options.contextToGroups,
+          preAggregationsSchema: await this.preAggregationsSchema(context),
+          context,
+          allowJsDuplicatePropsInSchema: this.options.allowJsDuplicatePropsInSchema,
+          allowNodeRequire: this.options.allowNodeRequire,
+          fastReload: this.options.fastReload,
+          onCompiled: () => this.evictCompilersOverMemberBudget(appId),
+        },
+      );
+
+      this.compilerCache.set(appId, compilerApi);
+    }
+
+    compilerApi.schemaVersion = currentSchemaVersion;
+    return compilerApi;
+  }
+
+  /**
+   * Never evicts `keepAppId`, nor the last model holding members, whatever its size:
+   * a model alone over budget would otherwise recompile on every request.
+   */
+  protected evictCompilersOverMemberBudget(keepAppId: string): void {
+    const budget = this.options.maxCompiledMembers;
+
+    if (!budget) {
+      return;
+    }
+
+    let total = 0;
+    let models = 0;
+
+    for (const api of this.compilerCache.values()) {
+      total += api.compiledMemberCount;
+      models += api.compiledMemberCount ? 1 : 0;
+    }
+
+    if (total <= budget) {
+      return;
+    }
+
+    const evicted: string[] = [];
+
+    // rkeys() walks least-recently-used first, so the models that go are the
+    // ones longest unused. peek() rather than get(), which would mark the
+    // model as freshly used and reorder the very list being walked.
+    for (const appId of [...this.compilerCache.rkeys()]) {
+      if (total <= budget) {
+        break;
+      }
+
+      const api = appId === keepAppId ? undefined : this.compilerCache.peek(appId);
+
+      // A model still compiling has no member count yet. Dropping one frees
+      // nothing, and disposing a compile in flight only makes its tenant
+      // start over -- so skip anything with nothing to free.
+      if (api?.compiledMemberCount) {
+        // The floor `keepAppId` gives fails when that app is no longer cached,
+        // e.g. an evicted instance recompiling. Walking LRU first, this keeps
+        // the most recently used model.
+        if (models <= 1) {
+          break;
+        }
+
+        total -= api.compiledMemberCount;
+        models -= 1;
+        this.compilerCache.delete(appId);
+        evicted.push(appId);
+      }
+    }
+
+    if (evicted.length) {
+      this.logger('Compiler cache member budget exceeded', {
+        budget,
+        membersAfterEviction: total,
+        evictedAppIds: evicted.length,
+        compiledAppIds: this.compilerCache.size,
+      });
+    }
+  }
+
+  public async resetInstanceState() {
+    await this.orchestratorStorage.releaseConnections();
+
+    this.orchestratorStorage.clear();
+    // A build still in flight would otherwise keep handing its pre-reset api --
+    // built from the pre-reset context and the env this is about to reload -- to
+    // every caller arriving until it settles.
+    this.buildingOrchestratorApis.clear();
+    this.compilerCache.clear();
+
+    this.reloadEnvVariables();
+
+    this.repository = new FileRepository(this.options.schemaPath);
+    this.repositoryFactory = this.options.repositoryFactory || (() => this.repository);
+
+    this.startScheduledRefreshTimer();
+  }
+
+  protected resolveContextToPreAggregationOrchestratorId(): ContextToPreAggregationOrchestratorIdFn {
+    if (this.options.contextToPreAggregationOrchestratorId) {
+      return memoizeByObject(this.options.contextToPreAggregationOrchestratorId);
+    }
+
+    if (this.contextToCubeStoreRouterId && getEnv('preAggregationsOrchestratorIdFromRouter')) {
+      return this.contextToCubeStoreRouterId;
+    }
+
+    return this.contextToOrchestratorId;
+  }
+
+  public async getOrchestratorApi(context: RequestContext): Promise<OrchestratorApi> {
+    const orchestratorId = await this.contextToOrchestratorId(context);
+
+    if (this.orchestratorStorage.has(orchestratorId)) {
+      return this.orchestratorStorage.get(orchestratorId);
+    }
+
+    const building = this.buildingOrchestratorApis.get(orchestratorId);
+
+    if (building) {
+      return building;
+    }
+
+    // Registered before the first `await` in the build, so nothing can interleave
+    // between the miss above and this line.
+    const pending = this.buildOrchestratorApi(orchestratorId, context)
+      .finally(() => {
+        // Dropped once settled: a success is in the cache by now, and a failure must
+        // not become the cached answer for this id. Identity-checked because
+        // `resetInstanceState()` clears the map mid-build, after which the entry
+        // belongs to a later caller's build rather than to this one.
+        if (this.buildingOrchestratorApis.get(orchestratorId) === pending) {
+          this.buildingOrchestratorApis.delete(orchestratorId);
+        }
+      });
+
+    this.buildingOrchestratorApis.set(orchestratorId, pending);
+
+    return pending;
+  }
+
+  protected async buildOrchestratorApi(orchestratorId: string, context: RequestContext): Promise<OrchestratorApi> {
+    /**
+     * Hash table to store promises which will be resolved with the
+     * datasource drivers. DriverFactoryByDataSource function is closure
+     * this constant.
+     */
+    const driverPromise: Record<string, Promise<BaseDriver>> = {};
+
+    let externalPreAggregationsDriverPromise: Promise<BaseDriver> | null = null;
+
+    const contextToDbType: DbTypeInternalFn = this.contextToDbType.bind(this);
+    const externalDbType = this.contextToExternalDbType(context);
+    // An orchestrator is cached by its own id, so its pre-aggregation id comes from
+    // the context that built it, as its other per-context options do
+    const preAggregationOrchestratorId = `${await this.contextToPreAggregationOrchestratorId(context)}`;
+    // Every query asks for the type of its data source, and the default `dbType` calls
+    // `driverFactory` to answer, but the answer depends only on this orchestrator's context
+    const dbTypeByDataSource = new Map<string, ReturnType<DbTypeInternalFn>>();
+
+    // orchestrator options can be empty, if user didn't define it.
+    // so we are adding default and configuring queues concurrency.
+    const orchestratorOptions =
+      this.optsHandler.getOrchestratorInitializedOptions(
+        context,
+        (await this.orchestratorOptions(context)) || {},
+      );
+
+    const orchestratorApi = this.createOrchestratorApi(
+      /**
+       * Driver factory function `DriverFactoryByDataSource`.
+       */
+      async (dataSource = 'default', preAggregations = false) => {
+        const factoryKey = preAggregations ? `${dataSource}@pre_agg` : dataSource;
+        if (driverPromise[factoryKey]) {
+          return driverPromise[factoryKey];
+        }
+
+        const hasSeparatePreAggEnv = hasPreAggregationsEnvVars(dataSource);
+        const usePreAgg = preAggregations && hasSeparatePreAggEnv && !this.optsHandler.isCustomDriverFactory();
+
+        if (preAggregations && hasSeparatePreAggEnv && this.optsHandler.isCustomDriverFactory()) {
+          this.logger('Pre-aggregation driver conflict', {
+            error: 'Both driverFactory and PRE_AGGREGATIONS env vars are defined. driverFactory will take precedence.',
+            dataSource,
+          });
+        }
+
+        driverPromise[factoryKey] = (async () => {
+          let driver: BaseDriver | null = null;
+
+          try {
+            driver = await this.resolveDriver(
+              {
+                ...context,
+                dataSource,
+                preAggregations: usePreAgg || false,
+              },
+              orchestratorOptions,
+            );
+
+            if (typeof driver === 'object' && driver != null) {
+              if (driver.setLogger) {
+                driver.setLogger(this.logger);
+              }
+
+              await driver.testConnection();
+
+              return driver;
+            }
+
+            throw new Error(
+              `Unexpected return type, driverFactory must return driver (dataSource: "${dataSource}"), actual: ${getRealType(driver)}`
+            );
+          } catch (e) {
+            driverPromise[factoryKey] = null;
+
+            if (!preAggregations && !hasSeparatePreAggEnv) {
+              driverPromise[`${dataSource}@pre_agg`] = null;
+            }
+
+            if (driver) {
+              await driver.release();
+            }
+
+            throw e;
+          }
+        })();
+
+        // No separate pre-agg driver needed — share the same promise for both keys
+        if (!preAggregations && !hasSeparatePreAggEnv) {
+          driverPromise[`${dataSource}@pre_agg`] = driverPromise[factoryKey];
+        }
+
+        return driverPromise[factoryKey];
+      },
+      {
+        externalDriverFactory: this.options.externalDriverFactory && (async () => {
+          if (externalPreAggregationsDriverPromise) {
+            return externalPreAggregationsDriverPromise;
+          }
+
+          // eslint-disable-next-line no-return-assign
+          return externalPreAggregationsDriverPromise = (async () => {
+            let driver: BaseDriver | null = null;
+
+            try {
+              driver = await this.options.externalDriverFactory(context);
+              if (typeof driver === 'object' && driver != null) {
+                if (driver.setLogger) {
+                  driver.setLogger(this.logger);
+                }
+
+                await driver.testConnection();
+
+                return driver;
+              }
+
+              throw new Error(
+                `Unexpected return type, externalDriverFactory must return driver, actual: ${getRealType(driver)}`
+              );
+            } catch (e) {
+              externalPreAggregationsDriverPromise = null;
+
+              if (driver) {
+                await driver.release();
+              }
+
+              throw e;
+            }
+          })();
+        }),
+        contextToDbType: (dataSource) => {
+          let dbType = dbTypeByDataSource.get(dataSource);
+          if (!dbType) {
+            dbType = Promise.resolve(contextToDbType({ ...context, dataSource }));
+            dbTypeByDataSource.set(dataSource, dbType);
+            dbType.catch(() => dbTypeByDataSource.delete(dataSource));
+          }
+          return dbType;
+        },
+        // speedup with cache
+        contextToExternalDbType: () => externalDbType,
+        redisPrefix: orchestratorId,
+        // Set whenever a pre-aggregation id is configured, even one equal to this orchestrator's,
+        // so it waits for the others sharing it. Unset by default, so `orchestratorOptions.redisPrefix`
+        // still keys the pre-aggregation queues and caches
+        preAggregationsRedisPrefix: this.contextToPreAggregationOrchestratorId !== this.contextToOrchestratorId
+          ? preAggregationOrchestratorId
+          : undefined,
+        skipExternalCacheAndQueue: externalDbType === 'cubestore',
+        cacheAndQueueDriver: this.options.cacheAndQueueDriver,
+        ...orchestratorOptions,
+      }
+    );
+
+    this.orchestratorStorage.set(orchestratorId, orchestratorApi);
+
+    return orchestratorApi;
+  }
+
+  protected createCompilerApi(repository: SchemaFileRepository, options: Record<string, any> = {}) {
+    return new CompilerApi(
+      repository,
+      options.dbType || this.options.dbType,
+      this.createCompilerApiOptions(options),
+    );
+  }
+
+  protected createCompilerApiOptions(options: Record<string, any> = {}): CompilerApiOptions {
+    return {
+      schemaVersion: options.schemaVersion || this.options.schemaVersion,
+      contextToGroups: this.options.contextToGroups,
+      devServer: this.options.devServer,
+      logger: this.logger,
+      externalDbType: options.externalDbType,
+      preAggregationsSchema: options.preAggregationsSchema,
+      allowUngroupedWithoutPrimaryKey:
+          this.options.allowUngroupedWithoutPrimaryKey ||
+          getEnv('allowUngroupedWithoutPrimaryKey'),
+      convertTzForRawTimeDimension: getEnv('convertTzForRawTimeDimension'),
+      localRefreshKey: getEnv('refreshKeyLocalTime'),
+      compileContext: options.context,
+      dialectClass: options.dialectClass,
+      externalDialectClass: options.externalDialectClass,
+      allowJsDuplicatePropsInSchema: options.allowJsDuplicatePropsInSchema,
+      sqlCache: this.options.sqlCache,
+      standalone: this.standalone,
+      allowNodeRequire: options.allowNodeRequire,
+      fastReload: options.fastReload || getEnv('fastReload'),
+      compilerCacheSize: this.options.compilerCacheSize || 250,
+      maxCompilerCacheKeepAlive: this.options.maxCompilerCacheKeepAlive,
+      updateCompilerCacheKeepAlive: this.options.updateCompilerCacheKeepAlive,
+      onCompiled: options.onCompiled,
+    };
+  }
+
+  protected createOrchestratorApi(
+    getDriver: DriverFactoryByDataSource,
+    options: OrchestratorApiOptions
+  ): OrchestratorApi {
+    return new OrchestratorApi(
+      getDriver,
+      this.logger,
+      options
+    );
+  }
+
+  /**
+   * @internal Please don't use this method directly, use refreshTimer
+   */
+  public handleScheduledRefreshInterval = async (options: ScheduledRefreshOptions) => {
+    const allContexts = await this.options.scheduledRefreshContexts();
+    if (allContexts.length < 1) {
+      this.logger('Refresh Scheduler Error', {
+        error: 'At least one context should be returned by scheduledRefreshContexts'
+      });
+    }
+
+    const contexts: RequestContext[] = [];
+
+    for (const allContext of allContexts) {
+      const resContext = this.migrateBackgroundContext(allContext);
+      const res = await this.contextAcceptor.shouldAccept(resContext);
+
+      if (res.accepted) {
+        contexts.push(resContext || <RequestContext>{});
+      }
+    }
+
+    const batchLimit = pLimit(this.options.scheduledRefreshBatchSize);
+    return Promise.all(
+      contexts
+        .map((context) => async () => {
+          const queryingOptions: any = {
+            ...options,
+            concurrency: this.options.scheduledRefreshConcurrency,
+          };
+
+          const timezonesFromOptionsOrSecurityContext = await this.scheduledRefreshTimeZones(context);
+          if (timezonesFromOptionsOrSecurityContext.length > 0) {
+            queryingOptions.timezones = timezonesFromOptionsOrSecurityContext;
+          }
+
+          return this.runScheduledRefresh(context, queryingOptions);
+        })
+        // Limit the number of refresh contexts we process per iteration
+        .map(batchLimit)
+    );
+  };
+
+  protected getRefreshScheduler() {
+    return new RefreshScheduler(this);
+  }
+
+  /**
+   * @internal Please don't use this method directly, use refreshTimer
+   */
+  public async runScheduledRefresh(context: UserBackgroundContext | null, queryingOptions?: ScheduledRefreshOptions) {
+    return this.getRefreshScheduler().runScheduledRefresh(
+      this.migrateBackgroundContext(context),
+      queryingOptions
+    );
+  }
+
+  protected warningBackgroundContextShow: boolean = false;
+
+  protected migrateBackgroundContext(ctx: UserBackgroundContext | null): RequestContext | null {
+    let result: any = null;
+
+    // We renamed authInfo to securityContext, but users can continue to use both ways
+    if (ctx) {
+      if (ctx.securityContext && !ctx.authInfo) {
+        result = {
+          ...ctx,
+          authInfo: ctx.securityContext,
+        };
+      } else if (ctx.authInfo) {
+        result = {
+          ...ctx,
+          securityContext: ctx.authInfo,
+        };
+
+        if (this.warningBackgroundContextShow) {
+          this.logger('auth_info_deprecation', {
+            warning: (
+              'authInfo was renamed to securityContext, please migrate: ' +
+              'https://github.com/cube-js/cube.js/blob/master/DEPRECATION.md#checkauthmiddleware'
+            )
+          });
+
+          this.warningBackgroundContextShow = false;
+        }
+      }
+    }
+
+    // Comes from server config, so only warn: rejecting it would stop the tenant's refresh
+    if (result?.requestId && !isValidRequestId(result.requestId)) {
+      this.logger('Refresh Scheduler Warning', {
+        warning: `Invalid requestId ${JSON.stringify(result.requestId)} in scheduled refresh context. ${INVALID_REQUEST_ID_MESSAGE}`,
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Returns driver instance by a given context
+   */
+  public async getDriver(
+    context: DriverContext,
+    options?: OrchestratorInitedOptions,
+  ): Promise<BaseDriver> {
+    // TODO (buntarb): this works fine without multiple data sources.
+    if (!this.driver) {
+      const driver = await this.resolveDriver(context, options);
+      await driver.testConnection(); // TODO mutex
+      this.driver = driver;
+    }
+    return this.driver;
+  }
+
+  /**
+   * Resolve driver by the data source.
+   */
+  public async resolveDriver(
+    context: DriverContext,
+    options?: OrchestratorInitedOptions,
+  ): Promise<BaseDriver> {
+    const val = await this.options.driverFactory(context);
+    if (isDriver(val)) {
+      return <BaseDriver>val;
+    } else {
+      const { type, ...rest } = <DriverConfig>val;
+      const opts = Object.keys(rest).length
+        ? rest
+        : {
+          maxPoolSize:
+            await CubejsServerCore.getDriverMaxPool(context, options),
+          testConnectionTimeout: options?.testConnectionTimeout,
+        };
+      opts.dataSource = assertDataSource(context.dataSource);
+      opts.preAggregations = context.preAggregations || false;
+      return CubejsServerCore.createDriver(type, opts);
+    }
+  }
+
+  public async testConnections() {
+    return this.orchestratorStorage.testConnections();
+  }
+
+  public async releaseConnections() {
+    await this.orchestratorStorage.releaseConnections();
+
+    if (this.maxCompilerCacheKeep) {
+      clearInterval(this.maxCompilerCacheKeep);
+    }
+
+    this.compilerCache.clear();
+
+    if (this.scheduledRefreshTimerInterval) {
+      await this.scheduledRefreshTimerInterval.cancel();
+    }
+  }
+
+  public async beforeShutdown() {
+    if (this.maxCompilerCacheKeep) {
+      clearInterval(this.maxCompilerCacheKeep);
+    }
+
+    if (this.scheduledRefreshTimerInterval) {
+      await this.scheduledRefreshTimerInterval.cancel(true);
+    }
+  }
+
+  protected causeErrorPromise: Promise<any> | null = null;
+
+  protected onUncaughtException = async (e: Error) => {
+    console.error(e.stack || e);
+
+    if (e.message && e.message.indexOf('Redis connection to') !== -1) {
+      console.log('🛑 Cube Server requires locally running Redis instance to connect to');
+      if (process.platform.indexOf('win') === 0) {
+        console.log('💾 To install Redis on Windows please use https://github.com/MicrosoftArchive/redis/releases');
+      } else if (process.platform.indexOf('darwin') === 0) {
+        console.log('💾 To install Redis on Mac please use https://redis.io/topics/quickstart or `$ brew install redis`');
+      } else {
+        console.log('💾 To install Redis please use https://redis.io/topics/quickstart');
+      }
+    }
+
+    if (!this.causeErrorPromise) {
+      this.causeErrorPromise = this.event('Dev Server Fatal Error', {
+        error: (e.stack || e.message || e).toString()
+      });
+    }
+
+    await this.causeErrorPromise;
+
+    process.exit(1);
+  };
+
+  public async shutdown() {
+    this.compilerCache.clear();
+
+    // Undefined when this instance never took a share, and cleared here because this
+    // method is public and unguarded: a second call must not release the share again
+    if (this.heldPreAggregationsSchemaPin !== undefined) {
+      const holder = this.heldPreAggregationsSchemaPin;
+
+      this.heldPreAggregationsSchemaPin = undefined;
+      releasePreAggregationsSchemaPin(holder);
+    }
+
+    if (this.devServer) {
+      if (!process.env.CI) {
+        process.removeListener('uncaughtException', this.onUncaughtException);
+      }
+    }
+
+    if (this.apiGatewayInstance) {
+      this.apiGatewayInstance.release();
+    }
+
+    return this.orchestratorStorage.releaseConnections();
+  }
+}

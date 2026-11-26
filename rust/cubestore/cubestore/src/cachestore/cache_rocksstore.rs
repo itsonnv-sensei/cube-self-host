@@ -1,0 +1,3853 @@
+use crate::cachestore::cache_item::{
+    CacheItem, CacheItemIndexKey, CacheItemRocksIndex, CacheItemRocksTable,
+    CACHE_ITEM_SIZE_WITHOUT_VALUE,
+};
+use crate::cachestore::queue_item::{
+    active_keys_to_value, QueueItem, QueueItemIndexKey, QueueItemRocksIndex, QueueItemRocksTable,
+    QueueItemStatus, QueueResultAckEvent, QueueResultAckEventResult, QueueRetrieveResponse,
+};
+use crate::cachestore::queue_result::{QueueResultRocksIndex, QueueResultRocksTable};
+use crate::cachestore::{compaction, QueueItemPayload, QueueResult};
+use crate::config::injection::DIService;
+use crate::config::{Config, ConfigObj};
+use std::collections::HashMap;
+use std::env;
+
+use crate::metastore::{
+    BaseRocksStoreFs, BatchPipe, DbTableRef, IdRow, MetaStoreEvent, MetaStoreFs, RocksPropertyRow,
+    RocksStore, RocksStoreDetails, RocksStoreRWLoop, RocksTable, RocksTableStats,
+};
+use crate::remotefs::LocalDirRemoteFs;
+use crate::util::WorkerLoop;
+use crate::{app_metrics, CubeError};
+use async_trait::async_trait;
+
+use cuberockstore::rocksdb::{BlockBasedOptions, Cache, Options, DB};
+use futures_timer::Delay;
+
+use crate::cachestore::cache_eviction_manager::{CacheEvictionManager, EvictionResult};
+use crate::cachestore::compaction::CompactionPreloadedState;
+use crate::cachestore::listener::RocksCacheStoreListener;
+use crate::cachestore::queue_item_payload::QueueItemPayloadRocksTable;
+use crate::table::{Row, TableValue};
+use chrono::{DateTime, Utc};
+use cuberockstore::rocksdb;
+use datafusion::cube_ext;
+use deepsize::DeepSizeOf;
+use itertools::Itertools;
+use log::{error, trace, warn};
+use serde_derive::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::broadcast::Sender;
+use tokio::task::JoinHandle;
+
+pub(crate) struct RocksCacheStoreDetails {
+    log_enabled: bool,
+}
+
+impl RocksCacheStoreDetails {
+    pub fn new(config: &Arc<dyn ConfigObj>) -> Self {
+        Self {
+            log_enabled: config.cachestore_log_enabled(),
+        }
+    }
+
+    pub fn get_compaction_state() -> CompactionPreloadedState {
+        let mut indexes = HashMap::new();
+
+        macro_rules! populate_indexes {
+            ($TABLE:ident) => {
+                for index in $TABLE::indexes() {
+                    indexes.insert(
+                        $TABLE::index_id(index.get_id()),
+                        crate::metastore::SecondaryIndexInfo {
+                            version: index.version(),
+                            value_version: index.value_version(),
+                        },
+                    );
+                }
+            };
+        }
+
+        populate_indexes!(CacheItemRocksTable);
+        populate_indexes!(QueueItemRocksTable);
+        populate_indexes!(QueueItemPayloadRocksTable);
+        populate_indexes!(QueueResultRocksTable);
+
+        CompactionPreloadedState::new(indexes)
+    }
+}
+
+impl RocksStoreDetails for RocksCacheStoreDetails {
+    fn open_db(&self, path: &Path, config: &Arc<dyn ConfigObj>) -> Result<DB, CubeError> {
+        let rocksdb_config = config.cachestore_rocksdb_config();
+        let compaction_state = Arc::new(Mutex::new(Some(
+            RocksCacheStoreDetails::get_compaction_state(),
+        )));
+
+        let mut opts = Options::default();
+        opts.create_if_missing(true);
+        opts.set_prefix_extractor(cuberockstore::rocksdb::SliceTransform::create_fixed_prefix(
+            13,
+        ));
+        opts.set_compaction_filter_factory(compaction::MetaStoreCacheCompactionFactory::new(
+            compaction_state,
+        ));
+        // TODO(ovr): Decrease after additional fix for get_updates_since
+        opts.set_wal_ttl_seconds(
+            config.meta_store_snapshot_interval() + config.meta_store_log_upload_interval(),
+        );
+        // Disable automatic compaction before migration, will be enabled later in after_migration
+        opts.set_disable_auto_compactions(true);
+
+        let block_opts = {
+            let mut block_opts = BlockBasedOptions::default();
+            // https://github.com/facebook/rocksdb/blob/v7.9.2/include/rocksdb/table.h#L524
+            block_opts.set_format_version(5);
+            block_opts.set_checksum_type(rocksdb_config.checksum_type.as_rocksdb_enum());
+
+            let cache = Cache::new_lru_cache(rocksdb_config.cache_capacity)?;
+            block_opts.set_block_cache(&cache);
+
+            block_opts
+        };
+
+        opts.set_max_background_jobs(rocksdb_config.max_background_jobs as i32);
+        opts.set_max_subcompactions(rocksdb_config.max_subcompactions);
+        opts.set_block_based_table_factory(&block_opts);
+        opts.set_compression_type(rocksdb_config.compression_type);
+        opts.set_bottommost_compression_type(rocksdb_config.bottommost_compression_type);
+        opts.increase_parallelism(rocksdb_config.parallelism as i32);
+
+        DB::open(&opts, path)
+            .map_err(|err| CubeError::internal(format!("DB::open error for cachestore: {}", err)))
+    }
+
+    fn open_readonly_db(&self, path: &Path, config: &Arc<dyn ConfigObj>) -> Result<DB, CubeError> {
+        let rocksdb_config = config.cachestore_rocksdb_config();
+
+        let mut opts = Options::default();
+        opts.set_prefix_extractor(cuberockstore::rocksdb::SliceTransform::create_fixed_prefix(
+            13,
+        ));
+
+        let block_opts = {
+            let mut block_opts = BlockBasedOptions::default();
+            // https://github.com/facebook/rocksdb/blob/v7.9.2/include/rocksdb/table.h#L524
+            block_opts.set_format_version(5);
+            block_opts.set_checksum_type(rocksdb_config.checksum_type.as_rocksdb_enum());
+
+            let cache = Cache::new_lru_cache(rocksdb_config.cache_capacity)?;
+            block_opts.set_block_cache(&cache);
+
+            block_opts
+        };
+
+        opts.set_block_based_table_factory(&block_opts);
+        opts.set_compression_type(rocksdb_config.compression_type);
+        opts.set_bottommost_compression_type(rocksdb_config.bottommost_compression_type);
+
+        DB::open_for_read_only(&opts, path, false).map_err(|err| {
+            CubeError::internal(format!(
+                "DB::open_for_read_only error for cachestore: {}",
+                err
+            ))
+        })
+    }
+
+    fn migrate(&self, table_ref: DbTableRef) -> Result<(), CubeError> {
+        CacheItemRocksTable::new(table_ref.clone()).migrate()?;
+        QueueItemRocksTable::new(table_ref.clone()).migrate()?;
+        QueueResultRocksTable::new(table_ref.clone()).migrate()?;
+        QueueItemPayloadRocksTable::new(table_ref.clone()).migrate()?;
+
+        table_ref
+            .db
+            .set_options(&[("disable_auto_compactions", "false")])?;
+
+        Ok(())
+    }
+
+    fn get_name(&self) -> &'static str {
+        &"cachestore"
+    }
+
+    fn log_enabled(&self) -> bool {
+        self.log_enabled
+    }
+}
+
+pub struct RocksCacheStore {
+    store: Arc<RocksStore>,
+    cache_eviction_manager: CacheEvictionManager,
+    upload_loop: Arc<WorkerLoop>,
+    metrics_loop: Arc<WorkerLoop>,
+    rw_loop_queue_cf: RocksStoreRWLoop,
+}
+
+impl RocksCacheStore {
+    pub async fn get_listener(&self) -> RocksCacheStoreListener {
+        let listeners = self.store.listeners.read().await;
+
+        let sender = if listeners.len() > 0 {
+            listeners.first().unwrap()
+        } else {
+            panic!("Unable to get listener for CacheStore");
+        };
+
+        RocksCacheStoreListener::new(sender.subscribe())
+    }
+
+    pub fn new(
+        path: &Path,
+        metastore_fs: Arc<dyn MetaStoreFs>,
+        config: Arc<dyn ConfigObj>,
+    ) -> Result<Arc<Self>, CubeError> {
+        let details = Arc::new(RocksCacheStoreDetails::new(&config));
+        Self::new_from_store(RocksStore::with_listener(
+            path,
+            vec![],
+            metastore_fs,
+            config,
+            details,
+        )?)
+    }
+
+    fn new_from_store(store: Arc<RocksStore>) -> Result<Arc<Self>, CubeError> {
+        let cache_eviction_manager = CacheEvictionManager::new(&store.config);
+
+        Ok(Arc::new(Self {
+            store,
+            cache_eviction_manager,
+            upload_loop: Arc::new(WorkerLoop::new("Cachestore upload")),
+            metrics_loop: Arc::new(WorkerLoop::new("Cachestore metrics")),
+            rw_loop_queue_cf: RocksStoreRWLoop::new("cachestore", "queue"),
+        }))
+    }
+
+    pub async fn load_from_dump(
+        path: &Path,
+        dump_path: &Path,
+        metastore_fs: Arc<dyn MetaStoreFs>,
+        config: Arc<dyn ConfigObj>,
+    ) -> Result<Arc<Self>, CubeError> {
+        let details = Arc::new(RocksCacheStoreDetails::new(&config));
+
+        let store =
+            RocksStore::load_from_dump(path, dump_path, metastore_fs, config, details).await?;
+
+        Self::new_from_store(store)
+    }
+
+    pub async fn load_from_remote(
+        path: &str,
+        metastore_fs: Arc<dyn MetaStoreFs>,
+        config: Arc<dyn ConfigObj>,
+    ) -> Result<Arc<Self>, CubeError> {
+        let details = Arc::new(RocksCacheStoreDetails::new(&config));
+        let store = metastore_fs
+            .load_from_remote(&path, config, details)
+            .await?;
+
+        Self::new_from_store(store)
+    }
+
+    async fn run_ttl_persist(&self) -> Result<(), CubeError> {
+        self.cache_eviction_manager.run_persist(&self.store).await
+    }
+
+    async fn run_eviction(&self) -> Result<EvictionResult, CubeError> {
+        self.cache_eviction_manager.run_eviction(&self.store).await
+    }
+
+    pub fn spawn_processing_loops(self: Arc<Self>) -> Vec<JoinHandle<Result<(), CubeError>>> {
+        let mut loops = vec![];
+
+        if self.store.config.upload_to_remote() {
+            let upload_interval = self.store.config.cachestore_log_upload_interval();
+            let cachestore = self.clone();
+            loops.push(cube_ext::spawn(async move {
+                cachestore
+                    .upload_loop
+                    .process(
+                        cachestore.clone(),
+                        move |_| async move {
+                            Ok(Delay::new(Duration::from_secs(upload_interval)).await)
+                        },
+                        move |m, _| async move { m.store.run_upload().await },
+                    )
+                    .await;
+
+                Ok(())
+            }))
+        } else {
+            log::info!("Not running cachestore upload loop");
+        }
+
+        let metrics_interval = self.store.config.cachestore_metrics_interval();
+        if metrics_interval > 0 {
+            let cachestore = self.clone();
+            loops.push(cube_ext::spawn(async move {
+                cachestore
+                    .metrics_loop
+                    .process(
+                        cachestore.clone(),
+                        move |_| async move {
+                            Ok(Delay::new(Duration::from_secs(metrics_interval)).await)
+                        },
+                        move |m, _| async move {
+                            if let Err(err) = m.submit_metrics().await {
+                                log::error!("Error while submitting cachestore metrics: {}", err)
+                            };
+
+                            Ok(())
+                        },
+                    )
+                    .await;
+
+                Ok(())
+            }))
+        } else {
+            log::info!("Not running cachestore metrics loop");
+        }
+
+        let persist_interval = self
+            .store
+            .config
+            .cachestore_cache_ttl_persist_loop_interval();
+        if persist_interval > 0 {
+            let cachestore = self.clone();
+            loops.push(cube_ext::spawn(async move {
+                cachestore
+                    .cache_eviction_manager
+                    .persist_loop
+                    .process(cachestore.clone(), async move |m| m.run_ttl_persist().await)
+                    .await;
+
+                Ok(())
+            }))
+        } else {
+            log::info!("Not running cachestore persist loop");
+        }
+
+        let eviction_interval = self.store.config.cachestore_cache_eviction_loop_interval();
+        if eviction_interval > 0 {
+            let cachestore = self.clone();
+            loops.push(cube_ext::spawn(async move {
+                cachestore
+                    .cache_eviction_manager
+                    .eviction_loop
+                    .process(cachestore.clone(), async move |m| {
+                        let _ = m.run_eviction().await?;
+
+                        Ok(())
+                    })
+                    .await;
+
+                Ok(())
+            }))
+        } else {
+            log::info!("Not running cachestore eviction loop");
+        }
+
+        loops
+    }
+
+    pub async fn submit_metrics(&self) -> Result<(), CubeError> {
+        app_metrics::CACHESTORE_ROCKSDB_ESTIMATE_LIVE_DATA_SIZE.report(
+            self.store
+                .db
+                .property_int_value(rocksdb::properties::ESTIMATE_LIVE_DATA_SIZE)?
+                .unwrap_or(0) as i64,
+        );
+
+        app_metrics::CACHESTORE_ROCKSDB_LIVE_SST_FILES_SIZE.report(
+            self.store
+                .db
+                .property_int_value(rocksdb::properties::LIVE_SST_FILES_SIZE)?
+                .unwrap_or(0) as i64,
+        );
+
+        let cf_metadata = self.store.db.get_column_family_metadata();
+
+        app_metrics::CACHESTORE_ROCKSDB_CF_DEFAULT_SIZE.report(cf_metadata.size as i64);
+
+        Ok(())
+    }
+
+    fn send_zero_gauge_stats(&self) {
+        app_metrics::CACHESTORE_ROCKSDB_ESTIMATE_LIVE_DATA_SIZE.report(0);
+        app_metrics::CACHESTORE_ROCKSDB_LIVE_SST_FILES_SIZE.report(0);
+        app_metrics::CACHESTORE_ROCKSDB_CF_DEFAULT_SIZE.report(0);
+    }
+
+    pub async fn stop_processing_loops(&self) {
+        self.send_zero_gauge_stats();
+
+        self.cache_eviction_manager.stop_processing_loops();
+        self.upload_loop.stop();
+        self.metrics_loop.stop();
+    }
+
+    pub async fn add_listener(&self, listener: Sender<MetaStoreEvent>) {
+        self.store.add_listener(listener).await;
+    }
+
+    pub fn prepare_bench_cachestore(
+        test_name: &str,
+        config: Config,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let store_path = env::current_dir()
+            .unwrap()
+            .join("db-tmp")
+            .join("benchmarks")
+            .join(format!("{}", test_name));
+        let _ = std::fs::remove_dir_all(store_path.clone());
+
+        Self::prepare_test_cachestore_impl(test_name, store_path, config)
+    }
+
+    pub fn prepare_test_cachestore(
+        test_name: &str,
+        config: Config,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let store_path = env::current_dir()
+            .unwrap()
+            .join("db-tmp")
+            .join("tests")
+            .join(format!("{}-local", test_name));
+        let _ = std::fs::remove_dir_all(store_path.clone());
+
+        Self::prepare_test_cachestore_impl(test_name, store_path, config)
+    }
+
+    pub fn prepare_test_cachestore_from_fixtures(
+        test_name: &str,
+        remote_fixtures: &str,
+        config: Config,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let store_path = env::current_dir()
+            .unwrap()
+            .join(format!("test-{}-local", test_name));
+        let _ = std::fs::remove_dir_all(store_path.clone());
+
+        let fixtures_path = env::current_dir()
+            .unwrap()
+            .join("testing-fixtures")
+            .join(remote_fixtures);
+
+        crate::util::copy_dir_all(&fixtures_path, store_path.join("cachestore")).unwrap();
+
+        Self::prepare_test_cachestore_impl(test_name, store_path, config)
+    }
+
+    fn prepare_test_cachestore_impl(
+        test_name: &str,
+        store_path: PathBuf,
+        config: Config,
+    ) -> (Arc<LocalDirRemoteFs>, Arc<Self>) {
+        let remote_store_path = env::current_dir()
+            .unwrap()
+            .join(format!("test-{}-remote", test_name));
+
+        let _ = std::fs::remove_dir_all(remote_store_path.clone());
+
+        let config_obj = config.config_obj();
+        let details = Arc::new(RocksCacheStoreDetails::new(&config_obj));
+        let remote_fs = LocalDirRemoteFs::new(Some(remote_store_path.clone()), store_path.clone());
+        let store = RocksStore::new(
+            store_path.clone().join(details.get_name()).as_path(),
+            BaseRocksStoreFs::new_for_cachestore(remote_fs.clone(), config_obj.clone()),
+            config_obj,
+            details,
+        )
+        .unwrap();
+
+        (remote_fs, Self::new_from_store(store).unwrap())
+    }
+
+    pub fn cleanup_test_cachestore(test_name: &str) {
+        RocksStore::cleanup_test_store(test_name)
+    }
+
+    pub async fn run_upload(&self) -> Result<(), CubeError> {
+        self.store.run_upload().await
+    }
+
+    pub async fn upload_check_point(&self) -> Result<(), CubeError> {
+        self.store.upload_check_point().await
+    }
+
+    pub async fn has_pending_changes(&self) -> Result<bool, CubeError> {
+        self.store.has_pending_changes().await
+    }
+
+    pub async fn check_all_indexes(&self) -> Result<(), CubeError> {
+        RocksStore::check_all_indexes(&self.store).await
+    }
+
+    /// Schedules a no-op on both RW loops (default + queue) and awaits them, so that any
+    /// operation previously enqueued on those loops has finished and released its transient
+    /// Arc<DB> clone. NOTE: this only flushes the two RW loops; it does NOT wait for out-of-queue
+    /// readers (read_operation_out_of_queue), which run on detached spawn_blocking tasks with
+    /// their own Arc<DB> clone. LazyRocksCacheStore::wipe additionally waits on db_strong_count()
+    /// to cover those before closing the DB.
+    pub async fn drain_rw_loops(&self) -> Result<(), CubeError> {
+        self.store
+            .read_operation("wipe_barrier", |_| Ok(()))
+            .await?;
+        self.read_operation_queue("wipe_barrier", |_| Ok(()))
+            .await?;
+
+        Ok(())
+    }
+
+    /// Number of strong references to the underlying RocksDB handle.
+    pub fn db_strong_count(&self) -> usize {
+        Arc::strong_count(&self.store.db)
+    }
+}
+
+impl RocksCacheStore {
+    #[inline(always)]
+    pub async fn write_operation_queue<F, R>(
+        &self,
+        op_name: &'static str,
+        f: F,
+    ) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>, &mut BatchPipe<'a>) -> Result<R, CubeError>
+            + Send
+            + Sync
+            + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.store
+            .write_operation_impl::<F, R, ()>(&self.rw_loop_queue_cf, op_name, f, ())
+            .await
+    }
+
+    #[inline(always)]
+    pub async fn read_operation_queue<F, R>(
+        &self,
+        op_name: &'static str,
+        f: F,
+    ) -> Result<R, CubeError>
+    where
+        F: for<'a> FnOnce(DbTableRef<'a>) -> Result<R, CubeError> + Send + Sync + 'static,
+        R: Send + Sync + 'static,
+    {
+        self.store
+            .read_operation_impl::<F, R>(&self.rw_loop_queue_cf, op_name, f)
+            .await
+    }
+
+    /// This method should be called when we are sure that we return data to the consumer
+    async fn queue_result_ready_to_delete(
+        &self,
+        id: u64,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        self.write_operation_queue("queue_result_ready_to_delete", move |db_ref, batch_pipe| {
+            let result_schema = QueueResultRocksTable::new(db_ref.clone());
+            if let Some(row) = result_schema.get_row(id)? {
+                Self::queue_result_ready_to_delete_impl(&result_schema, batch_pipe, row)
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    /// This method should be called when we are sure that we return data to the consumer
+    fn queue_result_ready_to_delete_impl(
+        result_schema: &QueueResultRocksTable,
+        batch_pipe: &mut BatchPipe,
+        queue_result: IdRow<QueueResult>,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        if queue_result.get_row().is_deleted() {
+            let id = queue_result.get_id();
+            let external_id = queue_result.get_row().get_external_id().clone();
+            return Ok(Some(QueueResultResponse::Success {
+                value: Some(queue_result.into_row().value),
+                id,
+                external_id,
+            }));
+        }
+
+        let row_id = queue_result.get_id();
+        let row = queue_result.into_row();
+        let mut new_row = row.clone();
+        new_row.deleted = true;
+
+        // TODO: Partial update? Index?
+        let queue_result = result_schema.update(row_id, new_row, &row, batch_pipe)?;
+
+        let id = queue_result.get_id();
+        let external_id = queue_result.get_row().get_external_id().clone();
+        Ok(Some(QueueResultResponse::Success {
+            value: Some(queue_result.into_row().value),
+            id,
+            external_id,
+        }))
+    }
+
+    async fn lookup_queue_result_by_key(
+        &self,
+        key: QueueKey,
+        external_id: Option<String>,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        self.write_operation_queue("lookup_queue_result_by_key", move |db_ref, batch_pipe| {
+            let result_schema = QueueResultRocksTable::new(db_ref.clone());
+
+            // Try id first
+            if key.is_id() {
+                let Some(queue_result) = result_schema.get_row_by_key(key)? else {
+                    return Ok(None);
+                };
+
+                let id = queue_result.get_id();
+                let row_external_id = queue_result.get_row().get_external_id().clone();
+
+                if let Some(ref external_id) = external_id {
+                    if row_external_id.as_ref() != Some(external_id) {
+                        return Err(CubeError::user(format!(
+                            "Queue result (id = {}) external_id mismatch: expected {}, got {:?}",
+                            id, external_id, row_external_id
+                        )));
+                    }
+                }
+
+                return Ok(Some(QueueResultResponse::Success {
+                    value: Some(queue_result.into_row().value),
+                    id,
+                    external_id: row_external_id,
+                }));
+            };
+
+            // try (path, external_id) first (if provided), then fall back to path lookup
+            // external_id can be different for path, because path is re-used across different requests across time
+            if let Some(ref external_id) = external_id {
+                let path = match &key {
+                    QueueKey::ByPath(p) => p.clone(),
+                    QueueKey::ById(_) => unreachable!("already handled ById above"),
+                };
+                if let Some(queue_result) =
+                    result_schema.get_row_by_path_and_external_id(path, external_id.clone())?
+                {
+                    let id = queue_result.get_id();
+                    let external_id = queue_result.get_row().get_external_id().clone();
+
+                    return Ok(Some(QueueResultResponse::Success {
+                        value: Some(queue_result.into_row().value),
+                        id,
+                        external_id,
+                    }));
+                }
+            }
+
+            let Some(queue_result) = result_schema.get_row_by_key(key)? else {
+                return Ok(None);
+            };
+
+            if queue_result.get_row().is_deleted() {
+                Ok(None)
+            } else {
+                Self::queue_result_ready_to_delete_impl(&result_schema, batch_pipe, queue_result)
+            }
+        })
+        .await
+    }
+
+    fn filter_to_cancel(
+        now: DateTime<Utc>,
+        items: Vec<IdRow<QueueItem>>,
+        orphaned_timeout: Option<u32>,
+        heartbeat_timeout: Option<u32>,
+    ) -> Vec<IdRow<QueueItem>> {
+        items
+            .into_iter()
+            .filter(|item| {
+                if item.get_row().get_status() == &QueueItemStatus::Pending {
+                    return if let Some(orphaned_timeout) = orphaned_timeout {
+                        if let Some(orphaned) = item.get_row().get_orphaned() {
+                            return if orphaned < &now { true } else { false };
+                        }
+
+                        let elapsed = now - item.get_row().get_created().clone();
+                        if elapsed.num_milliseconds() > orphaned_timeout as i64 {
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                }
+
+                if item.get_row().get_status() == &QueueItemStatus::Active {
+                    if let Some(heartbeat_timeout) = heartbeat_timeout {
+                        let elapsed = if let Some(heartbeat) = item.get_row().get_heartbeat() {
+                            now - heartbeat.clone()
+                        } else {
+                            now - item.get_row().get_created().clone()
+                        };
+                        if elapsed.num_milliseconds() > heartbeat_timeout as i64 {
+                            return true;
+                        }
+                    }
+                }
+
+                false
+            })
+            .collect()
+    }
+
+    /// The budget is prefix scoped, exclusivity and priority blind. Shared by
+    /// `QUEUE RETRIEVE` and `QUEUE ADD_AND_RETRIEVE` so that they cannot drift apart.
+    fn queue_prefix_counters(
+        queue_schema: &QueueItemRocksTable,
+        path: &str,
+    ) -> Result<(u64, Vec<String>), CubeError> {
+        let prefix = QueueItem::extract_prefix(path.to_string()).unwrap_or("".to_string());
+
+        let pending = queue_schema.count_rows_by_index(
+            &QueueItemIndexKey::ByPrefixAndStatus(prefix.clone(), QueueItemStatus::Pending),
+            &QueueItemRocksIndex::ByPrefixAndStatus,
+        )?;
+
+        let active = queue_schema
+            .get_rows_by_index(
+                &QueueItemIndexKey::ByPrefixAndStatus(prefix, QueueItemStatus::Active),
+                &QueueItemRocksIndex::ByPrefixAndStatus,
+            )?
+            .into_iter()
+            .map(|item| item.into_row().key)
+            .collect();
+
+        Ok((pending, active))
+    }
+
+    /// Moves the item to the active status inside the caller's batch. Shared by
+    /// `QUEUE RETRIEVE` and `QUEUE ADD_AND_RETRIEVE`, so both use identical exclusivity,
+    /// heartbeat and missing payload semantics. The budget is checked by the caller.
+    fn try_claim_queue_item(
+        queue_schema: &QueueItemRocksTable,
+        queue_payload_schema: &QueueItemPayloadRocksTable,
+        batch_pipe: &mut BatchPipe,
+        id_row: IdRow<QueueItem>,
+        caller_process_id: &Option<String>,
+        pending: u64,
+        mut active: Vec<String>,
+    ) -> Result<QueueRetrieveResponse, CubeError> {
+        if id_row.get_row().get_status() != &QueueItemStatus::Pending {
+            return Ok(QueueRetrieveResponse::LockFailed { pending, active });
+        }
+
+        if id_row.get_row().get_exclusive() {
+            match (id_row.get_row().get_process_id(), caller_process_id) {
+                (Some(_), None) => {
+                    return Err(CubeError::user(
+                        "Claiming an exclusive queue item requires a process_id in the connection context (x-process-id header)".to_string(),
+                    ))
+                }
+                (None, Some(_)) => {
+                    log::warn!(
+                        "Incorrect queue_item with exclusive flag, empty process_id, id: {:?}",
+                        caller_process_id
+                    );
+
+                    return Ok(QueueRetrieveResponse::NotFound { pending, active });
+                }
+                (Some(item_process_id), Some(caller_id)) => {
+                    if item_process_id != caller_id {
+                        return Ok(QueueRetrieveResponse::ExclusiveAccessFailed {
+                            pending,
+                            active,
+                        });
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+
+        let mut new = id_row.get_row().clone();
+        new.status = QueueItemStatus::Active;
+        // It's important to insert heartbeat, because
+        // without that created datetime will be used for orphaned filtering
+        new.update_heartbeat();
+
+        let res = queue_schema.update(id_row.get_id(), new, id_row.get_row(), batch_pipe)?;
+        let payload = if let Some(r) = queue_payload_schema.get_row(res.get_id())? {
+            r.into_row().value
+        } else {
+            error!(
+                "Unable to find payload for queue item, id = {}",
+                res.get_id()
+            );
+
+            queue_schema.delete_row(res, batch_pipe)?;
+
+            return Ok(QueueRetrieveResponse::NotFound { pending, active });
+        };
+
+        active.push(res.get_row().get_key().clone());
+
+        Ok(QueueRetrieveResponse::Success {
+            id: res.get_id(),
+            payload,
+            item: res.into_row(),
+            pending: pending.saturating_sub(1),
+            active,
+        })
+    }
+
+    fn touch_queue_item<'a>(
+        db_ref: &DbTableRef<'a>,
+        queue_schema: &QueueItemRocksTable<'a>,
+        batch_pipe: &mut BatchPipe<'a>,
+        id_row: IdRow<QueueItem>,
+        orphaned: u32,
+    ) -> Result<IdRow<QueueItem>, CubeError> {
+        let mut item = id_row.get_row().clone();
+        let Some(expire_moved) = item.touch_orphaned(orphaned) else {
+            return Ok(id_row);
+        };
+
+        if expire_moved {
+            // The payload is evicted on its own expiry, so it must outlive the item it belongs to
+            let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+            if let Some(payload_row) = queue_payload_schema.get_row(id_row.get_id())? {
+                let mut payload = payload_row.get_row().clone();
+                payload.set_expire(item.get_expire().clone());
+                queue_payload_schema.update(
+                    payload_row.get_id(),
+                    payload,
+                    payload_row.get_row(),
+                    batch_pipe,
+                )?;
+            }
+        }
+
+        queue_schema.update(id_row.get_id(), item, id_row.get_row(), batch_pipe)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, DeepSizeOf)]
+pub enum QueueKey {
+    ById(u64),
+    ByPath(String),
+}
+
+impl QueueKey {
+    pub(crate) fn is_id(&self) -> bool {
+        match self {
+            QueueKey::ById(_) => true,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct CachestoreInfo {
+    pub tables: Vec<RocksTableStats>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueAddResponse {
+    pub id: u64,
+    pub added: bool,
+    pub pending: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueAddPayload {
+    pub path: String,
+    pub value: String,
+    pub priority: i64,
+    pub orphaned: Option<u32>,
+    pub process_id: Option<String>,
+    pub exclusive: bool,
+    pub external_id: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueAddAndRetrievePayload {
+    pub path: String,
+    pub value: String,
+    pub priority: i64,
+    pub orphaned: Option<u32>,
+    pub process_id: Option<String>,
+    pub exclusive: bool,
+    pub external_id: Option<String>,
+    /// The same budget as `QUEUE RETRIEVE CONCURRENCY` uses
+    pub concurrency: u32,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueAddAndRetrieveResponse {
+    pub id: u64,
+    pub added: bool,
+    pub pending: u64,
+    /// Keys of the active items in the prefix after this operation
+    pub active: Vec<String>,
+    /// `Some` only when the item was claimed (moved to the active status) by this call
+    pub payload: Option<String>,
+    pub extra: Option<String>,
+}
+
+impl QueueAddAndRetrieveResponse {
+    pub fn from_claim(id: u64, claim: QueueRetrieveResponse) -> Self {
+        let (payload, extra, pending, active) = match claim {
+            QueueRetrieveResponse::Success {
+                item,
+                payload,
+                pending,
+                active,
+                ..
+            } => (Some(payload), item.extra, pending, active),
+            QueueRetrieveResponse::LockFailed { pending, active }
+            | QueueRetrieveResponse::NotEnoughConcurrency { pending, active }
+            | QueueRetrieveResponse::NotFound { pending, active }
+            | QueueRetrieveResponse::ExclusiveAccessFailed { pending, active } => {
+                (None, None, pending, active)
+            }
+        };
+
+        Self {
+            id,
+            // An existing item is never added twice, it's unique by path
+            added: false,
+            pending,
+            active,
+            payload,
+            extra,
+        }
+    }
+
+    pub fn into_queue_add_and_retrieve_row(self) -> Row {
+        Row::new(vec![
+            TableValue::String(self.id.to_string()),
+            TableValue::Boolean(self.added),
+            TableValue::Int(self.pending as i64),
+            active_keys_to_value(self.active),
+            self.payload.map_or(TableValue::Null, TableValue::String),
+            self.extra.map_or(TableValue::Null, TableValue::String),
+        ])
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueCancelResponse {
+    pub extra: Option<String>,
+    pub value: String,
+}
+
+impl QueueCancelResponse {
+    pub fn into_queue_cancel_row(self) -> Row {
+        let res = vec![
+            TableValue::String(self.value),
+            if let Some(extra) = self.extra {
+                TableValue::String(extra)
+            } else {
+                TableValue::Null
+            },
+        ];
+
+        Row::new(res)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub enum QueueResultResponse {
+    Success {
+        value: Option<String>,
+        #[serde(default)]
+        id: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_id: Option<String>,
+    },
+}
+
+impl QueueResultResponse {
+    pub fn into_queue_result_row(self) -> Row {
+        match self {
+            QueueResultResponse::Success {
+                value,
+                id,
+                external_id,
+            } => Row::new(vec![
+                if let Some(v) = value {
+                    TableValue::String(v)
+                } else {
+                    TableValue::Null
+                },
+                TableValue::String("success".to_string()),
+                TableValue::String(id.to_string()),
+                if let Some(ext_id) = external_id {
+                    TableValue::String(ext_id)
+                } else {
+                    TableValue::Null
+                },
+            ]),
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub enum QueueListItem {
+    ItemOnly(IdRow<QueueItem>),
+    WithPayload(IdRow<QueueItem>, String),
+}
+
+impl QueueListItem {
+    pub fn into_queue_list_row(self) -> Row {
+        let (id_row, payload) = match self {
+            QueueListItem::ItemOnly(id_row) => (id_row, None),
+            QueueListItem::WithPayload(id_row, payload) => (id_row, Some(payload)),
+        };
+
+        let row_id = id_row.get_id();
+        let row = id_row.into_row();
+
+        let mut res = vec![
+            TableValue::String(row.key),
+            TableValue::String(row_id.to_string()),
+            TableValue::String(row.status.to_string()),
+            if let Some(extra) = row.extra {
+                TableValue::String(extra)
+            } else {
+                TableValue::Null
+            },
+        ];
+
+        if let Some(payload) = payload {
+            res.push(TableValue::String(payload));
+        };
+
+        Row::new(res)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueGetResponse {
+    extra: Option<String>,
+    payload: String,
+}
+
+impl QueueGetResponse {
+    pub fn into_queue_get_row(self) -> Row {
+        let res = vec![
+            TableValue::String(self.payload),
+            if let Some(extra) = self.extra {
+                TableValue::String(extra)
+            } else {
+                TableValue::Null
+            },
+        ];
+
+        Row::new(res)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
+pub struct QueueAllItem {
+    pub item: IdRow<QueueItem>,
+    pub payload: Option<String>,
+}
+
+#[cuberpc::service]
+pub trait CacheStore: DIService + Send + Sync {
+    // cache
+    async fn cache_all(&self, limit: Option<usize>) -> Result<Vec<IdRow<CacheItem>>, CubeError>;
+    async fn cache_set(
+        &self,
+        item: CacheItem,
+        update_if_not_exists: bool,
+    ) -> Result<bool, CubeError>;
+    async fn cache_clear(&self) -> Result<(), CubeError>;
+    // Wipe the whole cachestore keyspace with a low-level RocksDB range delete.
+    async fn truncate(&self) -> Result<(), CubeError>;
+    async fn cache_delete(&self, key: String) -> Result<(), CubeError>;
+    async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError>;
+    async fn cache_keys(&self, prefix: String) -> Result<Vec<IdRow<CacheItem>>, CubeError>;
+    async fn cache_incr(&self, key: String) -> Result<IdRow<CacheItem>, CubeError>;
+
+    // queue
+    async fn queue_all(&self, limit: Option<usize>) -> Result<Vec<QueueAllItem>, CubeError>;
+    async fn queue_results_all(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<IdRow<QueueResult>>, CubeError>;
+    async fn queue_results_multi_delete(&self, ids: Vec<u64>) -> Result<(), CubeError>;
+    async fn queue_add(&self, payload: QueueAddPayload) -> Result<QueueAddResponse, CubeError>;
+    async fn queue_add_and_retrieve(
+        &self,
+        payload: QueueAddAndRetrievePayload,
+    ) -> Result<QueueAddAndRetrieveResponse, CubeError>;
+    async fn queue_clear(&self) -> Result<(), CubeError>;
+    async fn queue_to_cancel(
+        &self,
+        prefix: String,
+        orphaned_timeout: Option<u32>,
+        heartbeat_timeout: Option<u32>,
+    ) -> Result<Vec<IdRow<QueueItem>>, CubeError>;
+    async fn queue_list(
+        &self,
+        prefix: String,
+        status_filter: Option<QueueItemStatus>,
+        priority_sort: bool,
+        with_payload: bool,
+        caller_process_id: Option<String>,
+    ) -> Result<Vec<QueueListItem>, CubeError>;
+    // API with Path
+    async fn queue_get(&self, key: QueueKey) -> Result<Option<QueueGetResponse>, CubeError>;
+    async fn queue_cancel(&self, key: QueueKey) -> Result<Option<QueueCancelResponse>, CubeError>;
+    async fn queue_heartbeat(&self, key: QueueKey) -> Result<(), CubeError>;
+    async fn queue_retrieve_by_path(
+        &self,
+        path: String,
+        allow_concurrency: u32,
+        caller_process_id: Option<String>,
+    ) -> Result<QueueRetrieveResponse, CubeError>;
+    async fn queue_ack(&self, key: QueueKey, result: Option<String>) -> Result<bool, CubeError>;
+    async fn queue_result(
+        &self,
+        key: QueueKey,
+        external_id: Option<String>,
+    ) -> Result<Option<QueueResultResponse>, CubeError>;
+
+    async fn queue_result_blocking(
+        &self,
+        key: QueueKey,
+        timeout: u64,
+    ) -> Result<Option<QueueResultResponse>, CubeError>;
+    async fn queue_merge_extra(&self, key: QueueKey, payload: String) -> Result<(), CubeError>;
+
+    // Force compaction for the whole RocksDB
+    async fn compaction(&self) -> Result<(), CubeError>;
+    // DB stats + sizes
+    async fn info(&self) -> Result<CachestoreInfo, CubeError>;
+    // Force run for eviction
+    async fn eviction(&self) -> Result<EvictionResult, CubeError>;
+    // Force run for persist of lru/lfu stats
+    async fn persist(&self) -> Result<(), CubeError>;
+    async fn healthcheck(&self) -> Result<(), CubeError>;
+    async fn rocksdb_properties(&self) -> Result<Vec<RocksPropertyRow>, CubeError>;
+    // Wipe all cachestore state (cache + queue) and persist a fresh snapshot, updating the
+    // remote cachestore-current pointer so a poisoned snapshot is not re-hydrated on reload
+    async fn wipe(&self) -> Result<(), CubeError>;
+}
+
+#[async_trait]
+impl CacheStore for RocksCacheStore {
+    async fn cache_all(&self, limit: Option<usize>) -> Result<Vec<IdRow<CacheItem>>, CubeError> {
+        self.store
+            .read_operation_out_of_queue("cache_all", move |db_ref| {
+                Ok(CacheItemRocksTable::new(db_ref).scan_rows(limit)?)
+            })
+            .await
+    }
+
+    async fn cache_set(
+        &self,
+        item: CacheItem,
+        update_if_not_exists: bool,
+    ) -> Result<bool, CubeError> {
+        if item.get_value().len() >= self.store.config.cachestore_cache_max_entry_size() {
+            return Err(CubeError::user(format!(
+                "Unable to SET cache with '{}' key, exceeds maximum allowed size for payload: {}, max allowed: {}",
+                item.key,
+                humansize::format_size(item.get_value().len(), humansize::DECIMAL),
+                humansize::format_size(self.store.config.cachestore_cache_max_entry_size(), humansize::DECIMAL),
+            )));
+        }
+
+        self.cache_eviction_manager
+            .before_insert(item.get_value().len() as u64)
+            .await?;
+
+        let (result, inserted) = self
+            .store
+            .write_operation("cache_set", move |db_ref, batch_pipe| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                let index_key = CacheItemIndexKey::ByPath(item.get_path());
+                let id_row_opt = cache_schema
+                    .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
+
+                if let Some(id_row) = id_row_opt {
+                    if update_if_not_exists {
+                        return Ok((false, None));
+                    };
+
+                    cache_schema.update(id_row.id, item, &id_row.row, batch_pipe)?;
+                    Ok((true, None))
+                } else {
+                    let raw_size = item.get_value().len();
+
+                    cache_schema.insert(item, batch_pipe)?;
+                    Ok((true, Some(raw_size)))
+                }
+            })
+            .await?;
+
+        if let Some(raw_size) = inserted {
+            self.cache_eviction_manager.notify_insert(raw_size as u64)?;
+        }
+
+        Ok(result)
+    }
+
+    async fn cache_clear(&self) -> Result<(), CubeError> {
+        let block = self.cache_eviction_manager.truncation_block().await;
+
+        let result = self
+            .store
+            .write_operation("cache_clear", move |db_ref, batch_pipe| {
+                let cache_schema = CacheItemRocksTable::new(db_ref);
+                cache_schema.truncate(batch_pipe)?;
+
+                Ok(())
+            })
+            .await;
+
+        self.cache_eviction_manager.notify_truncate_end().await?;
+        drop(block);
+
+        result
+    }
+
+    async fn truncate(&self) -> Result<(), CubeError> {
+        let block = self.cache_eviction_manager.truncation_block().await;
+
+        let mut result = self.store.truncate().await;
+
+        // Re-seed migration metadata so the emptied store is usable again. Fold
+        // any re-seed error into `result` rather than early-returning with `?`,
+        // so the eviction manager is always notified and the block released even
+        // on failure (mirrors `cache_clear`); otherwise waiters could get stuck.
+        if result.is_ok() {
+            result = self.check_all_indexes().await;
+        }
+
+        self.cache_eviction_manager.notify_truncate_end().await?;
+        drop(block);
+
+        result
+    }
+
+    async fn cache_delete(&self, key: String) -> Result<(), CubeError> {
+        let result = self
+            .store
+            .write_operation("cache_delete", move |db_ref, batch_pipe| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                let index_key = CacheItemIndexKey::ByPath(key);
+                let row_opt = cache_schema
+                    .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
+
+                if let Some(row) = row_opt {
+                    let row_id = row.id;
+                    let raw_size = row.get_row().get_value().len();
+
+                    cache_schema.delete_row(row, batch_pipe)?;
+
+                    Ok(Some((row_id, raw_size)))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+
+        if let Some((row_id, raw_size)) = result {
+            self.cache_eviction_manager
+                .notify_delete(row_id, raw_size as u64)?;
+        }
+
+        Ok(())
+    }
+
+    async fn cache_get(&self, key: String) -> Result<Option<IdRow<CacheItem>>, CubeError> {
+        let res = self
+            .store
+            .read_operation("cache_get", move |db_ref| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                let index_key = CacheItemIndexKey::ByPath(key);
+                let id_row_opt = cache_schema
+                    .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
+
+                Ok(id_row_opt)
+            })
+            .await?;
+
+        if let Some(item) = &res {
+            self.cache_eviction_manager.notify_lookup(item)?;
+        };
+
+        Ok(res)
+    }
+
+    async fn cache_keys(&self, prefix: String) -> Result<Vec<IdRow<CacheItem>>, CubeError> {
+        self.store
+            .read_operation("cache_keys", move |db_ref| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                let index_key =
+                    CacheItemIndexKey::ByPrefix(CacheItem::parse_path_to_prefix(prefix));
+                let rows =
+                    cache_schema.get_rows_by_index(&index_key, &CacheItemRocksIndex::ByPrefix)?;
+
+                Ok(rows)
+            })
+            .await
+    }
+
+    async fn cache_incr(&self, path: String) -> Result<IdRow<CacheItem>, CubeError> {
+        let item = self
+            .store
+            .write_operation("cache_incr", move |db_ref, batch_pipe| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                let index_key = CacheItemIndexKey::ByPath(path.clone());
+                let id_row_opt = cache_schema
+                    .get_single_opt_row_by_index(&index_key, &CacheItemRocksIndex::ByPath)?;
+
+                // TODO: Merge operator?
+                if let Some(id_row) = id_row_opt {
+                    let mut new = id_row.row.clone();
+
+                    let last_val = id_row.row.value.parse::<i64>()?;
+                    new.value = (last_val + 1).to_string();
+
+                    cache_schema.update(id_row.id, new, &id_row.row, batch_pipe)
+                } else {
+                    let item = CacheItem::new(path, None, "1".to_string());
+                    cache_schema.insert(item, batch_pipe)
+                }
+            })
+            .await?;
+
+        self.cache_eviction_manager.notify_lookup(&item)?;
+
+        Ok(item)
+    }
+
+    async fn queue_all(&self, limit: Option<usize>) -> Result<Vec<QueueAllItem>, CubeError> {
+        self.store
+            .read_operation("queue_all", move |db_ref| {
+                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+                let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+                let mut res = Vec::new();
+
+                for item in queue_schema.scan_rows(limit)? {
+                    let payload =
+                        if let Some(payload) = queue_payload_schema.get_row(item.get_id())? {
+                            Some(payload.into_row().value)
+                        } else {
+                            error!(
+                                "Unable to find payload for queue item, id = {}",
+                                item.get_id()
+                            );
+
+                            None
+                        };
+
+                    res.push(QueueAllItem { item, payload })
+                }
+
+                Ok(res)
+            })
+            .await
+    }
+
+    async fn queue_results_all(
+        &self,
+        limit: Option<usize>,
+    ) -> Result<Vec<IdRow<QueueResult>>, CubeError> {
+        self.read_operation_queue("queue_results_all", move |db_ref| {
+            Ok(QueueResultRocksTable::new(db_ref).scan_rows(limit)?)
+        })
+        .await
+    }
+
+    async fn queue_results_multi_delete(&self, ids: Vec<u64>) -> Result<(), CubeError> {
+        self.write_operation_queue("queue_results_multi_delete", move |db_ref, batch_pipe| {
+            let queue_result_schema = QueueResultRocksTable::new(db_ref);
+
+            for id in ids {
+                queue_result_schema.try_delete(id, batch_pipe)?;
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn queue_add(&self, payload: QueueAddPayload) -> Result<QueueAddResponse, CubeError> {
+        self.write_operation_queue("queue_add", move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let pending = queue_schema.count_rows_by_index(
+                &QueueItemIndexKey::ByPrefixAndStatus(
+                    QueueItem::extract_prefix(payload.path.clone()).unwrap_or("".to_string()),
+                    QueueItemStatus::Pending,
+                ),
+                &QueueItemRocksIndex::ByPrefixAndStatus,
+            )?;
+
+            let index_key = QueueItemIndexKey::ByPath(payload.path.clone());
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+
+            let (id, added) = if let Some(row) = id_row_opt {
+                let id = row.get_id();
+                if let Some(orphaned) = payload.orphaned {
+                    Self::touch_queue_item(&db_ref, &queue_schema, batch_pipe, row, orphaned)?;
+                }
+
+                (id, false)
+            } else {
+                let queue_item_row = queue_schema.insert(
+                    QueueItem::new(
+                        payload.path,
+                        QueueItem::status_default(),
+                        payload.priority,
+                        payload.orphaned.clone(),
+                        payload.process_id,
+                        payload.exclusive,
+                        payload.external_id,
+                    ),
+                    batch_pipe,
+                )?;
+                let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+                queue_payload_schema.insert_with_pk(
+                    queue_item_row.id,
+                    QueueItemPayload::new(
+                        payload.value,
+                        queue_item_row.row.get_created().clone(),
+                        queue_item_row.row.get_expire().clone(),
+                    ),
+                    batch_pipe,
+                )?;
+
+                (queue_item_row.id, true)
+            };
+
+            Ok(QueueAddResponse {
+                id,
+                added,
+                pending: if added { pending + 1 } else { pending },
+            })
+        })
+        .await
+    }
+
+    async fn queue_add_and_retrieve(
+        &self,
+        payload: QueueAddAndRetrievePayload,
+    ) -> Result<QueueAddAndRetrieveResponse, CubeError> {
+        if payload.exclusive && payload.process_id.is_none() {
+            return Err(CubeError::user(
+                "An exclusive queue item requires a process_id".to_string(),
+            ));
+        }
+
+        self.write_operation_queue("queue_add_and_retrieve", move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let (pending, mut active) = Self::queue_prefix_counters(&queue_schema, &payload.path)?;
+
+            let index_key = QueueItemIndexKey::ByPath(payload.path.clone());
+            let id_row_opt = queue_schema
+                .get_single_opt_row_by_index(&index_key, &QueueItemRocksIndex::ByPath)?;
+
+            // An item which is already pending is not a part of its own backlog
+            let backlog = match &id_row_opt {
+                Some(id_row) if id_row.get_row().get_status() == &QueueItemStatus::Pending => {
+                    pending.saturating_sub(1)
+                }
+                _ => pending,
+            };
+
+            // Claiming the item being added ignores priority, it's harmless exactly while a
+            // slot is left over for every pending item too, so nothing can be jumped over.
+            // A deeper backlog is left to QUEUE PENDING + reconcile, which pick by priority.
+            let claim = (active.len() as u64) + backlog < (payload.concurrency as u64);
+
+            if let Some(id_row) = id_row_opt {
+                let id = id_row.get_id();
+                // The claim below updates the touched row, so it has to start from it
+                let id_row = if let Some(orphaned) = payload.orphaned {
+                    Self::touch_queue_item(&db_ref, &queue_schema, batch_pipe, id_row, orphaned)?
+                } else {
+                    id_row
+                };
+                let claim_result = if claim {
+                    let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+                    Self::try_claim_queue_item(
+                        &queue_schema,
+                        &queue_payload_schema,
+                        batch_pipe,
+                        id_row,
+                        &payload.process_id,
+                        pending,
+                        active,
+                    )?
+                } else {
+                    QueueRetrieveResponse::NotEnoughConcurrency { pending, active }
+                };
+
+                return Ok(QueueAddAndRetrieveResponse::from_claim(id, claim_result));
+            }
+
+            // Inserting a claimed item as active saves an update of the just written row
+            // (and its secondary indexes) inside the same batch
+            let mut item = QueueItem::new(
+                payload.path,
+                if claim {
+                    QueueItemStatus::Active
+                } else {
+                    QueueItem::status_default()
+                },
+                payload.priority,
+                payload.orphaned,
+                payload.process_id,
+                payload.exclusive,
+                payload.external_id,
+            );
+            if claim {
+                // It's important to insert heartbeat, because
+                // without that created datetime will be used for orphaned filtering
+                item.update_heartbeat();
+            }
+
+            let queue_item_row = queue_schema.insert(item, batch_pipe)?;
+
+            let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+            let queue_payload_row = queue_payload_schema.insert_with_pk(
+                queue_item_row.id,
+                QueueItemPayload::new(
+                    payload.value,
+                    queue_item_row.row.get_created().clone(),
+                    queue_item_row.row.get_expire().clone(),
+                ),
+                batch_pipe,
+            )?;
+
+            // The value can be huge, take it back from the inserted row instead of cloning
+            let claimed_payload = if claim {
+                active.push(queue_item_row.row.get_key().clone());
+
+                Some(queue_payload_row.into_row().value)
+            } else {
+                None
+            };
+
+            Ok(QueueAddAndRetrieveResponse {
+                id: queue_item_row.id,
+                added: true,
+                // A claimed item is inserted as active, it was never counted as pending
+                pending: if claim { pending } else { pending + 1 },
+                active,
+                payload: claimed_payload,
+                extra: None,
+            })
+        })
+        .await
+    }
+
+    async fn queue_clear(&self) -> Result<(), CubeError> {
+        self.write_operation_queue("queue_clear", move |db_ref, batch_pipe| {
+            let queue_item_schema = QueueItemRocksTable::new(db_ref.clone());
+            queue_item_schema.truncate(batch_pipe)?;
+
+            let queue_item_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+            queue_item_payload_schema.truncate(batch_pipe)?;
+
+            let queue_result_schema = QueueResultRocksTable::new(db_ref);
+            queue_result_schema.truncate(batch_pipe)?;
+
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
+    async fn queue_to_cancel(
+        &self,
+        prefix: String,
+        orphaned_timeout: Option<u32>,
+        heartbeat_timeout: Option<u32>,
+    ) -> Result<Vec<IdRow<QueueItem>>, CubeError> {
+        self.read_operation_queue("queue_to_cancel", move |db_ref| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let index_key = QueueItemIndexKey::ByPrefix(prefix);
+            let items =
+                queue_schema.get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefix)?;
+
+            Ok(Self::filter_to_cancel(
+                db_ref.start_time.clone(),
+                items,
+                orphaned_timeout,
+                heartbeat_timeout,
+            ))
+        })
+        .await
+    }
+
+    async fn queue_list(
+        &self,
+        prefix: String,
+        status_filter: Option<QueueItemStatus>,
+        priority_sort: bool,
+        with_payload: bool,
+        caller_process_id: Option<String>,
+    ) -> Result<Vec<QueueListItem>, CubeError> {
+        self.read_operation_queue("queue_list", move |db_ref| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+
+            let items = if let Some(status_filter) = status_filter {
+                let index_key = QueueItemIndexKey::ByPrefixAndStatus(prefix, status_filter);
+                queue_schema
+                    .get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefixAndStatus)?
+            } else {
+                let index_key = QueueItemIndexKey::ByPrefix(prefix);
+                queue_schema.get_rows_by_index(&index_key, &QueueItemRocksIndex::ByPrefix)?
+            };
+
+            let items: Vec<IdRow<QueueItem>> = items
+                .into_iter()
+                .filter(|id_row| id_row.get_row().is_visible_for(&caller_process_id))
+                .collect();
+
+            let items = if priority_sort {
+                items
+                    .into_iter()
+                    .sorted_by(|a, b| b.row.cmp(&a.row))
+                    .collect()
+            } else {
+                items
+            };
+
+            if with_payload {
+                let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+                let mut res = Vec::with_capacity(items.len());
+
+                for item in items {
+                    if let Some(payload_row) = queue_payload_schema.get_row(item.get_id())? {
+                        res.push(QueueListItem::WithPayload(
+                            item,
+                            payload_row.into_row().value,
+                        ));
+                    } else {
+                        res.push(QueueListItem::ItemOnly(item));
+                    }
+                }
+
+                Ok(res)
+            } else {
+                Ok(items
+                    .into_iter()
+                    .map(|item| QueueListItem::ItemOnly(item))
+                    .collect())
+            }
+        })
+        .await
+    }
+
+    async fn queue_get(&self, key: QueueKey) -> Result<Option<QueueGetResponse>, CubeError> {
+        self.read_operation_queue("queue_get", move |db_ref| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+
+            if let Some(item_row) = queue_schema.get_row_by_key(key)? {
+                let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+                if let Some(payload_row) = queue_payload_schema.get_row(item_row.get_id())? {
+                    Ok(Some(QueueGetResponse {
+                        extra: item_row.into_row().extra,
+                        payload: payload_row.into_row().value,
+                    }))
+                } else {
+                    error!(
+                        "Unable to find payload for queue item, id = {}",
+                        item_row.get_id()
+                    );
+
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    async fn queue_cancel(&self, key: QueueKey) -> Result<Option<QueueCancelResponse>, CubeError> {
+        self.write_operation_queue("queue_cancel", move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+            if let Some(id_row) = queue_schema.get_row_by_key(key)? {
+                let row_id = id_row.get_id();
+                let queue_item = queue_schema.delete_row(id_row, batch_pipe)?;
+
+                if let Some(queue_payload) = queue_payload_schema.try_delete(row_id, batch_pipe)? {
+                    Ok(Some(QueueCancelResponse {
+                        extra: queue_item.into_row().extra,
+                        value: queue_payload.into_row().value,
+                    }))
+                } else {
+                    error!("Unable to find payload for queue item, id = {}", row_id);
+
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        })
+        .await
+    }
+
+    async fn queue_heartbeat(&self, key: QueueKey) -> Result<(), CubeError> {
+        self.write_operation_queue("queue_heartbeat", move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let id_row_opt = queue_schema.get_row_by_key(key.clone())?;
+
+            if let Some(id_row) = id_row_opt {
+                let mut new = id_row.get_row().clone();
+                new.update_heartbeat();
+
+                queue_schema.update(id_row.id, new, id_row.get_row(), batch_pipe)?;
+                Ok(())
+            } else {
+                trace!("Unable to update heartbeat, unknown key: {:?}", key);
+
+                Ok(())
+            }
+        })
+        .await
+    }
+
+    async fn queue_retrieve_by_path(
+        &self,
+        path: String,
+        allow_concurrency: u32,
+        caller_process_id: Option<String>,
+    ) -> Result<QueueRetrieveResponse, CubeError> {
+        self.write_operation_queue("queue_retrieve_by_path", move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+            let (pending, active) = Self::queue_prefix_counters(&queue_schema, &path)?;
+            if active.len() >= (allow_concurrency as usize) {
+                return Ok(QueueRetrieveResponse::NotEnoughConcurrency { pending, active });
+            }
+
+            let id_row = queue_schema.get_single_opt_row_by_index(
+                &QueueItemIndexKey::ByPath(path.clone()),
+                &QueueItemRocksIndex::ByPath,
+            )?;
+            let id_row = if let Some(id_row) = id_row {
+                id_row
+            } else {
+                return Ok(QueueRetrieveResponse::NotFound { pending, active });
+            };
+
+            let queue_payload_schema = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+            Self::try_claim_queue_item(
+                &queue_schema,
+                &queue_payload_schema,
+                batch_pipe,
+                id_row,
+                &caller_process_id,
+                pending,
+                active,
+            )
+        })
+        .await
+    }
+
+    async fn queue_ack(&self, key: QueueKey, result: Option<String>) -> Result<bool, CubeError> {
+        self.write_operation_queue("queue_ack", move |db_ref, batch_pipe| {
+            let queue_item_tbl = QueueItemRocksTable::new(db_ref.clone());
+            let queue_item_payload_tbl = QueueItemPayloadRocksTable::new(db_ref.clone());
+
+            let item_row = queue_item_tbl.get_row_by_key(key.clone())?;
+            if let Some(item_row) = item_row {
+                let path = item_row.get_row().get_path();
+                let id = item_row.get_id();
+                let external_id = item_row.get_row().get_external_id().clone();
+
+                queue_item_tbl.delete_row(item_row, batch_pipe)?;
+                queue_item_payload_tbl.try_delete(id, batch_pipe)?;
+
+                if let Some(result) = result {
+                    let queue_result = QueueResult::new(path, result, external_id);
+                    let result_schema = QueueResultRocksTable::new(db_ref.clone());
+                    // QueueResult is a result of QueueItem, it's why we can use row_id of QueueItem
+                    result_schema.insert_with_pk(id, queue_result, batch_pipe)?;
+
+                    batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
+                        id,
+                        result: QueueResultAckEventResult::WithResult,
+                    }));
+                } else {
+                    batch_pipe.add_event(MetaStoreEvent::AckQueueItem(QueueResultAckEvent {
+                        id,
+                        result: QueueResultAckEventResult::Empty {},
+                    }));
+                }
+
+                Ok(true)
+            } else {
+                warn!("Unable to ack queue, unknown key: {:?}", key);
+
+                Ok(false)
+            }
+        })
+        .await
+    }
+
+    async fn queue_result(
+        &self,
+        key: QueueKey,
+        external_id: Option<String>,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        self.lookup_queue_result_by_key(key, external_id).await
+    }
+
+    async fn queue_result_blocking(
+        &self,
+        key: QueueKey,
+        timeout: u64,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        let QueueKey::ById(id) = key else {
+            return Err(CubeError::user(
+                "QUEUE RESULT_BLOCKING by path was removed and has not been used since Cube v0.33.7, \
+                 pass the queue id returned by QUEUE ADD"
+                    .to_string(),
+            ));
+        };
+
+        // It's important to open listener at the beginning to protect race condition
+        // it will fix the position (subscribe) of a broadcast channel
+        let listener = self.get_listener().await;
+
+        let store_in_result = self.lookup_queue_result_by_key(key.clone(), None).await?;
+        if store_in_result.is_some() {
+            return Ok(store_in_result);
+        }
+
+        let fut = tokio::time::timeout(
+            Duration::from_millis(timeout),
+            listener.wait_for_queue_ack_by_id(id),
+        );
+
+        if let Ok(res) = fut.await {
+            match res {
+                Ok(Some(ack_event)) => match ack_event.result {
+                    QueueResultAckEventResult::Empty => Ok(Some(QueueResultResponse::Success {
+                        value: None,
+                        id: ack_event.id,
+                        external_id: None,
+                    })),
+                    QueueResultAckEventResult::WithResult => {
+                        self.queue_result_ready_to_delete(ack_event.id).await
+                    }
+                },
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn queue_merge_extra(&self, key: QueueKey, payload: String) -> Result<(), CubeError> {
+        self.write_operation_queue("queue_merge_extra", move |db_ref, batch_pipe| {
+            let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+
+            let id_row_opt = queue_schema.get_row_by_key(key.clone())?;
+
+            if let Some(id_row) = id_row_opt {
+                let new = id_row.get_row().merge_extra(payload)?;
+
+                queue_schema.update(id_row.id, new, id_row.get_row(), batch_pipe)?;
+            } else {
+                warn!("Unable to merge extra, unknown key: {:?}", key);
+            }
+
+            Ok(())
+        })
+        .await
+    }
+
+    async fn compaction(&self) -> Result<(), CubeError> {
+        self.store
+            .read_operation_out_of_queue("compaction", move |db_ref| {
+                let start: Option<&[u8]> = None;
+                let end: Option<&[u8]> = None;
+
+                db_ref.db.compact_range(start, end);
+
+                Ok(())
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    async fn info(&self) -> Result<CachestoreInfo, CubeError> {
+        self.store
+            .read_operation_out_of_queue("info", move |db_ref| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                let cache_schema_stats = cache_schema.collect_table_stats_by_extended_index(
+                    &CacheItemRocksIndex::ByPath,
+                    CACHE_ITEM_SIZE_WITHOUT_VALUE as u64,
+                )?;
+
+                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+                let queue_schema_stats = queue_schema.collect_table_stats_by_extended_index(
+                    &QueueItemRocksIndex::ByPath,
+                    0 as u64,
+                )?;
+
+                let queue_result_schema = QueueResultRocksTable::new(db_ref.clone());
+                let queue_result_stats = queue_result_schema
+                    .collect_table_stats_by_extended_index(
+                        &QueueResultRocksIndex::ByPath,
+                        0 as u64,
+                    )?;
+
+                Ok(CachestoreInfo {
+                    tables: vec![cache_schema_stats, queue_schema_stats, queue_result_stats],
+                })
+            })
+            .await
+    }
+
+    async fn eviction(&self) -> Result<EvictionResult, CubeError> {
+        self.run_eviction().await
+    }
+
+    async fn persist(&self) -> Result<(), CubeError> {
+        self.run_ttl_persist().await
+    }
+
+    async fn healthcheck(&self) -> Result<(), CubeError> {
+        self.store.healthcheck().await?;
+
+        Ok(())
+    }
+
+    async fn rocksdb_properties(&self) -> Result<Vec<RocksPropertyRow>, CubeError> {
+        self.store.rocksdb_properties()
+    }
+
+    async fn wipe(&self) -> Result<(), CubeError> {
+        // Wiping requires dropping and reopening the RocksDB from scratch, which a bare inner
+        // store cannot do to itself (it cannot rebuild its own Arc / swap the state). The
+        // registered production impl is always LazyRocksCacheStore, which owns the teardown.
+        Err(CubeError::internal(
+            "cachestore wipe is only supported through LazyRocksCacheStore".to_string(),
+        ))
+    }
+}
+
+crate::di_service!(RocksCacheStore, [CacheStore]);
+crate::di_service!(CacheStoreRpcClient, [CacheStore]);
+
+pub struct ClusterCacheStoreClient {}
+
+#[async_trait]
+impl CacheStore for ClusterCacheStoreClient {
+    async fn cache_all(&self, _limit: Option<usize>) -> Result<Vec<IdRow<CacheItem>>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_all was used.")
+    }
+
+    async fn cache_set(
+        &self,
+        _item: CacheItem,
+        _update_if_not_exists: bool,
+    ) -> Result<bool, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_set was used.")
+    }
+
+    async fn cache_clear(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_clear was used.")
+    }
+
+    async fn truncate(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! truncate was used.")
+    }
+
+    async fn cache_delete(&self, _key: String) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_delete was used.")
+    }
+
+    async fn cache_get(&self, _key: String) -> Result<Option<IdRow<CacheItem>>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_get was used.")
+    }
+
+    async fn cache_keys(&self, _prefix: String) -> Result<Vec<IdRow<CacheItem>>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_keys was used.")
+    }
+
+    async fn cache_incr(&self, _: String) -> Result<IdRow<CacheItem>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! cache_incr was used.")
+    }
+
+    async fn queue_all(&self, _limit: Option<usize>) -> Result<Vec<QueueAllItem>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_all was used.")
+    }
+
+    async fn queue_results_all(
+        &self,
+        _limit: Option<usize>,
+    ) -> Result<Vec<IdRow<QueueResult>>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_results_all was used.")
+    }
+
+    async fn queue_results_multi_delete(&self, _ids: Vec<u64>) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_results_multi_delete was used.")
+    }
+
+    async fn queue_add(&self, _payload: QueueAddPayload) -> Result<QueueAddResponse, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_add was used.")
+    }
+
+    async fn queue_add_and_retrieve(
+        &self,
+        _payload: QueueAddAndRetrievePayload,
+    ) -> Result<QueueAddAndRetrieveResponse, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_add_and_retrieve was used.")
+    }
+
+    async fn queue_clear(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_clear was used.")
+    }
+
+    async fn queue_to_cancel(
+        &self,
+        _prefix: String,
+        _orphaned_timeout: Option<u32>,
+        _heartbeat_timeout: Option<u32>,
+    ) -> Result<Vec<IdRow<QueueItem>>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_to_cancel was used.")
+    }
+
+    async fn queue_list(
+        &self,
+        _prefix: String,
+        _status_filter: Option<QueueItemStatus>,
+        _priority_sort: bool,
+        _with_payload: bool,
+        _caller_process_id: Option<String>,
+    ) -> Result<Vec<QueueListItem>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_list was used.")
+    }
+
+    async fn queue_get(&self, _key: QueueKey) -> Result<Option<QueueGetResponse>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_get was used.")
+    }
+
+    async fn queue_cancel(&self, _key: QueueKey) -> Result<Option<QueueCancelResponse>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_cancel was used.")
+    }
+
+    async fn queue_heartbeat(&self, _key: QueueKey) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_heartbeat_by_id was used.")
+    }
+
+    async fn queue_retrieve_by_path(
+        &self,
+        _path: String,
+        _allow_concurrency: u32,
+        _caller_process_id: Option<String>,
+    ) -> Result<QueueRetrieveResponse, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_retrieve_by_path was used.")
+    }
+
+    async fn queue_ack(&self, _key: QueueKey, _result: Option<String>) -> Result<bool, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_ack was used.")
+    }
+
+    async fn queue_result(
+        &self,
+        _key: QueueKey,
+        _external_id: Option<String>,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_result was used.")
+    }
+
+    async fn queue_result_blocking(
+        &self,
+        _key: QueueKey,
+        _timeout: u64,
+    ) -> Result<Option<QueueResultResponse>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_result_blocking was used.")
+    }
+
+    async fn queue_merge_extra(&self, _key: QueueKey, _payload: String) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! queue_merge_extra was used.")
+    }
+
+    async fn compaction(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! compaction was used.")
+    }
+
+    async fn info(&self) -> Result<CachestoreInfo, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! info was used.")
+    }
+
+    async fn eviction(&self) -> Result<EvictionResult, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! eviction was used.")
+    }
+
+    async fn persist(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! persist was used.")
+    }
+
+    async fn healthcheck(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! healthcheck was used.")
+    }
+
+    async fn rocksdb_properties(&self) -> Result<Vec<RocksPropertyRow>, CubeError> {
+        panic!("CacheStore cannot be used on the worker node! rocksdb_properties was used.")
+    }
+
+    async fn wipe(&self) -> Result<(), CubeError> {
+        panic!("CacheStore cannot be used on the worker node! wipe was used.")
+    }
+}
+
+crate::di_service!(ClusterCacheStoreClient, [CacheStore]);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cachestore::cache_eviction_manager::LFU_INIT_VAL;
+    use crate::cachestore::{CacheEvictionPolicy, EvictionFinishedResult};
+    use crate::config::{init_test_logger, ConfigObjImpl, CubeServices};
+    use crate::metastore::{
+        RocksSecondaryIndexValueTTLExtended, RocksSecondaryIndexValueVersionEncoder,
+    };
+    use crate::CubeError;
+
+    #[tokio::test]
+    async fn test_cachestore_migration() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore_from_fixtures(
+            "cachestore-migration",
+            "cachestore-migration",
+            Config::test("cachestore-migration"),
+        );
+        // Right now, this test is not complete, because there is a problem with error tracking on migration
+        // TODO(ovr): fix me
+        cachestore.check_all_indexes().await?;
+
+        RocksCacheStore::cleanup_test_cachestore("cachestore-migration");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cache_incr() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) =
+            RocksCacheStore::prepare_test_cachestore("cache_incr", Config::test("cachestore_incr"));
+
+        let key = "prefix:key".to_string();
+        assert_eq!(
+            cachestore.cache_incr(key.clone()).await?.get_row().value,
+            "1"
+        );
+        assert_eq!(cachestore.cache_incr(key).await?.get_row().value, "2");
+
+        RocksCacheStore::cleanup_test_cachestore("cache_incr");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cache_set() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) =
+            RocksCacheStore::prepare_test_cachestore("cache_set", Config::test("cachestore_set"));
+
+        let path = "prefix:key-to-test-update".to_string();
+        assert_eq!(
+            cachestore
+                .cache_set(
+                    CacheItem::new(path.clone(), Some(60), "value1".to_string()),
+                    false
+                )
+                .await?,
+            true
+        );
+
+        assert_eq!(
+            cachestore
+                .cache_set(
+                    CacheItem::new(path.clone(), Some(60), "value2".to_string()),
+                    false
+                )
+                .await?,
+            true
+        );
+
+        let row = cachestore
+            .cache_get(path.clone())
+            .await?
+            .expect("must return row")
+            .into_row();
+        assert_eq!(row.get_path(), path);
+        assert_eq!(row.value, "value2".to_string());
+        assert_eq!(row.expire.is_some(), true);
+
+        RocksCacheStore::cleanup_test_cachestore("cache_set");
+
+        Ok(())
+    }
+
+    /// Lookups are tracked by a background task, wait until they reach the TTL buffer
+    async fn wait_for_ttl_buffer_hits(cachestore: &RocksCacheStore, row_id: u64, hits: u32) {
+        for _ in 0..100 {
+            if cachestore
+                .cache_eviction_manager
+                .get_ttl_buffer_hits(row_id)
+                .await
+                == Some(hits)
+            {
+                return;
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!(
+            "TTL buffer did not receive {} hits for row {}",
+            hits, row_id
+        );
+    }
+
+    async fn persist_and_read_extended(
+        cachestore: &RocksCacheStore,
+        row_id: u64,
+    ) -> Result<RocksSecondaryIndexValueTTLExtended, CubeError> {
+        cachestore.run_ttl_persist().await?;
+
+        cachestore
+            .store
+            .read_operation_out_of_queue("test_read_extended", move |db_ref| {
+                let cache_schema = CacheItemRocksTable::new(db_ref.clone());
+                for item in cache_schema.scan_index_values(&CacheItemRocksIndex::ByPath)? {
+                    let item = item?;
+                    if item.row_id == row_id {
+                        return Ok(item.extended.expect("must have extended info"));
+                    }
+                }
+
+                Err(CubeError::internal("row not found".to_string()))
+            })
+            .await
+    }
+
+    async fn cache_get_and_persist(
+        cachestore: &RocksCacheStore,
+        path: &str,
+        lookups: u32,
+    ) -> Result<RocksSecondaryIndexValueTTLExtended, CubeError> {
+        let mut row_id = 0;
+        for _ in 0..lookups {
+            row_id = cachestore
+                .cache_get(path.to_string())
+                .await?
+                .expect("must return row")
+                .get_id();
+        }
+
+        wait_for_ttl_buffer_hits(cachestore, row_id, lookups).await;
+        persist_and_read_extended(cachestore, row_id).await
+    }
+
+    #[tokio::test]
+    async fn test_cache_lfu_accumulates_across_persists() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        // log_factor=0 makes every hit increment the counter
+        let config = Config::test("cache_lfu_accumulates").update_config(|mut c| {
+            c.cachestore_cache_lfu_log_factor = 0;
+            c
+        });
+        let (_, cachestore) =
+            RocksCacheStore::prepare_test_cachestore("cache_lfu_accumulates", config);
+
+        let path = "prefix:lfu-key";
+        cachestore
+            .cache_set(
+                CacheItem::new(path.to_string(), Some(3600), "value".to_string()),
+                false,
+            )
+            .await?;
+
+        assert_eq!(
+            cache_get_and_persist(&cachestore, path, 5).await?.lfu,
+            LFU_INIT_VAL + 5
+        );
+        assert_eq!(
+            cache_get_and_persist(&cachestore, path, 3).await?.lfu,
+            LFU_INIT_VAL + 8
+        );
+
+        RocksCacheStore::cleanup_test_cachestore("cache_lfu_accumulates");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cache_lfu_does_not_decay_while_buffered() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let config = Config::test("cache_lfu_buffered_decay").update_config(|mut c| {
+            c.cachestore_cache_lfu_log_factor = 0;
+            c.cachestore_cache_lfu_decay_time = 60;
+            c
+        });
+        let (_, cachestore) =
+            RocksCacheStore::prepare_test_cachestore("cache_lfu_buffered_decay", config);
+
+        let path = "prefix:lfu-key";
+        cachestore
+            .cache_set(
+                CacheItem::new(path.to_string(), Some(3600), "value".to_string()),
+                false,
+            )
+            .await?;
+
+        assert_eq!(
+            cache_get_and_persist(&cachestore, path, 1).await?.lfu,
+            LFU_INIT_VAL + 1
+        );
+
+        // The key is hit right away and keeps being hit for 3 hours before the next persist
+        let row_id = cachestore
+            .cache_get(path.to_string())
+            .await?
+            .expect("must return row")
+            .get_id();
+        wait_for_ttl_buffer_hits(&cachestore, row_id, 1).await;
+        cachestore
+            .cache_eviction_manager
+            .set_ttl_buffer_last_access(
+                row_id,
+                (Utc::now() + chrono::Duration::hours(3)).encode_value_as_u32()?,
+            )
+            .await;
+
+        assert_eq!(
+            persist_and_read_extended(&cachestore, row_id).await?.lfu,
+            LFU_INIT_VAL + 2
+        );
+
+        RocksCacheStore::cleanup_test_cachestore("cache_lfu_buffered_decay");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cache_eviction_removes_expired_keys_from_ttl_buffer() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "cache_eviction_ttl_buffer",
+            Config::test("cache_eviction_ttl_buffer"),
+        );
+
+        let path = "prefix:expiring-key";
+        cachestore
+            .cache_set(
+                CacheItem::new(path.to_string(), Some(1), "value".to_string()),
+                false,
+            )
+            .await?;
+
+        let row_id = cachestore
+            .cache_get(path.to_string())
+            .await?
+            .expect("must return row")
+            .get_id();
+        wait_for_ttl_buffer_hits(&cachestore, row_id, 1).await;
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        // The first run loads stats and deletes expired keys
+        match cachestore.run_eviction().await? {
+            EvictionResult::InProgress(status) => panic!("unexpected status: {}", status),
+            EvictionResult::Finished(stats) => assert_eq!(stats.total_keys_removed, 1),
+        };
+
+        for _ in 0..100 {
+            if cachestore
+                .cache_eviction_manager
+                .get_ttl_buffer_hits(row_id)
+                .await
+                .is_none()
+            {
+                RocksCacheStore::cleanup_test_cachestore("cache_eviction_ttl_buffer");
+
+                return Ok(());
+            }
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("Evicted row {} was not removed from the TTL buffer", row_id);
+    }
+
+    #[tokio::test]
+    async fn test_cache_persist_keeps_raw_size_of_overwritten_value() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "cache_persist_raw_size",
+            Config::test("cache_persist_raw_size"),
+        );
+
+        let path = "prefix:raw-size-key";
+        cachestore
+            .cache_set(
+                CacheItem::new(path.to_string(), Some(3600), "a".repeat(100)),
+                false,
+            )
+            .await?;
+
+        let small = cache_get_and_persist(&cachestore, path, 1).await?;
+        assert_eq!(small.raw_size, CACHE_ITEM_SIZE_WITHOUT_VALUE + 100);
+
+        // A lookup is buffered, then the value is overwritten before the next persist
+        let row_id = cachestore
+            .cache_get(path.to_string())
+            .await?
+            .expect("must return row")
+            .get_id();
+        wait_for_ttl_buffer_hits(&cachestore, row_id, 1).await;
+
+        cachestore
+            .cache_set(
+                CacheItem::new(path.to_string(), Some(3600), "a".repeat(10_000)),
+                false,
+            )
+            .await?;
+
+        let overwritten = persist_and_read_extended(&cachestore, row_id).await?;
+        assert_eq!(overwritten.raw_size, CACHE_ITEM_SIZE_WITHOUT_VALUE + 10_000);
+
+        RocksCacheStore::cleanup_test_cachestore("cache_persist_raw_size");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_truncate() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "cachestore_truncate",
+            Config::test("cachestore_truncate"),
+        );
+
+        // Populate both the cache and the queue tables.
+        cachestore
+            .cache_set(
+                CacheItem::new("prefix:k1".to_string(), Some(60), "v1".to_string()),
+                false,
+            )
+            .await?;
+        cachestore
+            .cache_set(
+                CacheItem::new("prefix:k2".to_string(), Some(60), "v2".to_string()),
+                false,
+            )
+            .await?;
+        cachestore
+            .queue_add(QueueAddPayload {
+                path: "queue:p1".to_string(),
+                value: "qv1".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: None,
+            })
+            .await?;
+
+        assert_eq!(cachestore.cache_all(None).await?.len(), 2);
+        assert_eq!(cachestore.queue_all(None).await?.len(), 1);
+
+        // Low-level whole-store wipe (no per-row reads).
+        cachestore.truncate().await?;
+
+        assert_eq!(cachestore.cache_all(None).await?.len(), 0);
+        assert_eq!(cachestore.queue_all(None).await?.len(), 0);
+
+        // The emptied store must remain usable (migration metadata re-seeded,
+        // sequence counters reset).
+        assert_eq!(
+            cachestore
+                .cache_set(
+                    CacheItem::new("prefix:again".to_string(), Some(60), "v".to_string()),
+                    false
+                )
+                .await?,
+            true
+        );
+        assert_eq!(cachestore.cache_all(None).await?.len(), 1);
+
+        RocksCacheStore::cleanup_test_cachestore("cachestore_truncate");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cache_set_max_entry_size() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let config = Config::test("cachestore_set").update_config(|mut c| {
+            c.cachestore_cache_max_entry_size = 1 << 20;
+            c
+        });
+
+        let (_, cachestore) =
+            RocksCacheStore::prepare_test_cachestore("cache_set_max_entry_size", config);
+
+        let err = cachestore
+            .cache_set(
+                CacheItem::new(
+                    "prefix:key-with-wrong-size".to_string(),
+                    Some(60),
+                    "a".repeat(2 << 20),
+                ),
+                false,
+            )
+            .await;
+
+        assert_eq!(err, Err(CubeError::user(
+            "Unable to SET cache with 'key-with-wrong-size' key, exceeds maximum allowed size for payload: 2.10 MB, max allowed: 1.05 MB".to_string()
+        )));
+
+        RocksCacheStore::cleanup_test_cachestore("cache_set_max_entry_size");
+
+        Ok(())
+    }
+
+    async fn test_cachestore_force_eviction(
+        name: &str,
+        update_config: impl FnOnce(ConfigObjImpl) -> ConfigObjImpl,
+        keys_to_insert: usize,
+        key_size: usize,
+    ) -> Result<EvictionFinishedResult, CubeError> {
+        init_test_logger().await;
+
+        let config = Config::test(name).update_config(update_config);
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(name, config);
+
+        let cachestore_to_move = cachestore.clone();
+
+        tokio::task::spawn(async move {
+            let loops = cachestore_to_move.spawn_processing_loops();
+            CubeServices::wait_loops(loops).await
+        });
+
+        for i in (0..keys_to_insert).step_by(4) {
+            let (r1, r2, r3, r4) = tokio::join!(
+                cachestore.cache_set(
+                    CacheItem::new(format!("test:{}", i), Some(3600), "a".repeat(key_size)),
+                    false,
+                ),
+                cachestore.cache_set(
+                    CacheItem::new(format!("test:{}", i + 1), Some(3600), "a".repeat(key_size)),
+                    false,
+                ),
+                cachestore.cache_set(
+                    CacheItem::new(format!("test:{}", i + 2), Some(3600), "a".repeat(key_size)),
+                    false,
+                ),
+                cachestore.cache_set(
+                    CacheItem::new(format!("test:{}", i + 3), Some(3600), "a".repeat(key_size)),
+                    false,
+                )
+            );
+
+            r1?;
+            r2?;
+            r3?;
+            r4?;
+        }
+
+        let mut result = EvictionFinishedResult::empty();
+
+        // 1 load state
+        // check limits 3 (3 rounds for sampling)
+        for _ in 0..4 {
+            match cachestore.run_eviction().await? {
+                EvictionResult::InProgress(status) => panic!("unexpected status: {}", status),
+                EvictionResult::Finished(stats) => {
+                    println!("eviction stats {:?}", stats);
+
+                    result.add_eviction_result(stats);
+                }
+            };
+        }
+
+        // should not do anything
+        {
+            let eviction_results = match cachestore.run_eviction().await? {
+                EvictionResult::InProgress(status) => panic!("unexpected status: {}", status),
+                EvictionResult::Finished(stats) => stats,
+            };
+            assert_eq!(eviction_results.total_keys_removed, 0);
+            assert_eq!(eviction_results.total_size_removed, 0);
+            assert_eq!(eviction_results.total_delete_skipped, 0);
+
+            result.stats_total_keys = eviction_results.stats_total_keys;
+            result.stats_total_raw_size = eviction_results.stats_total_raw_size;
+        }
+
+        RocksCacheStore::cleanup_test_cachestore(name);
+
+        Ok(result)
+    }
+
+    #[tokio::test]
+    async fn test_cachestore_force_eviction_with_max_keys_limit_by_sampled_lru(
+    ) -> Result<(), CubeError> {
+        let result = test_cachestore_force_eviction(
+            "cachestore_force_eviction_with_max_keys_limit_by_sampled_lru",
+            |mut config| {
+                // 512 as soft
+                config.cachestore_cache_max_keys = 512;
+                // 512 * 1.5 = 768
+                config.cachestore_cache_threshold_to_force_eviction = 50;
+                config.cachestore_cache_eviction_below_threshold = 15;
+                config.cachestore_cache_max_size = 16384 << 20;
+                config.cachestore_cache_policy = CacheEvictionPolicy::SampledLru;
+
+                config
+            },
+            512 + 128,
+            128 << 12,
+        )
+        .await?;
+
+        // 640 -> 640 - (128 * 1.15 = 147.5) -> 492
+        assert_eq!(result.stats_total_keys < 512, true);
+        assert_eq!(result.stats_total_keys > 456, true);
+
+        assert_eq!(result.total_keys_removed > 100, true);
+        assert_eq!(result.total_keys_removed < 256, true);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cachestore_force_eviction_with_max_keys_limit_by_allkeys_lru(
+    ) -> Result<(), CubeError> {
+        let result = test_cachestore_force_eviction(
+            "cachestore_force_eviction_with_max_keys_limit_by_allkeys_lru",
+            |mut config| {
+                // 512 as soft
+                config.cachestore_cache_max_keys = 512;
+                // 512 * 1.5 = 768
+                config.cachestore_cache_threshold_to_force_eviction = 50;
+                config.cachestore_cache_eviction_below_threshold = 15;
+                config.cachestore_cache_max_size = 16384 << 20;
+                config.cachestore_cache_policy = CacheEvictionPolicy::AllKeysLru;
+
+                config
+            },
+            512 + 128,
+            128 << 12,
+        )
+        .await?;
+
+        // 640 - (128 * 1.15 = 147.5) -> 492
+        assert_eq!(result.stats_total_keys < 512, true);
+        assert_eq!(result.stats_total_keys > 456, true);
+
+        println!("result {:?}", result);
+        assert_eq!(result.total_keys_removed > 100, true);
+        assert_eq!(result.total_keys_removed < 256, true);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_cachestore_auto_eviction_with_max_keys_limit_by_allkeys_lru(
+    ) -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let config =
+            Config::test("test_cachestore_auto_eviction_with_max_keys_limit_by_allkeys_lru")
+                .update_config(|mut config| {
+                    // 512 as soft
+                    config.cachestore_cache_max_keys = 512;
+                    // 512 * 1.25 = 640
+                    config.cachestore_cache_threshold_to_force_eviction = 25;
+                    config.cachestore_cache_eviction_below_threshold = 15;
+                    config.cachestore_cache_max_size = 16384 << 20;
+                    config.cachestore_cache_policy = CacheEvictionPolicy::AllKeysLru;
+                    // disable periodic eviction, this test should force eviction
+                    config.cachestore_cache_eviction_loop_interval = 100000;
+
+                    config
+                });
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_cachestore_auto_eviction_with_max_keys_limit_by_allkeys_lru",
+            config,
+        );
+
+        let cachestore_to_move = cachestore.clone();
+
+        tokio::task::spawn(async move {
+            let loops = cachestore_to_move.spawn_processing_loops();
+            CubeServices::wait_loops(loops).await
+        });
+
+        for interval in 0..10 {
+            for i in (0..300).step_by(4) {
+                let (r1, r2, r3, r4) = tokio::join!(
+                    cachestore.cache_set(
+                        CacheItem::new(
+                            format!("test:{}", (interval * 1000) + i),
+                            Some(3600),
+                            "a".repeat(1 << 12)
+                        ),
+                        false,
+                    ),
+                    cachestore.cache_set(
+                        CacheItem::new(
+                            format!("test:{}", (interval * 1000) + i + 1),
+                            Some(3600),
+                            "a".repeat(1 << 12)
+                        ),
+                        false,
+                    ),
+                    cachestore.cache_set(
+                        CacheItem::new(
+                            format!("test:{}", (interval * 1000) + i + 2),
+                            Some(3600),
+                            "a".repeat(1 << 12)
+                        ),
+                        false,
+                    ),
+                    cachestore.cache_set(
+                        CacheItem::new(
+                            format!("test:{}", (interval * 1000) + i + 3),
+                            Some(3600),
+                            "a".repeat(1 << 12)
+                        ),
+                        false,
+                    )
+                );
+
+                r1?;
+                r2?;
+                r3?;
+                r4?;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            trace!(
+                "after loop, total keys: {}",
+                cachestore.cache_eviction_manager.get_stats_total_keys()
+            );
+            assert_eq!(
+                cachestore.cache_eviction_manager.get_stats_total_keys() < 640,
+                true
+            );
+            assert_eq!(
+                cachestore.cache_eviction_manager.get_stats_total_keys() >= 300,
+                true
+            );
+        }
+
+        assert_eq!(
+            cachestore.cache_eviction_manager.get_stats_total_keys() > 400,
+            true
+        );
+
+        RocksCacheStore::cleanup_test_cachestore(
+            "test_cachestore_auto_eviction_with_max_keys_limit_by_allkeys_lru",
+        );
+
+        Ok(())
+    }
+
+    /// Returns how many small and large keys survive the eviction.
+    async fn run_size_limit_eviction(
+        name: &str,
+        policy: CacheEvictionPolicy,
+        size_classes: Vec<u32>,
+    ) -> Result<(usize, usize), CubeError> {
+        init_test_logger().await;
+
+        let config = Config::test(name).update_config(|mut config| {
+            config.cachestore_cache_max_size = 1 << 20;
+            config.cachestore_cache_max_keys = 100_000;
+            // keep inserts from forcing an eviction, the test runs it explicitly
+            config.cachestore_cache_threshold_to_force_eviction = 100;
+            // evict exactly the overflow
+            config.cachestore_cache_eviction_below_threshold = 1;
+            config.cachestore_cache_policy = policy;
+            config.cachestore_cache_eviction_size_classes = size_classes;
+
+            config
+        });
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(name, config);
+
+        for i in 0..50 {
+            cachestore
+                .cache_set(
+                    CacheItem::new(format!("touch:{}", i), Some(3600), "1".to_string()),
+                    false,
+                )
+                .await?;
+        }
+
+        // LRU has a precision of one second
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        for i in 0..8 {
+            cachestore
+                .cache_set(
+                    CacheItem::new(format!("result:{}", i), Some(3600), "a".repeat(300 << 10)),
+                    false,
+                )
+                .await?;
+        }
+
+        // the first run loads stats, the second one evicts
+        for _ in 0..2 {
+            cachestore.run_eviction().await?;
+        }
+
+        let small = cachestore.cache_keys("touch:".to_string()).await?.len();
+        let large = cachestore.cache_keys("result:".to_string()).await?.len();
+
+        RocksCacheStore::cleanup_test_cachestore(name);
+
+        Ok((small, large))
+    }
+
+    #[tokio::test]
+    async fn test_size_limit_eviction_with_size_classes() -> Result<(), CubeError> {
+        let (small, large) = run_size_limit_eviction(
+            "test_size_limit_eviction_with_size_classes",
+            CacheEvictionPolicy::AllKeysLru,
+            vec![1 << 10],
+        )
+        .await?;
+
+        assert_eq!(small, 50);
+        assert_eq!(large, 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_size_limit_eviction_without_size_classes() -> Result<(), CubeError> {
+        let (small, large) = run_size_limit_eviction(
+            "test_size_limit_eviction_without_size_classes",
+            CacheEvictionPolicy::AllKeysLru,
+            vec![],
+        )
+        .await?;
+
+        // plain LRU drops the older small keys first, although together they free under 9 KB
+        assert_eq!(small, 0);
+        assert_eq!(large, 3);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_size_limit_eviction_sampled_with_size_classes() -> Result<(), CubeError> {
+        let (small_with, large_with) = run_size_limit_eviction(
+            "test_size_limit_eviction_sampled_with_size_classes",
+            CacheEvictionPolicy::SampledLru,
+            vec![1 << 10],
+        )
+        .await?;
+        let (small_without, large_without) = run_size_limit_eviction(
+            "test_size_limit_eviction_sampled_without_size_classes",
+            CacheEvictionPolicy::SampledLru,
+            vec![],
+        )
+        .await?;
+
+        // Sampling evicts one key per sample, so the order is best-effort. Both runs scan the
+        // same keys in the same order; with classes a sample gives up its large key instead
+        // of the older small one.
+        assert!(
+            small_with > small_without,
+            "small keys left: {} with classes, {} without",
+            small_with,
+            small_without
+        );
+        assert!(
+            large_with < large_without,
+            "large keys left: {} with classes, {} without",
+            large_with,
+            large_without
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_filter_to_cancel() {
+        let now = Utc::now();
+        let item_pending_custom_orphaned = IdRow::new(
+            1,
+            QueueItem::new(
+                "1".to_string(),
+                QueueItemStatus::Pending,
+                1,
+                Some(10),
+                None,
+                false,
+                None,
+            ),
+        );
+        let item_pending_custom_orphaned_expired = IdRow::new(
+            2,
+            QueueItem::new(
+                "2".to_string(),
+                QueueItemStatus::Pending,
+                1,
+                Some(1),
+                None,
+                false,
+                None,
+            ),
+        );
+        let item_active_custom_orphaned = IdRow::new(
+            3,
+            QueueItem::new(
+                "3".to_string(),
+                QueueItemStatus::Active,
+                1,
+                Some(10),
+                None,
+                false,
+                None,
+            ),
+        );
+        let mut item_active_custom_orphaned_expired = IdRow::new(
+            4,
+            QueueItem::new(
+                "4".to_string(),
+                QueueItemStatus::Active,
+                1,
+                Some(1),
+                None,
+                false,
+                None,
+            ),
+        );
+
+        assert_eq!(
+            RocksCacheStore::filter_to_cancel(
+                now.clone(),
+                vec![
+                    item_pending_custom_orphaned.clone(),
+                    item_pending_custom_orphaned_expired.clone(),
+                    item_active_custom_orphaned.clone(),
+                    item_active_custom_orphaned_expired.clone()
+                ],
+                Some(1000),
+                None,
+            )
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<u64>>()
+            .len(),
+            0
+        );
+
+        assert_eq!(
+            RocksCacheStore::filter_to_cancel(
+                now.clone(),
+                vec![
+                    item_pending_custom_orphaned.clone(),
+                    item_pending_custom_orphaned_expired.clone(),
+                    item_active_custom_orphaned.clone(),
+                    item_active_custom_orphaned_expired.clone()
+                ],
+                Some(1000),
+                Some(1000)
+            )
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<u64>>()
+            .len(),
+            0
+        );
+
+        let now = now + chrono::Duration::seconds(2);
+
+        assert_eq!(
+            RocksCacheStore::filter_to_cancel(
+                now.clone(),
+                vec![
+                    item_pending_custom_orphaned.clone(),
+                    item_pending_custom_orphaned_expired.clone(),
+                    item_active_custom_orphaned.clone(),
+                    item_active_custom_orphaned_expired.clone()
+                ],
+                Some(1000),
+                None,
+            )
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<u64>>(),
+            vec![2]
+        );
+
+        item_active_custom_orphaned_expired.row.heartbeat = Some(now.clone());
+
+        assert_eq!(
+            RocksCacheStore::filter_to_cancel(
+                now,
+                vec![
+                    item_pending_custom_orphaned.clone(),
+                    item_pending_custom_orphaned_expired.clone(),
+                    item_active_custom_orphaned.clone(),
+                    item_active_custom_orphaned_expired.clone()
+                ],
+                Some(1000),
+                Some(1000)
+            )
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<u64>>(),
+            vec![2, 3]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_validations() -> Result<(), CubeError> {
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_validations",
+            Config::test("test_queue_add_validations"),
+        );
+
+        let res = cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path1".to_string(),
+                value: "v1".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: Some("ext-dup".to_string()),
+            })
+            .await;
+        assert!(res.is_ok(), "First insert with external_id should succeed");
+        assert!(res.unwrap().added);
+
+        // Same external_id but different path should succeed (uniqueness is per path now)
+        let res = cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path2".to_string(),
+                value: "v2".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: Some("ext-dup".to_string()),
+            })
+            .await;
+        assert!(
+            res.is_ok(),
+            "Same external_id with different path should succeed"
+        );
+        assert!(res.unwrap().added);
+
+        // Same path returns added: false (ByPath uniqueness), not an error
+        let res = cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path1".to_string(),
+                value: "v1-dup".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: Some("ext-dup".to_string()),
+            })
+            .await;
+        assert!(res.is_ok(), "Duplicate path should return added: false");
+        assert!(!res.unwrap().added);
+
+        // Multiple inserts with None external_id should all succeed
+        {
+            let res = cachestore
+                .queue_add(QueueAddPayload {
+                    path: "prefix:path3".to_string(),
+                    value: "v3".to_string(),
+                    priority: 0,
+                    orphaned: None,
+                    process_id: None,
+                    exclusive: false,
+                    external_id: None,
+                })
+                .await;
+            assert!(
+                res.is_ok(),
+                "First insert with None external_id should succeed"
+            );
+            assert!(res.unwrap().added);
+
+            let res = cachestore
+                .queue_add(QueueAddPayload {
+                    path: "prefix:path4".to_string(),
+                    value: "v4".to_string(),
+                    priority: 0,
+                    orphaned: None,
+                    process_id: None,
+                    exclusive: false,
+                    external_id: None,
+                })
+                .await;
+            assert!(
+                res.is_ok(),
+                "Second insert with None external_id should succeed"
+            );
+            assert!(res.unwrap().added);
+        }
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_validations");
+
+        Ok(())
+    }
+
+    async fn assert_queue_item_status(
+        cachestore: &Arc<RocksCacheStore>,
+        key: &str,
+        status: QueueItemStatus,
+        with_heartbeat: bool,
+    ) -> Result<(), CubeError> {
+        let item = cachestore
+            .queue_all(None)
+            .await?
+            .into_iter()
+            .find(|row| row.item.get_row().get_key() == key)
+            .expect("queue item must exist");
+
+        assert_eq!(item.item.get_row().get_status(), &status, "key: {}", key);
+        assert_eq!(
+            item.item.get_row().get_heartbeat().is_some(),
+            with_heartbeat,
+            "heartbeat for key: {}",
+            key
+        );
+
+        Ok(())
+    }
+
+    fn queue_add_and_retrieve_payload(
+        path: &str,
+        value: &str,
+        concurrency: u32,
+    ) -> QueueAddAndRetrievePayload {
+        QueueAddAndRetrievePayload {
+            path: path.to_string(),
+            value: value.to_string(),
+            priority: 0,
+            orphaned: None,
+            process_id: None,
+            exclusive: false,
+            external_id: None,
+            concurrency,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_and_retrieve() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_and_retrieve",
+            Config::test("test_queue_add_and_retrieve"),
+        );
+
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path1", "v1", 1))
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, Some("v1".to_string()));
+        assert_eq!(res.extra, None);
+        assert_eq!(res.active, vec!["path1".to_string()]);
+        // A claimed item is inserted as active, it was never pending
+        assert_eq!(res.pending, 0);
+
+        assert_queue_item_status(&cachestore, "path1", QueueItemStatus::Active, true).await?;
+
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path2", "v2", 1))
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, None);
+        assert_eq!(res.active, vec!["path1".to_string()]);
+        assert_eq!(res.pending, 1);
+
+        assert_queue_item_status(&cachestore, "path2", QueueItemStatus::Pending, false).await?;
+
+        // The stored value is returned, not the value of this call
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path2", "v2-dup", 2))
+            .await?;
+        assert!(!res.added);
+        assert_eq!(res.payload, Some("v2".to_string()));
+        assert_eq!(res.pending, 0);
+
+        let mut active = res.active;
+        active.sort();
+        assert_eq!(active, vec!["path1".to_string(), "path2".to_string()]);
+
+        assert_queue_item_status(&cachestore, "path2", QueueItemStatus::Active, true).await?;
+
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path1", "v1", 5))
+            .await?;
+        assert!(!res.added);
+        assert_eq!(res.payload, None);
+        assert_eq!(res.pending, 0);
+        assert_eq!(res.active.len(), 2);
+
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path3", "v3", 0))
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, None);
+        assert_eq!(res.pending, 1);
+
+        assert_queue_item_status(&cachestore, "path3", QueueItemStatus::Pending, false).await?;
+
+        let res = cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path4".to_string(),
+                value: "v4".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: None,
+            })
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.pending, 2);
+
+        assert_queue_item_status(&cachestore, "path4", QueueItemStatus::Pending, false).await?;
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_and_retrieve");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_and_retrieve_backlog() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_and_retrieve_backlog",
+            Config::test("test_queue_add_and_retrieve_backlog"),
+        );
+
+        for path in ["prefix:path1", "prefix:path2"] {
+            cachestore
+                .queue_add(QueueAddPayload {
+                    path: path.to_string(),
+                    value: "v".to_string(),
+                    priority: 0,
+                    orphaned: None,
+                    process_id: None,
+                    exclusive: false,
+                    external_id: None,
+                })
+                .await?;
+        }
+
+        // Every concurrency slot is free, but claiming would leave the 2 pending items
+        // a single slot to share, so the item takes its place in the backlog instead
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path3", "v3", 2))
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, None);
+        assert_eq!(res.active, Vec::<String>::new());
+        assert_eq!(res.pending, 3);
+
+        assert_queue_item_status(&cachestore, "path3", QueueItemStatus::Pending, false).await?;
+
+        // A slot is left over for every one of the 3 pending items, nothing is jumped over
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path4", "v4", 4))
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, Some("v4".to_string()));
+        assert_eq!(res.active, vec!["path4".to_string()]);
+        assert_eq!(res.pending, 3);
+
+        assert_queue_item_status(&cachestore, "path4", QueueItemStatus::Active, true).await?;
+
+        // The very same budget declines the next claim, the slot it took is now busy
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path5", "v5", 4))
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, None);
+        assert_eq!(res.active, vec!["path4".to_string()]);
+        assert_eq!(res.pending, 4);
+
+        assert_queue_item_status(&cachestore, "path5", QueueItemStatus::Pending, false).await?;
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_and_retrieve_backlog");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_and_retrieve_exclusive() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_and_retrieve_excl",
+            Config::test("test_queue_add_and_retrieve_excl"),
+        );
+
+        // The process_id of a brand new item is the process_id of the caller,
+        // the exclusive flag can never block the claim on insert
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                process_id: Some("process-a".to_string()),
+                exclusive: true,
+                ..queue_add_and_retrieve_payload("prefix:path1", "v1", 1)
+            })
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, Some("v1".to_string()));
+
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                process_id: Some("process-a".to_string()),
+                exclusive: true,
+                ..queue_add_and_retrieve_payload("prefix:path2", "v2", 1)
+            })
+            .await?;
+        assert!(res.added);
+        assert_eq!(res.payload, None);
+
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                process_id: Some("process-b".to_string()),
+                exclusive: true,
+                ..queue_add_and_retrieve_payload("prefix:path2", "v2", 5)
+            })
+            .await?;
+        assert!(!res.added);
+        assert_eq!(res.payload, None);
+        assert_queue_item_status(&cachestore, "path2", QueueItemStatus::Pending, false).await?;
+
+        // Reachable without the EXCLUSIVE keyword, because the item itself is exclusive
+        let res = cachestore
+            .queue_add_and_retrieve(queue_add_and_retrieve_payload("prefix:path2", "v2", 5))
+            .await;
+        assert!(res.is_err(), "expected an error, actual: {:?}", res);
+        assert!(res.unwrap_err().to_string().contains("process_id"));
+        assert_eq!(cachestore.queue_all(None).await?.len(), 2);
+        assert_queue_item_status(&cachestore, "path2", QueueItemStatus::Pending, false).await?;
+
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                process_id: Some("process-a".to_string()),
+                exclusive: true,
+                ..queue_add_and_retrieve_payload("prefix:path2", "v2", 5)
+            })
+            .await?;
+        assert!(!res.added);
+        assert_eq!(res.payload, Some("v2".to_string()));
+        assert_queue_item_status(&cachestore, "path2", QueueItemStatus::Active, true).await?;
+
+        // An exclusive item without an owner would be inserted straight in the active
+        // status and could never be claimed back
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                exclusive: true,
+                ..queue_add_and_retrieve_payload("prefix:path3", "v3", 5)
+            })
+            .await;
+        assert!(res.is_err(), "expected an error, actual: {:?}", res);
+        assert!(res.unwrap_err().to_string().contains("process_id"));
+        assert_eq!(cachestore.queue_all(None).await?.len(), 2);
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_and_retrieve_excl");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_none_external_id_after_rebuild() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_none_ext_rebuild",
+            Config::test("test_queue_add_none_ext_rebuild"),
+        );
+
+        // Add two queue items without external_id
+        cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path1".to_string(),
+                value: "v1".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: None,
+            })
+            .await?;
+
+        cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path2".to_string(),
+                value: "v2".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: None,
+            })
+            .await?;
+
+        // Add one item with a real external_id
+        cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path_ext".to_string(),
+                value: "v_ext".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: Some("ext-real".to_string()),
+            })
+            .await?;
+
+        // Simulate migration: rebuild the ByPathAndExternalId index.
+        cachestore
+            .read_operation_queue("test_rebuild_index", move |db_ref| {
+                let queue_schema = QueueItemRocksTable::new(db_ref.clone());
+                let indexes = QueueItemRocksTable::indexes();
+
+                // Force rebuild index manually, instead of relying on the automatic rebuild (it will ignore).
+                for index in indexes.iter() {
+                    queue_schema.rebuild_index(index)?;
+                }
+
+                Ok(())
+            })
+            .await?;
+
+        // After rebuild, adding another item without external_id should still succeed
+        let res = cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path3".to_string(),
+                value: "v3".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: None,
+            })
+            .await;
+        assert!(
+            res.is_ok(),
+            "Insert with None external_id after index rebuild should succeed, got: {:?}",
+            res.err()
+        );
+
+        // Same external_id with different path should succeed after rebuild (uniqueness is per path)
+        let res = cachestore
+            .queue_add(QueueAddPayload {
+                path: "prefix:path_ext_dup".to_string(),
+                value: "v_ext_dup".to_string(),
+                priority: 0,
+                orphaned: None,
+                process_id: None,
+                exclusive: false,
+                external_id: Some("ext-real".to_string()),
+            })
+            .await;
+        assert!(
+            res.is_ok(),
+            "Same external_id with different path should succeed after rebuild, got: {:?}",
+            res.err()
+        );
+        assert!(res.unwrap().added);
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_none_ext_rebuild");
+
+        Ok(())
+    }
+
+    fn queue_add_payload(path: &str) -> QueueAddPayload {
+        QueueAddPayload {
+            path: path.to_string(),
+            value: "payload".to_string(),
+            priority: 0,
+            orphaned: None,
+            process_id: None,
+            exclusive: false,
+            external_id: None,
+        }
+    }
+
+    fn queue_result_value(response: Option<QueueResultResponse>) -> Option<String> {
+        match response {
+            Some(QueueResultResponse::Success { value, .. }) => value,
+            None => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_queue_result_blocking_multiple_waiters() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_result_blocking_multiple_waiters",
+            Config::test("test_queue_result_blocking_multiple_waiters"),
+        );
+        // send() fails without a live receiver
+        let (sender, _receiver) = tokio::sync::broadcast::channel(16);
+        cachestore.add_listener(sender).await;
+
+        let id = cachestore
+            .queue_add(QueueAddPayload {
+                external_id: Some("ext-1".to_string()),
+                ..queue_add_payload("prefix:path1")
+            })
+            .await?
+            .id;
+
+        let waiter = || {
+            let cachestore = cachestore.clone();
+            tokio::spawn(async move {
+                cachestore
+                    .queue_result_blocking(QueueKey::ById(id), 5000)
+                    .await
+            })
+        };
+        let waiter_1 = waiter();
+        let waiter_2 = waiter();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            cachestore
+                .queue_ack(QueueKey::ById(id), Some("result".to_string()))
+                .await?
+        );
+
+        for waiter in [waiter_1, waiter_2] {
+            assert_eq!(
+                waiter.await.unwrap()?,
+                Some(QueueResultResponse::Success {
+                    value: Some("result".to_string()),
+                    id,
+                    external_id: Some("ext-1".to_string()),
+                })
+            );
+        }
+
+        // Consumed by the waiters, but kept until GC
+        assert_eq!(
+            cachestore
+                .queue_result(QueueKey::ByPath("prefix:path1".to_string()), None)
+                .await?,
+            None
+        );
+        assert_eq!(
+            queue_result_value(cachestore.queue_result(QueueKey::ById(id), None).await?),
+            Some("result".to_string())
+        );
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_result_blocking_multiple_waiters");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_result_blocking_by_path_removed() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_result_blocking_by_path_removed",
+            Config::test("test_queue_result_blocking_by_path_removed"),
+        );
+
+        let err = cachestore
+            .queue_result_blocking(QueueKey::ByPath("prefix:path1".to_string()), 1000)
+            .await
+            .unwrap_err();
+        assert!(err.message.contains("was removed"), "{}", err.message);
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_result_blocking_by_path_removed");
+
+        Ok(())
+    }
+
+    fn queue_add_orphaned_payload(path: &str, orphaned: Option<u32>) -> QueueAddPayload {
+        QueueAddPayload {
+            path: path.to_string(),
+            value: "v".to_string(),
+            priority: 0,
+            orphaned,
+            process_id: None,
+            exclusive: false,
+            external_id: None,
+        }
+    }
+
+    async fn queue_item_by_key(
+        cachestore: &Arc<RocksCacheStore>,
+        key: &str,
+    ) -> Result<IdRow<QueueItem>, CubeError> {
+        Ok(cachestore
+            .queue_all(None)
+            .await?
+            .into_iter()
+            .find(|row| row.item.get_row().get_key() == key)
+            .expect("queue item must exist")
+            .item)
+    }
+
+    #[test]
+    fn test_queue_item_expire_is_never_shorter_with_orphaned() {
+        let without = QueueItem::new(
+            "prefix:k".to_string(),
+            QueueItemStatus::Pending,
+            0,
+            None,
+            None,
+            false,
+            None,
+        );
+        let with = QueueItem::new(
+            "prefix:k".to_string(),
+            QueueItemStatus::Pending,
+            0,
+            Some(120),
+            None,
+            false,
+            None,
+        );
+
+        assert!(with.get_expire() >= without.get_expire());
+    }
+
+    #[test]
+    fn test_queue_item_touch_skips_while_deadline_is_far() {
+        let item = |orphaned: u32| {
+            QueueItem::new(
+                "prefix:k".to_string(),
+                QueueItemStatus::Pending,
+                0,
+                Some(orphaned),
+                None,
+                false,
+                None,
+            )
+        };
+
+        // A full timeout is still left: polling waiters must not rewrite the row on every add
+        assert_eq!(item(900).touch_orphaned(600), None);
+
+        // Less than a full timeout left: written, and at least a full timeout is left again
+        let mut due = item(590);
+        assert!(due.touch_orphaned(600).is_some());
+        assert!(due.get_orphaned().unwrap() >= chrono::Utc::now() + chrono::Duration::seconds(600));
+        // so the poll right after it is skipped
+        assert_eq!(due.touch_orphaned(600), None);
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_touches_orphaned() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_touches_orphaned",
+            Config::test("test_queue_add_touches_orphaned"),
+        );
+
+        let res = cachestore
+            .queue_add(queue_add_orphaned_payload("prefix:touched", Some(0)))
+            .await?;
+        assert!(res.added);
+        // Seconds precision on disk, so let the zero deadline pass for sure
+        Delay::new(Duration::from_millis(1100)).await;
+
+        let to_cancel = cachestore
+            .queue_to_cancel("prefix".to_string(), Some(120_000), None)
+            .await?;
+        assert_eq!(to_cancel.len(), 1, "an item nobody waits for is orphaned");
+
+        // A waiter adding it again pushes the deadline forward instead of being ignored
+        let before = queue_item_by_key(&cachestore, "touched").await?;
+        let res = cachestore
+            .queue_add(queue_add_orphaned_payload("prefix:touched", Some(600)))
+            .await?;
+        assert!(!res.added);
+        assert_eq!(res.id, before.get_id());
+
+        let after = queue_item_by_key(&cachestore, "touched").await?;
+        let deadline = after
+            .get_row()
+            .get_orphaned()
+            .expect("touched item has a deadline");
+        assert!(deadline > chrono::Utc::now() + chrono::Duration::seconds(500));
+        assert!(*after.get_row().get_expire() >= deadline + chrono::Duration::hours(2));
+
+        let to_cancel = cachestore
+            .queue_to_cancel("prefix".to_string(), Some(120_000), None)
+            .await?;
+        assert!(to_cancel.is_empty(), "a touched item is not orphaned");
+
+        // A shorter timeout never pulls the deadline back
+        cachestore
+            .queue_add(queue_add_orphaned_payload("prefix:touched", Some(0)))
+            .await?;
+        let again = queue_item_by_key(&cachestore, "touched").await?;
+        assert_eq!(
+            again.get_row().get_orphaned(),
+            after.get_row().get_orphaned()
+        );
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_touches_orphaned");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_without_orphaned_does_not_touch() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_without_orphaned_does_not_touch",
+            Config::test("test_queue_add_without_orphaned_does_not_touch"),
+        );
+
+        cachestore
+            .queue_add(queue_add_orphaned_payload("prefix:untouched", None))
+            .await?;
+        let before = queue_item_by_key(&cachestore, "untouched").await?;
+
+        cachestore
+            .queue_add(queue_add_orphaned_payload("prefix:untouched", None))
+            .await?;
+        let after = queue_item_by_key(&cachestore, "untouched").await?;
+        assert_eq!(before.get_row(), after.get_row());
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_without_orphaned_does_not_touch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_touch_extends_payload_expire() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_touch_extends_payload_expire",
+            Config::test("test_queue_add_touch_extends_payload_expire"),
+        );
+
+        let res = cachestore
+            .queue_add(queue_add_orphaned_payload("prefix:long_wait", Some(0)))
+            .await?;
+        let created_expire = queue_item_by_key(&cachestore, "long_wait")
+            .await?
+            .get_row()
+            .get_expire()
+            .clone();
+
+        // Past the item's own expiry, so both the item and its payload have to move
+        cachestore
+            .queue_add(queue_add_orphaned_payload(
+                "prefix:long_wait",
+                Some(5 * 60 * 60),
+            ))
+            .await?;
+
+        let item = queue_item_by_key(&cachestore, "long_wait").await?;
+        assert!(*item.get_row().get_expire() > created_expire);
+
+        let id = res.id;
+        let payload = cachestore
+            .read_operation_queue("test_payload_expire", move |db_ref| {
+                QueueItemPayloadRocksTable::new(db_ref).get_row(id)
+            })
+            .await?
+            .expect("payload must exist");
+        assert_eq!(payload.get_row().get_expire(), item.get_row().get_expire());
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_touch_extends_payload_expire");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_queue_add_and_retrieve_touches_then_claims() -> Result<(), CubeError> {
+        init_test_logger().await;
+
+        let (_, cachestore) = RocksCacheStore::prepare_test_cachestore(
+            "test_queue_add_and_retrieve_touches_then_claims",
+            Config::test("test_queue_add_and_retrieve_touches_then_claims"),
+        );
+
+        // Pending: no concurrency left for it
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                orphaned: Some(0),
+                ..queue_add_and_retrieve_payload("prefix:claimed", "v", 0)
+            })
+            .await?;
+        assert!(res.added);
+        assert_queue_item_status(&cachestore, "claimed", QueueItemStatus::Pending, false).await?;
+
+        // Added again with room to run: touched and claimed in the same write
+        let res = cachestore
+            .queue_add_and_retrieve(QueueAddAndRetrievePayload {
+                orphaned: Some(600),
+                ..queue_add_and_retrieve_payload("prefix:claimed", "v", 1)
+            })
+            .await?;
+        assert!(!res.added);
+        assert_eq!(res.payload, Some("v".to_string()));
+
+        assert_queue_item_status(&cachestore, "claimed", QueueItemStatus::Active, true).await?;
+        let item = queue_item_by_key(&cachestore, "claimed").await?;
+        let deadline = item
+            .get_row()
+            .get_orphaned()
+            .expect("touched item has a deadline");
+        assert!(deadline > chrono::Utc::now() + chrono::Duration::seconds(500));
+
+        RocksCacheStore::cleanup_test_cachestore("test_queue_add_and_retrieve_touches_then_claims");
+
+        Ok(())
+    }
+}

@@ -1,0 +1,912 @@
+import {
+  getEnv,
+  assertDataSource,
+  extractRequestUUID,
+  formatClickHouse,
+} from '@cubejs-backend/shared';
+import type { LogLevel } from '@cubejs-backend/shared';
+import {
+  BaseDriver,
+  DownloadQueryResultsOptions,
+  DownloadQueryResultsResult,
+  DownloadTableCSVData,
+  DriverCapabilities,
+  DriverInterface,
+  GenericDataBaseType,
+  QueryOptions,
+  QuerySchemasResult,
+  S3Credentials,
+  StreamOptions,
+  StreamTableDataWithTypes,
+  TableColumn,
+  TableQueryResult,
+  TableStructure,
+  UnloadOptions,
+} from '@cubejs-backend/base-driver';
+
+import { ClickHouseClient, ClickHouseLogLevel, createClient } from '@clickhouse/client';
+import type {
+  ClickHouseSettings,
+  ErrorLogParams,
+  LogParams,
+  Logger,
+  ResponseJSON,
+  WarnLogParams,
+} from '@clickhouse/client';
+import { v4 as uuidv4 } from 'uuid';
+
+import { version } from '../package.json';
+
+import { ClickHouseRowStream } from './RowStream';
+import { buildTransformFromMeta, transformRow } from './Transform';
+import { formatError } from './utils';
+
+const SUPPORTED_BUCKET_TYPES = ['s3'];
+
+// ClickHouse signs every upload part with the export's credentials, so each export must start with at least
+// this long left. Of a default 1h STS session that leaves 10 min of sharing: enough to absorb a build burst.
+const EXPORT_CREDENTIALS_REFRESH_MARGIN_MS = 50 * 60 * 1000;
+
+/**
+ * Inline session policy for the credentials handed to ClickHouse: the role's rights, cut down to the
+ * export bucket path. A session policy can only narrow the role, never widen it.
+ */
+export function exportBucketSessionPolicy(bucketName: string, path: string, partition: string = 'aws'): string {
+  const prefix = path ? `${path}/` : '';
+
+  return JSON.stringify({
+    Version: '2012-10-17',
+    Statement: [
+      {
+        Effect: 'Allow',
+        Action: ['s3:PutObject', 's3:GetObject', 's3:AbortMultipartUpload', 's3:ListMultipartUploadParts'],
+        Resource: `arn:${partition}:s3:::${bucketName}/${prefix}*`,
+      },
+      {
+        Effect: 'Allow',
+        Action: ['s3:ListBucket', 's3:GetBucketLocation'],
+        Resource: `arn:${partition}:s3:::${bucketName}`,
+      },
+      {
+        // SSE-KMS: key use only through S3 for this bucket (bucket ARN too, for S3 Bucket Keys).
+        Effect: 'Allow',
+        Action: ['kms:GenerateDataKey', 'kms:Decrypt'],
+        Resource: '*',
+        Condition: {
+          StringLike: {
+            'kms:ViaService': 's3.*.amazonaws.com*',
+            'kms:EncryptionContext:aws:s3:arn': [
+              `arn:${partition}:s3:::${bucketName}`,
+              `arn:${partition}:s3:::${bucketName}/${prefix}*`,
+            ],
+          },
+        },
+      },
+    ],
+  });
+}
+
+// Statements without a result set. Sent through `client.query()`, ClickHouse answers them with an
+// empty body, or with a TabSeparated DDL status on a Replicated database: neither parses as JSONCompact.
+const NO_RESULT_SET_STATEMENT = /^\s*(CREATE|ALTER|DROP|RENAME|TRUNCATE|ATTACH|DETACH|EXCHANGE|INSERT)\b/i;
+
+const ClickhouseTypeToGeneric: Record<string, string> = {
+  enum: 'text',
+  string: 'text',
+  datetime: 'timestamp',
+  datetime64: 'timestamp',
+  date: 'date',
+  decimal: 'decimal',
+  // integers
+  int8: 'int',
+  int16: 'int',
+  int32: 'int',
+  int64: 'bigint',
+  // unsigned int
+  uint8: 'int',
+  uint16: 'int',
+  uint32: 'int',
+  uint64: 'bigint',
+  // floats
+  float32: 'float',
+  float64: 'double',
+  // We don't support enums
+  enum8: 'text',
+  enum16: 'text',
+};
+
+export interface ClickHouseDriverOptions {
+  host?: string,
+  port?: string,
+  username?: string,
+  password?: string,
+  protocol?: string,
+  database?: string,
+  readOnly?: boolean,
+  /**
+   * Timeout in milliseconds for requests to ClickHouse.
+   * Default is 10 minutes
+   */
+  requestTimeout?: number,
+
+  /**
+   * Data source name.
+   */
+  dataSource?: string,
+
+  /**
+   * Max pool size value for the [cube]<-->[db] pool.
+   */
+  maxPoolSize?: number,
+
+  /**
+   * Time to wait for a response from a connection after validation
+   * request before determining it as not valid. Default - 10000 ms.
+   */
+  testConnectionTimeout?: number,
+
+  /**
+   * Whether this driver is used for pre-aggregations.
+   */
+  preAggregations?: boolean,
+
+  /**
+   * Custom HTTP headers attached to every request sent to ClickHouse.
+   * @see https://clickhouse.com/docs/integrations/javascript#configuration
+   */
+  headers?: Record<string, string>,
+}
+
+interface ClickhouseDriverExportRequiredAWS {
+  bucketType: 's3',
+  bucketName: string,
+  region: string,
+}
+
+interface ClickhouseDriverExportKeySecretAWS extends ClickhouseDriverExportRequiredAWS {
+  keyId?: string,
+  secretKey?: string,
+}
+
+interface ClickhouseDriverExportAWS extends ClickhouseDriverExportKeySecretAWS {
+}
+
+type ClickHouseDriverConfig = {
+  url: string,
+  username: string,
+  password: string,
+  readOnly: boolean,
+  database: string,
+  requestTimeout: number,
+  exportBucket: ClickhouseDriverExportAWS | null,
+  compression: { response?: boolean; request?: boolean },
+  clickhouseSettings: ClickHouseSettings,
+  headers: Record<string, string>,
+};
+
+export class ClickHouseDriver extends BaseDriver implements DriverInterface {
+  /**
+   * Returns default concurrency value.
+   */
+  public static getDefaultConcurrency(): number {
+    return 10;
+  }
+
+  // ClickHouseClient has internal pool of several sockets, no need for generic-pool
+  protected readonly client: ClickHouseClient;
+
+  protected readonly readOnlyMode: boolean;
+
+  protected readonly config: ClickHouseDriverConfig;
+
+  protected readonly killQueryTimeout: number = 10 * 1000;
+
+  protected exportCredentials: Promise<S3Credentials> | null = null;
+
+  /**
+   * Class constructor.
+   */
+  public constructor(
+    config: ClickHouseDriverOptions = {},
+  ) {
+    super({
+      testConnectionTimeout: config.testConnectionTimeout,
+    });
+
+    const dataSource = config.dataSource ?? assertDataSource('default');
+    const preAggregations = config.preAggregations || false;
+    const host = config.host ?? getEnv('dbHost', { dataSource, preAggregations });
+    const port = config.port ?? getEnv('dbPort', { dataSource, preAggregations }) ?? 8123;
+    const protocol = config.protocol ?? (getEnv('dbSsl', { dataSource, preAggregations }) ? 'https:' : 'http:');
+    const url = `${protocol}//${host}:${port}`;
+
+    const username = config.username ?? getEnv('dbUser', { dataSource, preAggregations });
+    const password = config.password ?? getEnv('dbPass', { dataSource, preAggregations });
+    const database = config.database ?? (getEnv('dbName', { dataSource, preAggregations }) as string) ?? 'default';
+
+    // TODO this is a bit inconsistent with readOnly
+    this.readOnlyMode = getEnv('clickhouseReadOnly', { dataSource, preAggregations });
+
+    // Expect that getEnv('dbQueryTimeout') will always return a value
+    const requestTimeoutEnv: number = getEnv('dbQueryTimeout', { dataSource, preAggregations }) * 1000;
+    const requestTimeout = config.requestTimeout ?? requestTimeoutEnv;
+
+    this.config = {
+      url,
+      username,
+      password,
+      database,
+      exportBucket: this.getExportBucket(dataSource, preAggregations),
+      readOnly: !!config.readOnly,
+      requestTimeout,
+      compression: {
+        // Response compression can't be enabled for a user with readonly=1, as ClickHouse will not allow settings modifications for such user.
+        response: this.readOnlyMode ? false : getEnv('clickhouseCompression', { dataSource, preAggregations }),
+        request: getEnv('clickhouseCompression', { dataSource, preAggregations }),
+      },
+      clickhouseSettings: {
+        /// Default Node.js client has a limit for the max size of HTTP headers. In practise, such headers can be extremely large
+        /// Let's disable it, because we don't need them.
+        send_progress_in_http_headers: 0,
+        // If ClickHouse user's permissions are restricted with "readonly = 1",
+        // change settings queries are not allowed
+        ...(this.readOnlyMode ? {} : {
+          join_use_nulls: 1,
+          // Pins every DateTime value to the width its column type implies, which is what the
+          // specialized converters in Transform.ts key off. Not guaranteed: a readonly user or a
+          // driver_factory override still lands on the generic formatter.
+          date_time_output_format: 'simple',
+        }),
+      },
+      // Custom HTTP headers can only be passed via driver_factory, not env vars.
+      headers: config.headers ?? {},
+    };
+
+    const maxPoolSize = config.maxPoolSize ??
+      getEnv('dbMaxPoolSize', { dataSource, preAggregations }) ??
+      ClickHouseDriver.getDefaultConcurrency();
+
+    this.client = this.createClient(maxPoolSize);
+  }
+
+  private buildQueryId(requestId?: string): string {
+    const prefix = requestId ? extractRequestUUID(requestId).slice(0, 63) : '';
+    if (!prefix) {
+      return uuidv4();
+    }
+
+    return `${prefix}-${uuidv4()}`;
+  }
+
+  protected withCancel<T>(
+    fn: (con: ClickHouseClient, queryId: string, signal: AbortSignal) => Promise<T>,
+    options?: QueryOptions,
+  ): Promise<T> {
+    const queryId = this.buildQueryId(options?.requestId);
+
+    const abortController = new AbortController();
+    const { signal } = abortController;
+    let killed: Promise<void> | undefined;
+    let settled = false;
+
+    const promise = (async () => {
+      signal.throwIfAborted();
+
+      try {
+        // Queries sent by `fn` can hit a timeout error, would _not_ get killed, and continue running in ClickHouse
+        // TODO should we kill those as well?
+        const result = await fn(this.client, queryId, signal);
+        signal.throwIfAborted();
+        return result;
+      } catch (e) {
+        // The abort rejects at once; settle only after the kill, so callers cleaning up
+        // (e.g. dropping a half-built table) don't race the still running query
+        await killed?.catch(() => undefined);
+        throw e;
+      } finally {
+        settled = true;
+      }
+    })();
+    (promise as any).cancel = async () => {
+      // `cancelCombinator` cancels every saved promise, finished ones included
+      if (settled) {
+        return;
+      }
+
+      killed ??= this.killQuery(queryId);
+      abortController.abort();
+      await killed;
+    };
+
+    return promise;
+  }
+
+  protected createClient(maxPoolSize: number): ClickHouseClient {
+    return createClient({
+      url: this.config.url,
+      username: this.config.username,
+      password: this.config.password,
+      database: this.config.database,
+      compression: this.config.compression,
+      clickhouse_settings: this.config.clickhouseSettings,
+      request_timeout: this.config.requestTimeout,
+      max_open_connections: maxPoolSize,
+      http_headers: this.config.headers,
+      application: `CubeDev_Cube/${version}`,
+      log: {
+        LoggerClass: this.clientLoggerClass(),
+        // At WARN the client advises enabling progress headers on every construction,
+        // which we disable on purpose.
+        level: ClickHouseLogLevel.ERROR,
+      },
+    });
+  }
+
+  /**
+   * The client instantiates `LoggerClass` with no arguments, and `setLogger` runs
+   * after the constructor, so the Cube logger is resolved lazily on every call.
+   */
+  private clientLoggerClass(): new () => Logger {
+    const emit = (level: LogLevel, { module, message, args }: LogParams, err?: Error) => {
+      this.logger?.('ClickHouse Client Log', {
+        ...args,
+        level,
+        module,
+        message,
+        ...(err ? { error: (err.stack || err).toString() } : {}),
+      });
+    };
+
+    return class implements Logger {
+      public trace(params: LogParams) {
+        emit('trace', params);
+      }
+
+      // Cube's LogLevel has no debug counterpart
+      public debug(params: LogParams) {
+        emit('trace', params);
+      }
+
+      public info(params: LogParams) {
+        emit('info', params);
+      }
+
+      public warn(params: WarnLogParams) {
+        emit('warn', params, params.err);
+      }
+
+      public error(params: ErrorLogParams) {
+        emit('error', params, params.err);
+      }
+    };
+  }
+
+  protected async killQuery(queryId: string): Promise<void> {
+    // Use separate client for kill query, usual pool may be busy
+    const killClient = this.createClient(1);
+
+    try {
+      await killClient.command({
+        query: formatClickHouse('KILL QUERY WHERE query_id = ? SYNC', [queryId]),
+        // A cancelled query settles only after the kill, so a stuck kill must not hold it for the whole query timeout
+        abort_signal: AbortSignal.timeout(this.killQueryTimeout),
+      });
+    } finally {
+      await killClient.close();
+    }
+  }
+
+  public async testConnection() {
+    await this.query('SELECT 1', []);
+  }
+
+  public readOnly() {
+    return (this.config.readOnly != null || this.readOnlyMode) ?
+      (!!this.config.readOnly || this.readOnlyMode) :
+      true;
+  }
+
+  // Not `async`: QueryCache registers the returned promise's `cancel`, which a new promise would drop
+  public query<R = unknown>(query: string, values: unknown[], options?: QueryOptions): Promise<R[]> {
+    if (NO_RESULT_SET_STATEMENT.test(query)) {
+      return this.thenKeepCancel(this.command(formatClickHouse(query, values), options), () => []);
+    }
+
+    return this.thenKeepCancel(
+      this.queryResponse(query, values, options),
+      (response) => this.normaliseResponse<R>(response),
+    );
+  }
+
+  protected thenKeepCancel<T, U>(promise: Promise<T>, fn: (value: T) => U): Promise<U> {
+    const result = promise.then(fn);
+    (result as any).cancel = (promise as any).cancel;
+    return result;
+  }
+
+  protected queryResponse(query: string, values: unknown[], options?: QueryOptions): Promise<ResponseJSON<Array<unknown>>> {
+    const formattedQuery = formatClickHouse(query, values);
+
+    return this.withCancel(async (connection, queryId, signal) => {
+      try {
+        // Positional rows drop the repeated column names and share the transform with `stream()`;
+        // ClickHouse serializes cell values identically in JSON and JSONCompact.
+        const format = 'JSONCompact';
+
+        const resultSet = await connection.query({
+          query: formattedQuery,
+          query_id: queryId,
+          format,
+          clickhouse_settings: this.config.clickhouseSettings,
+          abort_signal: signal,
+        });
+
+        // response_headers['x-clickhouse-format'] is optional, but if it exists,
+        // it should match the requested format.
+        if (resultSet.response_headers['x-clickhouse-format'] && resultSet.response_headers['x-clickhouse-format'] !== format) {
+          throw new Error(`Unexpected x-clickhouse-format in response: expected ${format}, received ${resultSet.response_headers['x-clickhouse-format']}`);
+        }
+
+        const results = await resultSet.json<Array<unknown>>();
+
+        // Up to ClickHouse 25.x, failures after the first flushed block are appended to a 200
+        // response; newer versions truncate the JSON and are rejected while parsing it above.
+        // The client declares `exception` for `JSONEachRowWithProgress` rows only, never here.
+        const { exception } = results as { exception?: string };
+        if (exception) {
+          throw new Error(`ClickHouse aborted after ${results.data?.length ?? 0} row(s): ${exception}`);
+        }
+
+        return results;
+      } catch (e) {
+        throw new Error(`Query failed: ${formatError(e)}; query id: ${queryId}`, { cause: e });
+      }
+    }, options);
+  }
+
+  protected normaliseResponse<R = unknown>(res: ResponseJSON<Array<unknown>>): Array<R> {
+    const { data } = res;
+    if (!data || data.length === 0) {
+      return [];
+    }
+
+    if (!res.meta) {
+      throw new Error('Unexpected response without meta for format JSONCompact');
+    }
+
+    const transform = buildTransformFromMeta(res.meta);
+
+    const rows: Array<R> = new Array(data.length);
+
+    for (let i = 0; i < data.length; i++) {
+      rows[i] = transformRow(data[i] as Array<unknown>, transform) as R;
+    }
+
+    return rows;
+  }
+
+  public async release() {
+    await this.client.close();
+  }
+
+  public informationSchemaQuery() {
+    return `
+      SELECT name as column_name,
+             table as table_name,
+             database as table_schema,
+             type as data_type
+        FROM system.columns
+       WHERE database = '${this.config.database}'
+    `;
+  }
+
+  protected override getTablesForSpecificSchemasQuery(schemasPlaceholders: string) {
+    const query = `
+      SELECT database as schema_name,
+            name as table_name
+      FROM system.tables
+      WHERE database IN (${schemasPlaceholders})
+    `;
+    return query;
+  }
+
+  protected override getColumnsForSpecificTablesQuery(conditionString: string) {
+    const query = `
+      SELECT name as ${this.quoteIdentifier('column_name')},
+             table as ${this.quoteIdentifier('table_name')},
+             database as ${this.quoteIdentifier('schema_name')},
+             type as ${this.quoteIdentifier('data_type')}
+      FROM system.columns
+      WHERE ${conditionString}
+    `;
+    return query;
+  }
+
+  protected override getColumnNameForSchemaName() {
+    return 'database';
+  }
+
+  protected override getColumnNameForTableName() {
+    return 'table';
+  }
+
+  public override async getSchemas(): Promise<QuerySchemasResult[]> {
+    return [{ schema_name: this.config.database }];
+  }
+
+  public async stream(
+    query: string,
+    values: unknown[],
+    { highWaterMark, requestId }: StreamOptions
+  ): Promise<StreamTableDataWithTypes> {
+    // Use separate client for this long-living query
+    const client = this.createClient(1);
+    const queryId = this.buildQueryId(requestId);
+
+    try {
+      const formattedQuery = formatClickHouse(query, values);
+
+      const format = 'JSONCompactEachRowWithNamesAndTypes';
+
+      const resultSet = await client.query({
+        query: formattedQuery,
+        query_id: queryId,
+        format,
+        clickhouse_settings: this.config.clickhouseSettings,
+      });
+
+      if (resultSet.response_headers['x-clickhouse-format'] !== format) {
+        throw new Error(`Unexpected x-clickhouse-format in response: expected ${format}, received ${resultSet.response_headers['x-clickhouse-format']}`);
+      }
+
+      // Array<unknown> is okay, because we use fixed JSONCompactEachRowWithNamesAndTypes format
+      // And each row after first two will look like this: [42, "hello", [0,1]]
+      // https://clickhouse.com/docs/en/interfaces/formats#jsoncompacteachrowwithnamesandtypes
+      const { rowStream, names, types } = await ClickHouseRowStream.open(
+        resultSet.stream<Array<unknown>>()[Symbol.asyncIterator](),
+        queryId,
+        highWaterMark || getEnv('dbQueryStreamHighWaterMark'),
+      );
+
+      return {
+        rowStream,
+        types: names.map((name, idx) => {
+          const type = types[idx];
+          return {
+            name,
+            type: this.toGenericType(type),
+          };
+        }),
+        release: async () => {
+          await client.close();
+        }
+      };
+    } catch (e) {
+      await client.close();
+      throw new Error(`Stream query failed: ${formatError(e)}; query id: ${queryId}`, { cause: e });
+    }
+  }
+
+  public downloadQueryResults(
+    query: string,
+    values: unknown[],
+    options: DownloadQueryResultsOptions
+  ): Promise<DownloadQueryResultsResult> {
+    if ((options ?? {}).streamImport) {
+      return this.stream(query, values, options);
+    }
+
+    return this.thenKeepCancel(this.queryResponse(query, values, options), (response) => ({
+      rows: this.normaliseResponse(response),
+      types: (response.meta ?? []).map((field) => ({
+        name: field.name,
+        type: this.toGenericType(field.type),
+      })),
+    }));
+  }
+
+  /**
+   * Example of types:
+   *
+   * Int64
+   * Nullable(Int64) / Nullable(String)
+   * Nullable(DateTime('UTC'))
+   * LowCardinality(Nullable(String))
+   * Array(DateTime) -> timestamp[]
+   * Map(String, Int32) / Tuple(Int32, String)
+   */
+  protected override toGenericType(columnType: string, precision?: number | null, scale?: number | null): GenericDataBaseType {
+    const type = columnType.trim();
+    const lowerType = type.toLowerCase();
+
+    if (lowerType in ClickhouseTypeToGeneric) {
+      return ClickhouseTypeToGeneric[lowerType];
+    }
+
+    const argsStart = type.indexOf('(');
+    if (argsStart === -1) {
+      return super.toGenericType(type, precision, scale);
+    }
+
+    const name = lowerType.slice(0, argsStart).trim();
+    const args = type.slice(argsStart + 1, type.lastIndexOf(')'));
+
+    switch (name) {
+      case 'nullable':
+      case 'lowcardinality':
+        return this.toGenericType(args, precision, scale);
+      case 'array':
+        return `${this.toGenericType(args)}[]`;
+      case 'map':
+      case 'tuple':
+      case 'nested':
+        return 'text';
+      case 'decimal': {
+        const [argPrecision, argScale] = args.split(',');
+        return super.toGenericType(name, Number(argPrecision), Number(argScale));
+      }
+      default:
+        // Parameterized scalars: DateTime('UTC'), DateTime64(3, 'UTC'), Enum8('Date' = 1),
+        // FixedString(16). Their arguments never carry a type, so only the name is mapped.
+        return name in ClickhouseTypeToGeneric
+          ? ClickhouseTypeToGeneric[name]
+          : super.toGenericType(name, precision, scale);
+    }
+  }
+
+  public async createSchemaIfNotExists(schemaName: string): Promise<void> {
+    await this.command(`CREATE DATABASE IF NOT EXISTS ${schemaName}`);
+  }
+
+  public getTablesQuery(schemaName: string): Promise<TableQueryResult[]> {
+    return this.query('SELECT name as table_name FROM system.tables WHERE database = ?', [schemaName]);
+  }
+
+  public override dropTable(tableName: string, options?: QueryOptions): Promise<void> {
+    return this.command(`DROP TABLE ${tableName}`, options);
+  }
+
+  protected getExportBucket(
+    dataSource: string,
+    preAggregations?: boolean,
+  ): ClickhouseDriverExportAWS | null {
+    const requiredExportBucket: ClickhouseDriverExportRequiredAWS = {
+      bucketType: getEnv('dbExportBucketType', {
+        supported: SUPPORTED_BUCKET_TYPES,
+        dataSource,
+        preAggregations,
+      }),
+      bucketName: getEnv('dbExportBucket', { dataSource, preAggregations }),
+      region: getEnv('dbExportBucketAwsRegion', { dataSource, preAggregations }),
+    };
+
+    const exportBucket: ClickhouseDriverExportAWS = {
+      ...requiredExportBucket,
+      keyId: getEnv('dbExportBucketAwsKey', { dataSource, preAggregations }),
+      secretKey: getEnv('dbExportBucketAwsSecret', { dataSource, preAggregations }),
+    };
+
+    if (exportBucket.bucketType) {
+      if (!SUPPORTED_BUCKET_TYPES.includes(exportBucket.bucketType)) {
+        throw new Error(
+          `Unsupported EXPORT_BUCKET_TYPE, supported: ${SUPPORTED_BUCKET_TYPES.join(',')}`
+        );
+      }
+
+      // Make sure the required keys are set
+      const emptyRequiredKeys = Object.keys(requiredExportBucket)
+        .filter((key: string) => requiredExportBucket[<keyof ClickhouseDriverExportRequiredAWS>key] === undefined);
+      if (emptyRequiredKeys.length) {
+        throw new Error(
+          `Unsupported configuration exportBucket, some configuration keys are empty: ${emptyRequiredKeys.join(',')}`
+        );
+      }
+
+      return exportBucket;
+    }
+
+    return null;
+  }
+
+  public async isUnloadSupported() {
+    return !!this.config.exportBucket;
+  }
+
+  /**
+   * Returns an array of queried fields meta info.
+   */
+  public async queryColumnTypes(sql: string, params: unknown[], options?: QueryOptions): Promise<TableStructure> {
+    // For DESCRIBE we expect that each row would have special structure
+    // See https://clickhouse.com/docs/en/sql-reference/statements/describe-table
+    // TODO complete this type
+    type DescribeRow = {
+      name: string,
+      type: string
+    };
+    const columns = await this.query<DescribeRow>(`DESCRIBE ${sql}`, params, options);
+    if (!columns) {
+      throw new Error('Unable to describe table');
+    }
+
+    return columns.map((column) => ({
+      name: column.name,
+      type: this.toGenericType(column.type),
+    }));
+  }
+
+  // This is only for use in tests
+  public override async createTableRaw(query: string): Promise<void> {
+    await this.command(query);
+  }
+
+  public override async createTable(quotedTableName: string, columns: TableColumn[]) {
+    const createTableSql = this.createTableSql(quotedTableName, columns);
+
+    try {
+      await this.command(createTableSql);
+    } catch (e) {
+      throw new Error(`Create table ${quotedTableName} failed: ${formatError(e)}`, { cause: e });
+    }
+  }
+
+  /**
+   * We use unloadWithoutTempTable strategy
+   */
+  public async unload(_tableName: string, options: UnloadOptions): Promise<DownloadTableCSVData> {
+    if (!options.query?.sql) {
+      throw new Error('Query must be defined in options');
+    }
+
+    return this.unloadFromQuery(
+      options.query?.sql,
+      options.query?.params,
+      options
+    );
+  }
+
+  public async unloadFromQuery(sql: string, params: unknown[], options: UnloadOptions): Promise<DownloadTableCSVData> {
+    if (!this.config.exportBucket) {
+      throw new Error('Unload is not configured');
+    }
+
+    const { keyId, secretKey, region } = this.config.exportBucket;
+    // Checked here, not in the constructor, so a half-set pair fails only the export, never other queries.
+    if (!keyId !== !secretKey) {
+      throw new Error(
+        'Unsupported configuration exportBucket, keyId and secretKey must be set together, ' +
+        'or both left empty to use the AWS SDK default credential chain'
+      );
+    }
+
+    const types = await this.queryColumnTypes(`(${sql})`, params, { requestId: options.requestId });
+    const { bucketName, path } = this.parseBucketUrl(this.config.exportBucket.bucketName);
+    const exportPrefix = path ? `${path}/${uuidv4()}` : uuidv4();
+
+    const staticCredentials = keyId && secretKey ? { accessKeyId: keyId, secretAccessKey: secretKey } : undefined;
+    // ClickHouse writes to S3 itself, so the pod's OIDC identity never reaches it: hand it short-lived credentials.
+    const credentials: S3Credentials = staticCredentials ?? await this.getExportCredentials(bucketName, path, region);
+    const credentialParams = [credentials.accessKeyId, credentials.secretAccessKey];
+    if (credentials.sessionToken) {
+      credentialParams.push(credentials.sessionToken);
+    }
+
+    // Formatted apart from `sql`: an empty `params` must keep skipping the scan, or a ClickHouse `a ? b : c` breaks.
+    const insertInto = formatClickHouse(`
+      INSERT INTO FUNCTION
+         s3(
+             'https://${bucketName}.s3.${region}.amazonaws.com/${exportPrefix}/export.csv.gz',
+             ${credentialParams.map(() => '?').join(',\n             ')},
+             'CSV'
+          )
+      `, credentialParams);
+    const formattedQuery = insertInto + formatClickHouse(`${sql}
+    `, params);
+
+    await this.command(formattedQuery, { requestId: options.requestId });
+
+    const csvFile = await this.extractUnloadedFilesFromS3(
+      staticCredentials ? { credentials: staticCredentials, region } : { region },
+      bucketName,
+      exportPrefix,
+    );
+
+    return {
+      csvFile,
+      types,
+      csvNoHeader: true,
+      // Can be controlled via SET format_csv_delimiter
+      csvDelimiter: ','
+    };
+  }
+
+  /**
+   * Shares one set of temporary credentials across exports until it nears expiry, so a partitioned
+   * build does not make one STS call per partition.
+   */
+  protected async getExportCredentials(bucketName: string, path: string, region: string): Promise<S3Credentials> {
+    const current = this.exportCredentials;
+    if (current) {
+      const credentials = await current.catch(() => null);
+      if (
+        credentials &&
+        (!credentials.expiration || credentials.expiration.getTime() - Date.now() > EXPORT_CREDENTIALS_REFRESH_MARGIN_MS)
+      ) {
+        return credentials;
+      }
+
+      if (this.exportCredentials !== current) {
+        return this.getExportCredentials(bucketName, path, region);
+      }
+    }
+
+    const next = this.resolveExportCredentials(bucketName, path, region);
+    this.exportCredentials = next;
+
+    return next;
+  }
+
+  protected async resolveExportCredentials(bucketName: string, path: string, region: string): Promise<S3Credentials> {
+    const stsRegion = process.env.AWS_REGION || region;
+
+    // Static env keys win in the SDK default chain too, so only scope when web identity is what it would use.
+    if (
+      process.env.AWS_WEB_IDENTITY_TOKEN_FILE && process.env.AWS_ROLE_ARN &&
+      !(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)
+    ) {
+      // The bucket ARN must be in the role's partition (aws-us-gov, aws-cn), or the policy matches nothing.
+      const partition = process.env.AWS_ROLE_ARN.split(':')[1] || 'aws';
+      return this.resolveWebIdentityCredentials(exportBucketSessionPolicy(bucketName, path, partition), stsRegion);
+    }
+
+    return this.resolveS3Credentials({ region: stsRegion });
+  }
+
+  protected async resolveWebIdentityCredentials(policy: string, region: string): Promise<S3Credentials> {
+    const { fromTokenFile } = await import('@aws-sdk/credential-provider-web-identity');
+    const { accessKeyId, secretAccessKey, sessionToken, expiration } = await fromTokenFile({
+      policy,
+      clientConfig: { region },
+    })();
+
+    return { accessKeyId, secretAccessKey, sessionToken, expiration };
+  }
+
+  public capabilities(): DriverCapabilities {
+    return {
+      unloadWithoutTempTable: true,
+      incrementalSchemaLoading: true,
+    };
+  }
+
+  // This is not part of a driver interface, and marked public only for testing
+  public command(query: string, options?: QueryOptions): Promise<void> {
+    return this.withCancel(async (connection, queryId, signal) => {
+      try {
+        await connection.command({
+          query,
+          query_id: queryId,
+          abort_signal: signal,
+        });
+      } catch (e) {
+        throw new Error(`Command failed: ${formatError(e)}; query id: ${queryId}`, { cause: e });
+      }
+    }, options);
+  }
+
+  // This is not part of a driver interface, and marked public only for testing
+  public async insert(table: string, values: Array<Array<unknown>>, options?: QueryOptions): Promise<void> {
+    await this.withCancel(async (connection, queryId, signal) => {
+      try {
+        await connection.insert({
+          table,
+          values,
+          format: 'JSONCompactEachRow',
+          query_id: queryId,
+          abort_signal: signal,
+        });
+      } catch (e) {
+        throw new Error(`Insert failed: ${formatError(e)}; query id: ${queryId}`, { cause: e });
+      }
+    }, options);
+  }
+}

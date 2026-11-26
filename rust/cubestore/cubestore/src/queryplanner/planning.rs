@@ -1,0 +1,3958 @@
+//! Query planning goes through the following stages:
+//!   1. Logical plan produced by DataFusion. Contains table scans of [CubeTableLogical], does not
+//!      know which physical nodes it has to query.
+//!   2. [choose_index] transformation will replace the index and particular partitions to query.
+//!      It will also place [ClusterSendNode] into the correct place.
+//!      At this point, the logical plan is finalized, it only scans [CubeTable]s and contains
+//!      enough information to distribute the plan into workers.
+//!   3. We serialize the resulting logical plan into [SerializedPlan] and send it to workers.
+//!   4. [CubeQueryPlanner] is used on both the router and the workers to produce a physical plan.
+//!      Note that workers and the router produce different plans:
+//!          - Router produces a physical plan that handles the "top" part of the logical plan, above
+//!            the cluster send.
+//!          - Workers take only the "bottom" part part of the logical plan, below the cluster send.
+//!            In addition, workers will replace all table scans of data they do not have with empty
+//!            results.
+//!
+//!       At this point we also optimize the physical plan to ensure we do as much work as possible
+//!       on the workers, see [CubeQueryPlanner] for details.
+use std::collections::hash_map::RandomState;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::SystemTime;
+
+use async_trait::async_trait;
+use datafusion::arrow::datatypes::Field;
+use datafusion::error::DataFusionError;
+use datafusion::physical_plan::empty::EmptyExec;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+};
+use itertools::{EitherOrBoth, Itertools};
+use std::any::Any;
+use std::fmt::Formatter;
+
+use crate::cluster::{Cluster, PlanningFlags};
+use crate::metastore::multi_index::MultiPartition;
+use crate::metastore::table::{Table, TablePath};
+use crate::metastore::{
+    AggregateFunction, Chunk, Column, IdRow, Index, IndexType, MetaStore, Partition, Schema,
+};
+use crate::queryplanner::metadata_cache::NoopParquetMetadataCache;
+use crate::queryplanner::optimizations::rewrite_plan::{rewrite_plan, PlanRewriter};
+use crate::queryplanner::panic::PanicWorkerSerialized;
+use crate::queryplanner::panic::{plan_panic_worker, PanicWorkerNode};
+use crate::queryplanner::partition_filter::PartitionFilter;
+use crate::queryplanner::providers::InfoSchemaQueryCacheTableProvider;
+use crate::queryplanner::query_executor::{
+    dedup_safe_unique_key_filter, ClusterSendExec, CubeTable, InlineTableProvider,
+};
+use crate::queryplanner::rolling::RollingWindowAggregateSerialized;
+use crate::queryplanner::serialized_plan::PreSerializedPlan;
+use crate::queryplanner::serialized_plan::{IndexSnapshot, InlineSnapshot, PartitionSnapshot};
+use crate::queryplanner::topk::{
+    materialize_topk, ClusterAggregateTopKLowerSerialized, ClusterAggregateTopKUpperSerialized,
+};
+use crate::queryplanner::topk::{plan_topk, DummyTopKLowerExec};
+use crate::queryplanner::topk::{ClusterAggregateTopKLower, ClusterAggregateTopKUpper};
+use crate::queryplanner::{CubeTableLogical, InfoSchemaTableProvider};
+use crate::table::{cmp_same_types, Row};
+use crate::{app_metrics, CubeError};
+use datafusion::common;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::DFSchemaRef;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::execution::{SessionState, TaskContext};
+use datafusion::logical_expr::expr::Alias;
+use datafusion::logical_expr::utils::expr_to_columns;
+use datafusion::logical_expr::{
+    expr, Aggregate, BinaryExpr, Expr, Extension, FetchType, Filter, InvariantLevel, Join, Limit,
+    LogicalPlan, Operator, Projection, SkipType, Sort, SortExpr, SubqueryAlias, TableScan, Union,
+    Unnest, UserDefinedLogicalNode,
+};
+use datafusion::physical_expr::{Distribution, LexRequirement};
+use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
+use datafusion_proto::bytes::Serializeable;
+use serde::{Deserialize as SerdeDeser, Deserializer, Serialize as SerdeSer, Serializer};
+use serde_derive::Deserialize;
+use serde_derive::Serialize;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::iter::FromIterator;
+
+#[cfg(test)]
+pub async fn choose_index(
+    p: LogicalPlan,
+    metastore: &dyn PlanIndexStore,
+) -> Result<(LogicalPlan, PlanningMeta), DataFusionError> {
+    choose_index_ext(
+        p, metastore, /* enable_topk */ true, /* limit_pushdown */ true,
+    )
+    .await
+}
+
+/// Information required to distribute the logical plan into multiple workers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PlanningMeta {
+    pub indices: Vec<IndexSnapshot>,
+    /// Non-empty only if indices point to multi-partitions.
+    /// Custom serde handlers as flatbuffers can't handle hash maps with integer keys.
+    #[serde(deserialize_with = "de_vec_as_map")]
+    #[serde(serialize_with = "se_vec_as_map")]
+    pub multi_part_subtree: HashMap<u64, MultiPartition>,
+    /// Aligned 1:1 with `indices`: the proto-encoded dedup-safe pushable predicate for
+    /// each unique-key index scan, used by the worker to trim in-memory chunks before
+    /// IPC. `None` when the index has no unique key or nothing is pushable. `#[serde(default)]`
+    /// so plans from an older router (no field) decode as "no pre-filter".
+    #[serde(default)]
+    pub pushable_chunk_filters: Vec<Option<Vec<u8>>>,
+}
+
+fn se_vec_as_map<S: Serializer>(m: &HashMap<u64, MultiPartition>, s: S) -> Result<S::Ok, S::Error> {
+    m.iter().collect_vec().serialize(s)
+}
+
+fn de_vec_as_map<'de, D: Deserializer<'de>>(
+    d: D,
+) -> Result<HashMap<u64, MultiPartition>, D::Error> {
+    Vec::<(u64, MultiPartition)>::deserialize(d).map(HashMap::from_iter)
+}
+
+fn system_time_to_df_error(e: std::time::SystemTimeError) -> DataFusionError {
+    DataFusionError::Execution(e.to_string())
+}
+
+pub async fn choose_index_ext(
+    p: LogicalPlan,
+    metastore: &dyn PlanIndexStore,
+    enable_topk: bool,
+    limit_pushdown: bool,
+) -> Result<(LogicalPlan, PlanningMeta), DataFusionError> {
+    // Prepare information to choose the index.
+    let mut collector = CollectConstraints::default();
+    // TODO p.clone()
+    rewrite_plan(p.clone(), &ConstraintsContext::default(), &mut collector)?;
+
+    // Consult metastore to choose the index.
+    // TODO should be single snapshot read to ensure read consistency here
+    let get_tables_with_indices_start = SystemTime::now();
+    let tables = metastore
+        .get_tables_with_indexes(
+            collector
+                .constraints
+                .iter()
+                .map(|c| {
+                    // TODO: use ids.
+                    let schema = c.table.schema.get_row().get_name().clone();
+                    let table = c.table.table.get_row().get_table_name().clone();
+                    (schema, table)
+                })
+                .collect_vec(),
+        )
+        .await?;
+    let time_2 = SystemTime::now();
+    let get_tables_with_indices_micros = time_2
+        .duration_since(get_tables_with_indices_start)
+        .map_err(system_time_to_df_error)?
+        .as_micros() as i64;
+    let mut cumulative_await_micros = get_tables_with_indices_micros;
+    app_metrics::DATA_QUERY_CHOOSE_INDEX_EXT_GET_TABLES_WITH_INDICES_TIME_US
+        .report(get_tables_with_indices_micros);
+    assert_eq!(tables.len(), collector.constraints.len());
+    let mut candidates = Vec::new();
+    for (c, inputs) in collector.constraints.iter().zip(tables) {
+        candidates.push(pick_index(c, inputs.0, inputs.1, inputs.2)?)
+    }
+    app_metrics::DATA_QUERY_CHOOSE_INDEX_EXT_PICK_INDEX_TIME_US.report(
+        time_2
+            .elapsed()
+            .map_err(system_time_to_df_error)?
+            .as_micros() as i64,
+    );
+
+    // We pick partitioned index only when all tables request the same one.
+    let mut indices: Vec<_> = match all_have_same_partitioned_index(&candidates) {
+        true => candidates
+            .into_iter()
+            .map(|c| c.partitioned_index.unwrap())
+            .collect(),
+        // We sometimes propagate 'index for join not found' error here.
+        false => candidates
+            .into_iter()
+            .map(|c| c.ordinary_index)
+            .collect::<Result<_, DataFusionError>>()?,
+    };
+
+    let get_active_partitions_and_chunks_start = SystemTime::now();
+    // TODO should be single snapshot read to ensure read consistency here
+    let partitions = metastore
+        .get_active_partitions_and_chunks_by_index_id_for_select(
+            indices.iter().map(|i| i.index.get_id()).collect_vec(),
+        )
+        .await?;
+    let get_active_partitions_and_chunks_micros = get_active_partitions_and_chunks_start
+        .elapsed()
+        .map_err(system_time_to_df_error)?
+        .as_micros() as i64;
+    app_metrics::DATA_QUERY_CHOOSE_INDEX_EXT_GET_ACTIVE_PARTITIONS_AND_CHUNKS_BY_INDEX_ID_TIME_US
+        .report(get_active_partitions_and_chunks_micros);
+    cumulative_await_micros += get_active_partitions_and_chunks_micros;
+
+    assert_eq!(partitions.len(), indices.len());
+    for ((i, c), ps) in indices
+        .iter_mut()
+        .zip(collector.constraints.iter())
+        .zip(partitions)
+    {
+        i.partitions = pick_partitions(i, c, ps)?;
+    }
+
+    // Precompute, per index scan, the dedup-safe pushable predicate so the worker can
+    // trim in-memory chunks before IPC without re-deriving it from the plan. Encoding
+    // failures degrade to `None` (no pre-filter); correctness is unaffected since the
+    // subprocess re-applies the predicate. Reuses exactly the filters that already gate
+    // partition pruning above.
+    let pushable_chunk_filters = indices
+        .iter()
+        .zip(collector.constraints.iter())
+        .map(|(i, c)| {
+            let table = i.table_path.table.get_row();
+            let key_columns = table.unique_key_columns()?;
+            let predicate = dedup_safe_unique_key_filter(&c.filters, &key_columns)?;
+            // Filters reach the scan provider unqualified, and the worker applies the
+            // predicate against the bare index schema. Strip relation qualifiers so column
+            // references resolve there.
+            let predicate = predicate
+                .transform(|e| {
+                    Ok(match e {
+                        Expr::Column(col) => common::tree_node::Transformed::yes(Expr::Column(
+                            common::Column::new_unqualified(col.name),
+                        )),
+                        other => common::tree_node::Transformed::no(other),
+                    })
+                })
+                .map(|t| t.data)
+                .ok()?;
+            predicate.to_bytes().ok().map(|b| b.to_vec())
+        })
+        .collect::<Vec<_>>();
+
+    // We have enough information to finalize the logical plan.
+    let mut r = ChooseIndex {
+        chosen_indices: &indices,
+        next_index: 0,
+        enable_topk,
+        can_pushdown_limit: limit_pushdown,
+        cluster_send_next_id: 1,
+    };
+
+    let plan = rewrite_plan(p, &ChooseIndexContext::default(), &mut r)?;
+    assert_eq!(r.next_index, indices.len());
+
+    let mut multi_parts = Vec::new();
+    for i in &indices {
+        for p in &i.partitions {
+            if let Some(m) = p.partition.get_row().multi_partition_id() {
+                multi_parts.push(m);
+            }
+        }
+    }
+
+    let get_multi_partition_subtree_start_time = SystemTime::now();
+    // TODO should be single snapshot read to ensure read consistency here
+    let multi_part_subtree = metastore.get_multi_partition_subtree(multi_parts).await?;
+    let get_multi_partition_subtree_micros = get_multi_partition_subtree_start_time
+        .elapsed()
+        .map_err(system_time_to_df_error)?
+        .as_micros() as i64;
+    app_metrics::DATA_QUERY_CHOOSE_INDEX_EXT_GET_MULTI_PARTITION_SUBTREE_TIME_US
+        .report(get_multi_partition_subtree_micros);
+    cumulative_await_micros += get_multi_partition_subtree_micros;
+    app_metrics::DATA_QUERY_CHOOSE_INDEX_EXT_TOTAL_AWAITING_TIME_US.report(cumulative_await_micros);
+    Ok((
+        plan,
+        PlanningMeta {
+            indices,
+            multi_part_subtree,
+            pushable_chunk_filters,
+        },
+    ))
+}
+
+#[allow(dead_code)]
+///Checks that indexex is not intersects.
+///TODO unused yet but may be required for limit pushdown when order by consist aggregate functions
+fn can_pushdown_limit(indices: &Vec<IndexSnapshot>) -> bool {
+    if indices.is_empty() {
+        return false;
+    }
+    if indices[0].sort_on().is_none() || indices[0].sort_on().unwrap().is_empty() {
+        return false;
+    }
+
+    let sort_on = indices[0].sort_on().unwrap();
+
+    if indices
+        .iter()
+        .any(|i| i.sort_on().map_or(true, |s| s != sort_on))
+    {
+        return false;
+    }
+
+    let sort_on_len = sort_on.len();
+
+    let mut inds_min_max = indices.iter().map(|i| index_min_max(i)).collect::<Vec<_>>();
+
+    inds_min_max.sort_by(|a, b| cmp_row(a.0, b.0, sort_on_len, true));
+
+    for item in inds_min_max.iter().zip_longest(inds_min_max.iter().skip(1)) {
+        match item {
+            EitherOrBoth::Both(left_part, right_part) => {
+                match cmp_row(left_part.1, right_part.0, sort_on_len, true) {
+                    Ordering::Greater => return false,
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
+#[allow(dead_code)]
+fn index_min_max(ind: &IndexSnapshot) -> (Option<&Row>, Option<&Row>) {
+    let sort_on_len = ind.sort_on().unwrap().len();
+
+    let mut partitions = ind
+        .partitions
+        .iter()
+        .filter(|p| p.partition().get_row().is_active())
+        .collect::<Vec<_>>();
+
+    if partitions.is_empty() {
+        return (None, None);
+    }
+
+    partitions.sort_by(|a, b| {
+        let a_row = a.partition().get_row();
+        let b_row = b.partition().get_row();
+        let a_val = a_row.get_min_or_lower_bound();
+        let b_val = b_row.get_max_or_upper_bound();
+        cmp_row(a_val, b_val, sort_on_len, true)
+    });
+
+    let min_candidates = partitions
+        .first()
+        .unwrap()
+        .chunks
+        .iter()
+        .map(|c| c.get_row().min().as_ref());
+    let part_min = partitions
+        .first()
+        .unwrap()
+        .partition()
+        .get_row()
+        .get_min_or_lower_bound();
+
+    let min = if part_min.is_some() {
+        min_candidates
+            .chain(std::iter::once(part_min))
+            .min_by(|a, b| cmp_row(*a, *b, sort_on_len, true))
+    } else {
+        min_candidates.min_by(|a, b| cmp_row(*a, *b, sort_on_len, true))
+    };
+
+    let max_candidates = partitions
+        .last()
+        .unwrap()
+        .chunks
+        .iter()
+        .map(|c| c.get_row().max().as_ref());
+
+    let part_max = partitions
+        .first()
+        .unwrap()
+        .partition()
+        .get_row()
+        .get_max_or_upper_bound();
+
+    let max = if part_max.is_some() {
+        max_candidates
+            .chain(std::iter::once(part_max))
+            .max_by(|a, b| cmp_row(*a, *b, sort_on_len, false))
+    } else {
+        max_candidates.max_by(|a, b| cmp_row(*a, *b, sort_on_len, false))
+    };
+
+    if min.is_none() || max.is_none() {
+        return (None, None);
+    }
+
+    (min.unwrap(), max.unwrap())
+}
+
+fn cmp_row(l: Option<&Row>, r: Option<&Row>, len: usize, none_first: bool) -> Ordering {
+    match (l, r) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if none_first {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if !none_first {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(l), Some(r)) => l
+            .values()
+            .iter()
+            .take(len)
+            .zip(r.values().iter().take(len))
+            .find_map(|(a, b)| match cmp_same_types(a, b) {
+                Ordering::Less => Some(Ordering::Less),
+                Ordering::Greater => Some(Ordering::Greater),
+                Ordering::Equal => None,
+            })
+            .unwrap_or(Ordering::Equal),
+    }
+}
+
+fn all_have_same_partitioned_index(cs: &[IndexCandidate]) -> bool {
+    if cs.is_empty() {
+        return true;
+    }
+    let multi_index_id = |c: &IndexCandidate| {
+        c.partitioned_index
+            .as_ref()
+            .and_then(|i| i.index.get_row().multi_index_id())
+    };
+    let id = match multi_index_id(&cs[0]) {
+        Some(id) => id,
+        None => return false,
+    };
+    for c in &cs[1..] {
+        if multi_index_id(c) != Some(id) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#[async_trait]
+pub trait PlanIndexStore: Send + Sync {
+    async fn get_tables_with_indexes(
+        &self,
+        inputs: Vec<(String, String)>,
+    ) -> Result<Vec<(IdRow<Schema>, IdRow<Table>, Vec<IdRow<Index>>)>, CubeError>;
+    async fn get_active_partitions_and_chunks_by_index_id_for_select(
+        &self,
+        index_id: Vec<u64>,
+    ) -> Result<Vec<Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)>>, CubeError>;
+    async fn get_multi_partition_subtree(
+        &self,
+        multi_part_ids: Vec<u64>,
+    ) -> Result<HashMap<u64, MultiPartition>, CubeError>;
+}
+
+#[async_trait]
+impl<'a> PlanIndexStore for &'a dyn MetaStore {
+    async fn get_tables_with_indexes(
+        &self,
+        inputs: Vec<(String, String)>,
+    ) -> Result<Vec<(IdRow<Schema>, IdRow<Table>, Vec<IdRow<Index>>)>, CubeError> {
+        MetaStore::get_tables_with_indexes(*self, inputs).await
+    }
+
+    async fn get_active_partitions_and_chunks_by_index_id_for_select(
+        &self,
+        index_id: Vec<u64>,
+    ) -> Result<Vec<Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)>>, CubeError> {
+        MetaStore::get_active_partitions_and_chunks_by_index_id_for_select(*self, index_id).await
+    }
+
+    async fn get_multi_partition_subtree(
+        &self,
+        multi_part_ids: Vec<u64>,
+    ) -> Result<HashMap<u64, MultiPartition>, CubeError> {
+        MetaStore::get_multi_partition_subtree(*self, multi_part_ids).await
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SortColumns {
+    sort_on: Vec<String>,
+    required: bool,
+}
+
+#[derive(Debug)]
+struct IndexConstraints {
+    sort_on: Option<SortColumns>,
+    table: TablePath,
+    projection: Option<Vec<usize>>,
+    filters: Vec<Expr>,
+    aggregates: Vec<Expr>,
+}
+
+#[derive(Default)]
+struct CollectConstraints {
+    constraints: Vec<IndexConstraints>,
+}
+
+#[derive(Default, Clone)]
+struct ConstraintsContext {
+    sort_on: Option<SortColumns>,
+    aggregates: Vec<Expr>,
+    order_col_names: Option<Vec<String>>,
+}
+
+impl ConstraintsContext {
+    pub fn update_sort_on(&self, sort_on: Option<SortColumns>) -> Self {
+        Self {
+            sort_on,
+            aggregates: self.aggregates.clone(),
+            order_col_names: self.order_col_names.clone(),
+        }
+    }
+    pub fn update_order_col_names(&self, order_col_names: Vec<String>) -> Self {
+        Self {
+            sort_on: self.sort_on.clone(),
+            aggregates: self.aggregates.clone(),
+            order_col_names: Some(order_col_names),
+        }
+    }
+}
+
+impl PlanRewriter for CollectConstraints {
+    type Context = ConstraintsContext;
+
+    fn rewrite(
+        &mut self,
+        n: LogicalPlan,
+        c: &Self::Context,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        match &n {
+            LogicalPlan::TableScan(TableScan {
+                projection,
+                filters,
+                source,
+                ..
+            }) => {
+                if let Some(source) = source.as_any().downcast_ref::<DefaultTableSource>() {
+                    let table_provider = source.table_provider.clone();
+                    if let Some(table) = table_provider.as_any().downcast_ref::<CubeTableLogical>()
+                    {
+                        //If there is no aggregations and joins push order_by columns into constraints sort_on
+                        let sort_on = if c.aggregates.is_empty() || c.order_col_names.is_none() {
+                            if let Some(order_col_names) = &c.order_col_names {
+                                match &c.sort_on {
+                                    Some(s) => {
+                                        if s.required {
+                                            c.sort_on.clone()
+                                        } else {
+                                            Some(SortColumns {
+                                                sort_on: s
+                                                    .sort_on
+                                                    .iter()
+                                                    .chain(order_col_names.iter())
+                                                    .map(|n| n.clone())
+                                                    .unique()
+                                                    .collect::<Vec<_>>(),
+                                                required: s.required,
+                                            })
+                                        }
+                                    }
+                                    None => Some(SortColumns {
+                                        sort_on: order_col_names.clone(),
+                                        required: false,
+                                    }),
+                                }
+                            } else {
+                                c.sort_on.clone()
+                            }
+                        } else {
+                            c.sort_on.clone()
+                        };
+                        self.constraints.push(IndexConstraints {
+                            sort_on,
+                            table: table.table.clone(),
+                            projection: projection.clone(),
+                            filters: filters.clone(),
+                            aggregates: c.aggregates.clone(),
+                        })
+                    };
+                }
+            }
+            _ => {}
+        }
+        Ok(n)
+    }
+
+    fn enter_node(
+        &mut self,
+        n: &LogicalPlan,
+        current_context: &Self::Context,
+    ) -> Option<Self::Context> {
+        match n {
+            LogicalPlan::Aggregate(Aggregate {
+                group_expr,
+                aggr_expr,
+                ..
+            }) => {
+                let sort_on = group_expr
+                    .iter()
+                    .map(extract_column_name)
+                    .collect::<Vec<_>>();
+                let sort_on = if !sort_on.is_empty() && sort_on.iter().all(|c| c.is_some()) {
+                    Some(SortColumns {
+                        sort_on: sort_on.into_iter().map(|c| c.unwrap()).collect(),
+                        required: false,
+                    })
+                } else {
+                    None
+                };
+                Some(ConstraintsContext {
+                    sort_on,
+                    aggregates: aggr_expr.to_vec(),
+                    order_col_names: current_context.order_col_names.clone(),
+                })
+            }
+            LogicalPlan::Sort(Sort { expr, input, .. }) => {
+                let (names, _, _) = sort_to_column_names(expr, input);
+
+                if !names.is_empty() {
+                    Some(current_context.update_order_col_names(names))
+                } else {
+                    None
+                }
+            }
+            LogicalPlan::Filter(Filter { predicate, .. }) => {
+                let mut sort_on = Vec::new();
+                if single_value_filter_columns(predicate, &mut sort_on) {
+                    if !sort_on.is_empty() {
+                        let sort_on = Some(SortColumns {
+                            sort_on: sort_on
+                                .into_iter()
+                                .map(|c| c.name.to_string())
+                                .chain(
+                                    current_context
+                                        .sort_on
+                                        .as_ref()
+                                        .map(|c| c.sort_on.clone())
+                                        .unwrap_or_else(|| Vec::new())
+                                        .into_iter(),
+                                )
+                                .unique()
+                                .collect(),
+                            required: false,
+                        });
+                        Some(current_context.update_sort_on(sort_on))
+                    } else {
+                        Some(current_context.clone())
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    fn enter_join_left(&mut self, join: &LogicalPlan, _: &Self::Context) -> Option<Self::Context> {
+        let join_on;
+        if let LogicalPlan::Join(Join { on, .. }) = join {
+            join_on = on;
+        } else {
+            panic!("expected join node");
+        }
+        join_on
+            .iter()
+            .map(|(l, _)| match l {
+                Expr::Column(c) => Some(c.name.to_string()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|sort_on| ConstraintsContext {
+                sort_on: Some(SortColumns {
+                    sort_on,
+                    required: true,
+                }),
+                aggregates: Vec::new(),
+                order_col_names: None,
+            })
+    }
+
+    fn enter_join_right(
+        &mut self,
+        join: &LogicalPlan,
+        _c: &Self::Context,
+    ) -> Option<Self::Context> {
+        let join_on;
+        if let LogicalPlan::Join(Join { on, .. }) = join {
+            join_on = on;
+        } else {
+            panic!("expected join node");
+        }
+        join_on
+            .iter()
+            .map(|(_, r)| match r {
+                Expr::Column(c) => Some(c.name.to_string()),
+                _ => None,
+            })
+            .collect::<Option<Vec<_>>>()
+            .map(|sort_on| ConstraintsContext {
+                sort_on: Some(SortColumns {
+                    sort_on,
+                    required: true,
+                }),
+                aggregates: Vec::new(),
+                order_col_names: None,
+            })
+    }
+}
+fn extract_column_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Alias(Alias { expr, .. }) => extract_column_name(expr),
+        Expr::Column(col) => Some(col.name.clone()), // TODO use alias
+        _ => None,
+    }
+}
+
+///Try to get original column namse from if underlined projection or aggregates contains columns aliases
+fn get_original_name(may_be_alias: &String, input: &LogicalPlan) -> String {
+    fn get_name(exprs: &Vec<Expr>, may_be_alias: &String) -> String {
+        let expr = exprs.iter().find(|&expr| match expr {
+            Expr::Alias(Alias { name, .. }) => name == may_be_alias,
+            _ => false,
+        });
+        if let Some(expr) = expr {
+            if let Some(original_name) = extract_column_name(expr) {
+                return original_name;
+            }
+        }
+        may_be_alias.clone()
+    }
+    match input {
+        LogicalPlan::Projection(Projection { expr, .. }) => get_name(expr, may_be_alias),
+        LogicalPlan::Filter(Filter { input, .. }) => get_original_name(may_be_alias, input),
+        LogicalPlan::Aggregate(Aggregate { group_expr, .. }) => get_name(group_expr, may_be_alias),
+        _ => may_be_alias.clone(),
+    }
+}
+
+/// Returns the ORDER BY column names, whether the (uniform) direction is ascending, and the
+/// per-column `nulls_first` (parallel to the names). Empty names signals an unusable sort (a
+/// non-column expr or mixed asc/desc). The real `nulls_first` is carried through so the worker
+/// top-k cut honors the query's explicit `NULLS FIRST/LAST` instead of re-deriving it from the
+/// sort direction (which would disagree with the router select and drop groups at the limit).
+fn sort_to_column_names(
+    sort_exprs: &Vec<SortExpr>,
+    input: &LogicalPlan,
+) -> (Vec<String>, bool, Vec<bool>) {
+    let mut res = Vec::new();
+    let mut nulls_first = Vec::new();
+    let mut has_desc = false;
+    let mut has_asc = false;
+    for sexpr in sort_exprs.iter() {
+        match sexpr {
+            SortExpr {
+                expr,
+                asc,
+                nulls_first: nf,
+            } => {
+                if *asc {
+                    has_asc = true;
+                } else {
+                    has_desc = true;
+                }
+                match expr {
+                    Expr::Column(c) => {
+                        res.push(get_original_name(&c.name, input));
+                        nulls_first.push(*nf);
+                    }
+                    _ => {
+                        return (Vec::new(), true, Vec::new());
+                    }
+                }
+            }
+        }
+    }
+    if has_asc && has_desc {
+        (Vec::new(), true, Vec::new())
+    } else {
+        (res, has_asc, nulls_first)
+    }
+}
+
+/// Column names of the group-by keys, or `None` if any key is not a plain column (then we can't
+/// relate the grouping to the index sort key).
+fn group_expr_to_column_names(group_expr: &Vec<Expr>, input: &LogicalPlan) -> Option<Vec<String>> {
+    let mut names = Vec::with_capacity(group_expr.len());
+    for expr in group_expr {
+        match expr {
+            Expr::Column(c) => names.push(get_original_name(&c.name, input)),
+            _ => return None,
+        }
+    }
+    Some(names)
+}
+
+fn single_value_filter_columns<'a>(expr: &'a Expr, columns: &mut Vec<&'a common::Column>) -> bool {
+    match expr {
+        Expr::Column(c) => {
+            columns.push(c);
+            true
+        }
+        Expr::Not(e) => {
+            let expr = e.as_ref();
+            match expr {
+                Expr::Column(c) => {
+                    columns.push(c);
+                    true
+                }
+                _ => false,
+            }
+        }
+        Expr::Literal(_) => true,
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+            Operator::Eq => {
+                single_value_filter_columns(left, columns)
+                    && single_value_filter_columns(right, columns)
+            }
+            Operator::And => {
+                let mut l_part = Vec::new();
+                let l_res = single_value_filter_columns(left, &mut l_part);
+
+                if l_res {
+                    columns.append(&mut l_part);
+                }
+
+                let mut r_part = Vec::new();
+                let r_res = single_value_filter_columns(right, &mut r_part);
+
+                if r_res {
+                    columns.append(&mut r_part);
+                }
+                l_res || r_res
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+struct ChooseIndex<'a> {
+    next_index: usize,
+    chosen_indices: &'a [IndexSnapshot],
+    enable_topk: bool,
+    can_pushdown_limit: bool,
+    cluster_send_next_id: usize,
+}
+
+#[derive(Debug, Default, Clone)]
+struct ChooseIndexContext {
+    limit: Option<usize>,
+    sort: Option<Vec<String>>,
+    sort_is_asc: bool,
+    /// Per-column `nulls_first` for the ORDER BY, parallel to [sort]. Carries the query's explicit
+    /// (or default) NULL placement so the worker top-k cut matches the router select.
+    sort_nulls_first: Vec<bool>,
+    single_value_filtered_cols: HashSet<String>,
+    /// Group-by key column names of the nearest aggregate above the scan, when all of them are
+    /// plain columns. Lets a `GROUP BY ... LIMIT` without `ORDER BY` push the limit to workers.
+    group_by: Option<Vec<String>>,
+    /// An `ORDER BY` we couldn't reduce to a column prefix (mixed asc/desc, or a non-column expr).
+    /// It still constrains the output order, so a group-by limit pushdown must not bypass it.
+    unusable_sort: bool,
+    /// A `HAVING` (a filter above the group-by aggregate) drops groups on the router after the
+    /// workers already truncated to their first `limit` groups, so a group-by limit pushdown would
+    /// undercount. Set when [group_by] is captured if a filter was seen above the aggregate.
+    group_by_has_having: bool,
+    /// A filter has been seen on the way down since the last aggregate (or the root) -- folded
+    /// into [group_by_has_having] at the next aggregate. A `WHERE` below the aggregate is fine, so
+    /// this is reset when entering an aggregate.
+    filter_above: bool,
+    /// Set once an aggregate has claimed the enclosing `LIMIT`/`ORDER BY`. Everything below that
+    /// aggregate is its input, not the query's output: the pushdown lands on the aggregate nearest
+    /// the scan, so for a deeper one it would truncate the input of the aggregate that actually
+    /// owns the limit.
+    limit_claimed: bool,
+}
+
+impl ChooseIndexContext {
+    /// A limit entering the context starts a new scope, so nothing but the limit itself carries
+    /// over. See [Self::for_unrelated_relation].
+    fn update_limit(&self, limit: Option<usize>) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+    fn update_sort(
+        &self,
+        names: Vec<String>,
+        sort_is_asc: bool,
+        sort_nulls_first: Vec<bool>,
+    ) -> Self {
+        Self {
+            sort: Some(names),
+            sort_is_asc,
+            sort_nulls_first,
+            ..self.clone()
+        }
+    }
+    fn update_single_value_filtered_cols(&self, cols: HashSet<String>) -> Self {
+        Self {
+            single_value_filtered_cols: cols,
+            ..self.clone()
+        }
+    }
+    /// Enter an aggregate: record its group-by keys (`None` when they are not all plain columns, so
+    /// an outer aggregate's keys are never inherited in their place), fold any filter seen above it
+    /// into [group_by_has_having], and reset [filter_above] so a `WHERE` below counts only towards a
+    /// deeper aggregate. Claims the limit for this aggregate.
+    fn enter_aggregate(&self, names: Option<Vec<String>>) -> Self {
+        Self {
+            group_by: names,
+            group_by_has_having: self.filter_above,
+            filter_above: false,
+            limit_claimed: true,
+            ..self.clone()
+        }
+    }
+
+    /// The context for a relation the enclosing query's `LIMIT` does not count the rows of. Nothing
+    /// describing that query's output survives, [single_value_filtered_cols] included: a predicate
+    /// above the boundary does not constrain the relation below it, and that set drops columns from
+    /// both sides of the index-prefix check.
+    fn for_unrelated_relation() -> Self {
+        Self::default()
+    }
+    fn mark_filter_above(&self) -> Self {
+        Self {
+            filter_above: true,
+            ..self.clone()
+        }
+    }
+    fn has_usable_sort(&self) -> bool {
+        self.sort.as_ref().map_or(false, |s| !s.is_empty())
+    }
+    fn has_order_by(&self) -> bool {
+        self.unusable_sort || self.has_usable_sort()
+    }
+    // Neither a sort nor an aggregate on the way down, so the limit counts rows that come
+    // straight from the relation below (through filters at most).
+    fn limit_counts_plain_rows(&self) -> bool {
+        !self.has_order_by() && !self.limit_claimed
+    }
+    // A filter needs more input rows than the limit keeps, so it breaks the bound as well.
+    fn limit_bounds_input(&self) -> bool {
+        self.limit_counts_plain_rows() && !self.filter_above
+    }
+    fn mark_unusable_sort(&self) -> Self {
+        Self {
+            unusable_sort: true,
+            ..self.clone()
+        }
+    }
+}
+
+impl PlanRewriter for ChooseIndex<'_> {
+    type Context = ChooseIndexContext;
+
+    fn enter_node(&mut self, n: &LogicalPlan, context: &Self::Context) -> Option<Self::Context> {
+        // TODO upgrade DF: This might be broken, or very sensitive to planning behavior.  For
+        // example we handle skips, but don't remove limit when we see a Filter.  It might have been
+        // so before the DF upgrade too.
+        match n {
+            LogicalPlan::Limit(limit@Limit {
+                // fetch: Some(n),
+                // skip: 0,
+                ..
+            }) => {
+                // An outer limit tightens this one only while it still counts this one's rows.
+                let inherits_outer = context.limit_bounds_input();
+                let outer_limit = if inherits_outer { context.limit } else { None };
+
+                // None means no update to limit.  Some(x) means call update_limit(x).
+                let maybe_limit_update: Option<Option<usize>> = match limit.get_fetch_type().ok()? {
+                    FetchType::Literal(Some(n)) =>
+                    if let Some(existing_limit) = outer_limit {
+                        if n < existing_limit {
+                            Some(Some(n))
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(Some(n))
+                    },
+                    FetchType::Literal(None) => None,
+                    FetchType::UnsupportedExpr =>
+                        // Remove the limit (and possible optimization) in case we get a non-constant limit.
+                        Some(None)
+                };
+
+                // Now handle the skip that comes underneath or "before" the limit.
+                let maybe_limit_update: Option<Option<usize>> = match limit.get_skip_type().ok()? {
+                    SkipType::Literal(skip_n) =>
+                    if skip_n == 0 {
+                        maybe_limit_update
+                    } else {
+                        // This is the limit (that would be applied or left in place by this function, if there were no skip) "above" the skip:
+                        let existing_limit = maybe_limit_update.as_ref().unwrap_or(&outer_limit);
+
+                        if let Some(existing_limit_n) = existing_limit {
+                            Some(Some(existing_limit_n + skip_n))
+                        } else {
+                            maybe_limit_update
+                        }
+                    },
+                    SkipType::UnsupportedExpr =>
+                        // Remove the limit (and possible optimization) if we get a non-constant skip underneath it.
+                        Some(None),
+                };
+
+                match maybe_limit_update {
+                    Some(limit_update) => Some(context.update_limit(limit_update)),
+                    None if !inherits_outer => Some(ChooseIndexContext::for_unrelated_relation()),
+                    None => None,
+                }
+            },
+            LogicalPlan::Filter(Filter { predicate, .. }) => {
+                let mut single_filtered = Vec::new();
+                let base = if single_value_filter_columns(predicate, &mut single_filtered) {
+                    context.update_single_value_filtered_cols(
+                        single_filtered
+                            .into_iter()
+                            .map(|c| c.name.to_string())
+                            .collect(),
+                    )
+                } else {
+                    context.clone()
+                };
+                // A filter above the group-by aggregate is a HAVING; record it so the group-by
+                // limit pushdown (which truncates per worker before this filter) stays disabled.
+                Some(base.mark_filter_above())
+            }
+            LogicalPlan::Sort(Sort {
+                expr, input, fetch, ..
+            }) => {
+                let base = match fetch.as_ref() {
+                    Some(f) => context.update_limit(Some(*f)),
+                    // A sort with no fetch below the aggregate that owns the limit orders that
+                    // aggregate's input, not the query's output -- reading it as the query's order
+                    // would flip `reverse` and keep the wrong end of the index. DataFusion drops
+                    // such a sort before we see it (pinned in `test_limit_pushdown_scope`), so this
+                    // makes the invariant structural instead of resting on that.
+                    None if context.limit_claimed => ChooseIndexContext::for_unrelated_relation(),
+                    None => context.clone(),
+                };
+                let (names, sort_is_asc, sort_nulls_first) = sort_to_column_names(expr, input);
+                let base = &base;
+                Some(if !names.is_empty() {
+                    base.update_sort(names, sort_is_asc, sort_nulls_first)
+                } else {
+                    base.mark_unusable_sort()
+                })
+            }
+            LogicalPlan::Aggregate(Aggregate {
+                group_expr, input, ..
+            }) => {
+                // Only the first aggregate below the limit owns it. A deeper one is the input of
+                // that aggregate, and bounding an input drops rows the owner still needs.
+                let context = if context.limit_claimed {
+                    ChooseIndexContext::for_unrelated_relation()
+                } else {
+                    context.clone()
+                };
+                Some(context.enter_aggregate(group_expr_to_column_names(group_expr, input)))
+            }
+            // Row-preserving: the limit still describes the relation below. `TableScan` is here
+            // because `enter_node`'s result is also what [Self::rewrite] sees for this very node,
+            // so clearing it here would kill every pushdown. `Union` is safe because
+            // `pull_up_cluster_send` rejects a union whose branches are not uniformly cluster
+            // sends, so a branch that skipped this scope cannot reach a worker.
+            LogicalPlan::Projection(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Union(_)
+            | LogicalPlan::TableScan(_) => None,
+            // Anything else is a different relation. This covers both sides of a join:
+            // `rewrite_plan_impl` enters the `Join` node before it splits and hands each side the
+            // context produced here.
+            _ => Some(ChooseIndexContext::for_unrelated_relation()),
+        }
+    }
+
+    fn rewrite(
+        &mut self,
+        n: LogicalPlan,
+        ctx: &Self::Context,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        let p = self.choose_table_index(n, ctx)?;
+        let mut p = pull_up_cluster_send(p)?;
+        if self.enable_topk {
+            p = materialize_topk(p)?;
+        }
+        Ok(p)
+    }
+}
+
+fn try_extract_cluster_send(p: &LogicalPlan) -> Option<&ClusterSendNode> {
+    if let LogicalPlan::Extension(Extension { node }) = p {
+        return node.as_any().downcast_ref::<ClusterSendNode>();
+    }
+    return None;
+}
+
+impl ChooseIndex<'_> {
+    fn choose_table_index(
+        &mut self,
+        mut p: LogicalPlan,
+        ctx: &ChooseIndexContext,
+    ) -> Result<LogicalPlan, DataFusionError> {
+        match &mut p {
+            LogicalPlan::TableScan(TableScan {
+                source, table_name, ..
+            }) => {
+                if let Some(default_table_source) =
+                    source.as_any().downcast_ref::<DefaultTableSource>()
+                {
+                    let table_provider = default_table_source.table_provider.clone();
+                    if let Some(table) = table_provider.as_any().downcast_ref::<CubeTableLogical>()
+                    {
+                        assert!(
+                            self.next_index < self.chosen_indices.len(),
+                            "inconsistent state: next_index: {}, chosen_indices: {:?}",
+                            self.next_index,
+                            self.chosen_indices
+                        );
+
+                        assert_eq!(
+                            table.table.table.get_id(),
+                            self.chosen_indices[self.next_index]
+                                .table_path
+                                .table
+                                .get_id()
+                        );
+
+                        let snapshot = self.chosen_indices[self.next_index].clone();
+                        self.next_index += 1;
+
+                        let table_schema = source.schema();
+                        *source = Arc::new(DefaultTableSource::new(Arc::new(CubeTable::try_new(
+                            snapshot.clone(),
+                            // Filled by workers
+                            HashMap::new(),
+                            Vec::new(),
+                            NoopParquetMetadataCache::new(),
+                        )?)));
+
+                        let index_schema = source.schema();
+                        assert_eq!(table_schema, index_schema);
+                        let limit = self.get_limit_for_pushdown(snapshot.sort_on(), ctx);
+                        let limit_and_reverse = limit.map(|limit| {
+                            // `reverse` reads the index backwards for a descending ORDER BY. A
+                            // pushdown without an ORDER BY reads it forward.
+                            (limit, ctx.has_usable_sort() && !ctx.sort_is_asc)
+                        });
+
+                        // When the limit can't ride the index (ORDER BY on group columns that
+                        // isn't a sort-key prefix), fall back to a per-worker bounded sort.
+                        let worker_sort_and_limit = if limit_and_reverse.is_none() {
+                            self.compute_worker_sort_and_limit(ctx)
+                        } else {
+                            None
+                        };
+
+                        let mut node = ClusterSendNode::new(
+                            self.get_cluster_send_next_id(),
+                            Arc::new(p),
+                            vec![vec![Snapshot::Index(snapshot)]],
+                            limit_and_reverse,
+                        );
+                        node.worker_sort_and_limit = worker_sort_and_limit;
+                        return Ok(node.into_plan());
+                    } else if let Some(table) = table_provider
+                        .as_any()
+                        .downcast_ref::<InlineTableProvider>()
+                    {
+                        let id = table.get_id();
+                        return Ok(ClusterSendNode::new(
+                            self.get_cluster_send_next_id(),
+                            Arc::new(p),
+                            vec![vec![Snapshot::Inline(InlineSnapshot { id })]],
+                            None,
+                        )
+                        .into_plan());
+                    } else if let Some(_) = table_provider
+                        .as_any()
+                        .downcast_ref::<InfoSchemaTableProvider>()
+                    {
+                        return Err(DataFusionError::Plan(
+                            "Unexpected table source: InfoSchemaTableProvider".to_string(),
+                        ));
+                    } else if let Some(_) = table_provider
+                        .as_any()
+                        .downcast_ref::<InfoSchemaQueryCacheTableProvider>()
+                    {
+                        return Err(DataFusionError::Plan(
+                            "Unexpected table source: InfoSchemaQueryCacheTableProvider"
+                                .to_string(),
+                        ));
+                    } else {
+                        return Err(DataFusionError::Plan("Unexpected table source".to_string()));
+                    }
+                } else {
+                    return Err(DataFusionError::Plan(format!(
+                        "Expected DefaultTableSource for: {}",
+                        table_name
+                    )));
+                }
+            }
+            _ => return Ok(p),
+        }
+    }
+
+    fn get_cluster_send_next_id(&mut self) -> usize {
+        let id = self.cluster_send_next_id;
+        self.cluster_send_next_id += 1;
+        id
+    }
+
+    /// Builds the worker bounded-sort descriptor for `ORDER BY <group cols> LIMIT n` that can't ride
+    /// the index. Returns the full group key reordered with the ORDER BY columns first (so the
+    /// per-partition top-n on the workers is sound), or `None` when it doesn't apply.
+    fn compute_worker_sort_and_limit(
+        &self,
+        ctx: &ChooseIndexContext,
+    ) -> Option<WorkerSortAndLimit> {
+        if !self.can_pushdown_limit || ctx.unusable_sort || ctx.group_by_has_having {
+            return None;
+        }
+        let limit = ctx.limit?;
+        let group_by = ctx.group_by.as_ref().filter(|g| !g.is_empty())?;
+
+        // Every ORDER BY column must be a group-by column; map it to its group-key position. A bare
+        // LIMIT (no ORDER BY) leaves the prefix empty, so the total order is the full group key in
+        // group-by order -- "any n groups" becomes "the n smallest by group key", still valid.
+        let mut cols: Vec<(usize, bool, bool)> = Vec::with_capacity(group_by.len());
+        let mut used = vec![false; group_by.len()];
+        if let Some(sort) = ctx.sort.as_ref().filter(|s| !s.is_empty()) {
+            for (i, name) in sort.iter().enumerate() {
+                let idx = group_by.iter().position(|g| g == name)?;
+                if used[idx] {
+                    continue;
+                }
+                used[idx] = true;
+                // Honor the query's explicit NULL placement; fall back to the asc-derived default
+                // only if it wasn't captured (it always is, alongside the name).
+                let nulls_first = ctx
+                    .sort_nulls_first
+                    .get(i)
+                    .copied()
+                    .unwrap_or(!ctx.sort_is_asc);
+                cols.push((idx, ctx.sort_is_asc, nulls_first));
+            }
+        }
+        // Extend with the remaining group keys to make it a total order on the full group key. Their
+        // NULL placement is arbitrary (these columns are not in the query's ORDER BY); use ascending
+        // nulls-first for a deterministic order. The worker cut and the router select both derive
+        // from this one descriptor, so they agree on the total order by construction.
+        for (idx, is_used) in used.iter().enumerate() {
+            if !is_used {
+                cols.push((idx, true, true));
+            }
+        }
+        Some((cols, limit))
+    }
+
+    fn get_limit_for_pushdown(
+        &self,
+        index_sort_on: Option<&Vec<String>>,
+        ctx: &ChooseIndexContext,
+    ) -> Option<usize> {
+        if ctx.limit.is_none() || !self.can_pushdown_limit {
+            return None;
+        }
+        // A HAVING drops groups on the router after the workers already truncated to their first
+        // `limit` groups, so the result would be short of `limit` rows.
+        if ctx.group_by_has_having {
+            return None;
+        }
+
+        let limit = ctx.limit.unwrap();
+
+        // Neither an ORDER BY nor an aggregate between the limit and the scan: the limit counts
+        // plain scan rows and any `limit` of them answer the query, whatever the index order.
+        if ctx.limit_counts_plain_rows() {
+            return Some(limit);
+        }
+
+        if index_sort_on.is_none() || index_sort_on.unwrap().is_empty() {
+            return None;
+        }
+        let index_sort_on = index_sort_on.unwrap();
+
+        let can_pushdown = match ctx.sort.as_ref().filter(|s| !s.is_empty()) {
+            //We can push down limit only if resulting order by is the prefix of index sort on
+            Some(sort_columns) => {
+                //We exclude from order by and index sort_on strictly restricted columns (aka `a = 10`)
+                let works_ind_sort_cols = index_sort_on
+                    .iter()
+                    .filter(|c| !ctx.single_value_filtered_cols.contains(*c));
+                let works_sort_cols = sort_columns
+                    .iter()
+                    .filter(|c| !ctx.single_value_filtered_cols.contains(*c));
+
+                works_sort_cols
+                    .zip_longest(works_ind_sort_cols)
+                    .all(|item| {
+                        match item {
+                            EitherOrBoth::Both(sort, index) => sort == index,
+                            EitherOrBoth::Left(_) => false, //order by has more columns then index sort on
+                            EitherOrBoth::Right(_) => true,
+                        }
+                    })
+            }
+            // No ORDER BY: a grouped aggregate whose group-by keys are a prefix of the index sort
+            // key emits complete groups in sort order, so the per-partition limit may descend to
+            // the workers' sorted partial aggregate (see add_limit_to_workers). Skipped when an
+            // ORDER BY is present but unusable (it still constrains the output order).
+            None if !ctx.unusable_sort => match ctx.group_by.as_ref().filter(|g| !g.is_empty()) {
+                Some(group_by) => group_by_is_index_sort_prefix(
+                    group_by,
+                    index_sort_on,
+                    &ctx.single_value_filtered_cols,
+                ),
+                None => false,
+            },
+            None => false,
+        };
+
+        if can_pushdown {
+            Some(limit)
+        } else {
+            None
+        }
+    }
+}
+
+/// True if the group-by key set equals a prefix of the index sort key (ignoring single-valued
+/// filtered columns). Then the rows of each group are contiguous in the index scan, the partial
+/// aggregate is sorted, and groups are emitted in index sort order -- the order the router's limit
+/// cuts on, so a per-partition group limit is safe to push down.
+fn group_by_is_index_sort_prefix(
+    group_by: &[String],
+    index_sort_on: &[String],
+    single_value_filtered_cols: &HashSet<String>,
+) -> bool {
+    let group_set: HashSet<&String> = group_by
+        .iter()
+        .filter(|c| !single_value_filtered_cols.contains(*c))
+        .collect();
+    if group_set.is_empty() {
+        return false;
+    }
+    let prefix: Vec<&String> = index_sort_on
+        .iter()
+        .filter(|c| !single_value_filtered_cols.contains(*c))
+        .take(group_set.len())
+        .collect();
+    prefix.len() == group_set.len() && prefix.iter().all(|c| group_set.contains(*c))
+}
+
+struct IndexCandidate {
+    /// May contain for unmatched index.
+    pub ordinary_index: Result<IndexSnapshot, DataFusionError>,
+    pub partitioned_index: Option<IndexSnapshot>,
+}
+
+fn check_aggregates_expr(table: &IdRow<Table>, aggregates: &Vec<Expr>) -> bool {
+    let table_aggregates = table.get_row().aggregate_columns();
+
+    for aggr in aggregates.iter() {
+        match aggr {
+            Expr::AggregateFunction(expr::AggregateFunction {
+                func,
+                params: expr::AggregateFunctionParams { args, .. },
+            }) => {
+                if args.len() != 1 {
+                    return false;
+                }
+
+                let aggr_fun = match func.name().to_lowercase().as_str() {
+                    "sum" => Some(AggregateFunction::SUM),
+                    "max" => Some(AggregateFunction::MAX),
+                    "min" => Some(AggregateFunction::MIN),
+                    "merge" => Some(AggregateFunction::MERGE),
+                    _ => None,
+                };
+
+                if aggr_fun.is_none() {
+                    return false;
+                }
+
+                let aggr_fun = aggr_fun.unwrap();
+
+                let col_match = match &args[0] {
+                    Expr::Column(col) => table_aggregates.iter().any(|ta| {
+                        ta.function() == &aggr_fun && ta.column().get_name() == &col.name
+                    }),
+                    _ => false,
+                };
+
+                if !col_match {
+                    return false;
+                }
+            }
+            _ => {
+                return false;
+            }
+        };
+    }
+    true
+}
+
+// Picks the index, but not partitions snapshots.
+fn pick_index(
+    c: &IndexConstraints,
+    schema: IdRow<Schema>,
+    table: IdRow<Table>,
+    indices: Vec<IdRow<Index>>,
+) -> Result<IndexCandidate, DataFusionError> {
+    let sort_on = c.sort_on.as_ref().map(|sc| (&sc.sort_on, sc.required));
+
+    let aggr_index_allowed = check_aggregates_expr(&table, &c.aggregates);
+
+    let default_index = indices.iter().next().expect("no default index");
+    let (index, mut partitioned_index, sort_on) = if let Some(projection_column_indices) =
+        &c.projection
+    {
+        let projection_columns = CubeTable::project_to_table(&table, &projection_column_indices);
+
+        let mut filter_columns = HashSet::new();
+        for f in c.filters.iter() {
+            expr_to_columns(f, &mut filter_columns)?;
+        }
+
+        // Skipping default index
+        let filtered_by_sort_on = indices.iter().skip(1).filter(|i| {
+            if let Some((join_on_columns, required)) = sort_on.as_ref() {
+                if i.get_row().sort_key_size() < (join_on_columns.len() as u64) {
+                    return false;
+                }
+                let all_columns_in_index = match i.get_row().get_type() {
+                    IndexType::Aggregate => {
+                        if aggr_index_allowed {
+                            let projection_check = projection_columns.iter().all(|c| {
+                                i.get_row()
+                                    .get_columns()
+                                    .iter()
+                                    .find(|ic| ic.get_name() == c.get_name())
+                                    .is_some()
+                            });
+                            let filter_check = filter_columns.iter().all(|c| {
+                                i.get_row()
+                                    .get_columns()
+                                    .iter()
+                                    .find(|ic| ic.get_name() == &c.name)
+                                    .is_some()
+                            });
+
+                            projection_check && filter_check
+                        } else {
+                            false
+                        }
+                    }
+                    _ => true,
+                };
+
+                if !all_columns_in_index {
+                    return false;
+                }
+                let join_columns_in_index = join_on_columns
+                    .iter()
+                    .map(|c| {
+                        i.get_row()
+                            .get_columns()
+                            .iter()
+                            .find(|ic| ic.get_name().as_str() == c.as_str())
+                            .cloned()
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let join_columns_in_index = match join_columns_in_index {
+                    None => return false,
+                    Some(c) => c,
+                };
+                let mut join_columns_indices = CubeTable::project_to_index_positions(
+                    &join_columns_in_index
+                        .iter()
+                        .map(|c| c.get_name().to_string())
+                        .collect(),
+                    &i,
+                );
+
+                //TODO We are not touching indexes for join yet, because they should be the same sorted for different tables.
+                if !required {
+                    join_columns_indices.sort();
+                }
+
+                let matches = join_columns_indices
+                    .iter()
+                    .enumerate()
+                    .all(|(i, col_i)| Some(i) == *col_i);
+                matches
+            } else {
+                true
+            }
+        });
+        let optimal_with_partitioned_index = optimal_index_by_score(
+            filtered_by_sort_on
+                .clone()
+                .filter(|i| i.get_row().multi_index_id().is_some()),
+            &projection_columns,
+            &filter_columns,
+        );
+        let optimal =
+            optimal_index_by_score(filtered_by_sort_on, &projection_columns, &filter_columns);
+        if let Some(index) = optimal_with_partitioned_index.or(optimal) {
+            (
+                Ok(index),
+                index.get_row().multi_index_id().map(|_| index),
+                sort_on,
+            )
+        } else {
+            if let Some((join_on_columns, true)) = sort_on.as_ref() {
+                let table_name = c.table.table_name();
+                let err = Err(DataFusionError::Plan(format!(
+                    "Can't find index to join table {} on {}. Consider creating index: CREATE INDEX {}_{} ON {} ({})",
+                    table_name,
+                    join_on_columns.join(", "),
+                    table.get_row().get_table_name(),
+                    join_on_columns.join("_"),
+                    table_name,
+                    join_on_columns.join(", ")
+                )));
+                (err, None, sort_on)
+            } else {
+                let optimal = optimal_index_by_score(
+                    // Skipping default index
+                    indices.iter().skip(1),
+                    &projection_columns,
+                    &filter_columns,
+                );
+
+                let index = optimal.unwrap_or(default_index);
+                (
+                    Ok(index),
+                    index.get_row().multi_index_id().map(|_| index),
+                    None,
+                )
+            }
+        }
+    } else {
+        if let Some((join_on_columns, _)) = sort_on {
+            return Err(DataFusionError::Plan(format!(
+                "Can't find index to join table {} on {} and projection push down optimization has been disabled. Invalid state.",
+                c.table.table_name(),
+                join_on_columns.join(", ")
+            )));
+        }
+        (Ok(default_index), None, None)
+    };
+
+    // Only use partitioned index for joins. Joins are indicated by the required flag.
+    if !sort_on
+        .as_ref()
+        .map(|(_, required)| *required)
+        .unwrap_or(false)
+    {
+        partitioned_index = None;
+    }
+
+    let schema = Arc::new(schema);
+    let create_snapshot = |index: &IdRow<Index>| {
+        // An empty join `on` (a cross/range join, as rolling-window queries produce) yields an
+        // empty `sort_on`. Normalize it to `None` here so every consumer of `IndexSnapshot::sort_on`
+        // (scan construction and `required_input_ordering`) consistently falls back to the index
+        // sort key instead of describing an empty ordering.
+        let index_sort_on = sort_on
+            .map(|sc| {
+                index
+                    .get_row()
+                    .columns()
+                    .iter()
+                    .take(sc.0.len())
+                    .map(|c| c.get_name().clone())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|cols| !cols.is_empty());
+        IndexSnapshot {
+            index: index.clone(),
+            partitions: Vec::new(), // filled with results of `pick_partitions` later.
+            table_path: TablePath::new(schema.clone(), table.clone()),
+            sort_on: index_sort_on,
+        }
+    };
+    Ok(IndexCandidate {
+        ordinary_index: index.map(create_snapshot),
+        partitioned_index: partitioned_index.map(create_snapshot),
+    })
+}
+
+fn optimal_index_by_score<'a, T: Iterator<Item = &'a IdRow<Index>>>(
+    indexes: T,
+    projection_columns: &Vec<Column>,
+    filter_columns: &HashSet<common::Column>,
+) -> Option<&'a IdRow<Index>> {
+    #[derive(PartialEq, Eq, Clone)]
+    struct Score {
+        index_type: IndexType,
+        index_size: u64,
+        filter_score: usize,
+        projection_score: usize,
+    }
+    impl PartialOrd for Score {
+        fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Score {
+        fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+            let res = match self.index_type {
+                IndexType::Regular => match other.index_type {
+                    IndexType::Regular => core::cmp::Ordering::Equal,
+                    IndexType::Aggregate => core::cmp::Ordering::Greater,
+                },
+                IndexType::Aggregate => match other.index_type {
+                    IndexType::Regular => core::cmp::Ordering::Less,
+                    IndexType::Aggregate => self.index_size.cmp(&other.index_size),
+                },
+            };
+            match res {
+                core::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+            match self.filter_score.cmp(&other.filter_score) {
+                core::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+            self.projection_score.cmp(&other.projection_score)
+        }
+    }
+
+    indexes
+        .filter_map(|i| {
+            let index_size = i.get_row().sort_key_size();
+
+            let filter_score = CubeTable::project_to_index_positions(
+                &filter_columns.iter().map(|c| c.name.to_string()).collect(),
+                &i,
+            )
+            .into_iter()
+            .fold_options(0, |a, b| a + b);
+
+            let projection_score = CubeTable::project_to_index_positions(
+                &projection_columns
+                    .iter()
+                    .map(|c| c.get_name().to_string())
+                    .collect(),
+                &i,
+            )
+            .into_iter()
+            .fold_options(0, |a, b| a + b);
+
+            let index_score = if filter_score.is_some() && projection_score.is_some() {
+                Some(Score {
+                    index_type: i.get_row().get_type(),
+                    index_size,
+                    filter_score: filter_score.unwrap(),
+                    projection_score: projection_score.unwrap(),
+                })
+            } else {
+                None
+            };
+
+            let res = Some(i).zip(index_score);
+            res
+        })
+        .min_by_key(|(_, score)| score.clone())
+        .map(|(index, _)| index)
+}
+
+fn pick_partitions(
+    i: &IndexSnapshot,
+    c: &IndexConstraints,
+    partitions: Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)>,
+) -> Result<Vec<PartitionSnapshot>, DataFusionError> {
+    let partition_filter = PartitionFilter::extract(&partition_filter_schema(&i.index), &c.filters);
+    log::trace!("Extracted partition filter is {:?}", partition_filter);
+    let candidate_partitions = partitions.len();
+    let mut pruned_partitions = 0;
+
+    let mut partition_snapshots = Vec::new();
+    for (partition, chunks) in partitions.into_iter() {
+        let min_row = partition
+            .get_row()
+            .get_min_val()
+            .as_ref()
+            .map(|r| r.values().as_slice());
+        let max_row = partition
+            .get_row()
+            .get_max_val()
+            .as_ref()
+            .map(|r| r.values().as_slice());
+
+        if !partition_filter.can_match(min_row, max_row) {
+            pruned_partitions += 1;
+            continue;
+        }
+
+        partition_snapshots.push(PartitionSnapshot { chunks, partition });
+    }
+    log::trace!(
+        "Pruned {} of {} partitions",
+        pruned_partitions,
+        candidate_partitions
+    );
+
+    Ok(partition_snapshots)
+}
+
+fn partition_filter_schema(index: &IdRow<Index>) -> datafusion::arrow::datatypes::Schema {
+    let schema_fields: Vec<Field>;
+    schema_fields = index
+        .get_row()
+        .columns()
+        .iter()
+        .map(|c| c.clone().into())
+        .take(index.get_row().sort_key_size() as usize)
+        .collect();
+    datafusion::arrow::datatypes::Schema::new(schema_fields)
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Hash, PartialEq, Eq, PartialOrd)]
+pub enum Snapshot {
+    Index(IndexSnapshot),
+    Inline(InlineSnapshot),
+}
+
+pub type Snapshots = Vec<Snapshot>;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum ExtensionNodeSerialized {
+    ClusterSend(ClusterSendSerialized),
+    PanicWorker(PanicWorkerSerialized),
+    RollingWindowAggregate(RollingWindowAggregateSerialized),
+    ClusterAggregateTopKUpper(ClusterAggregateTopKUpperSerialized),
+    ClusterAggregateTopKLower(ClusterAggregateTopKLowerSerialized),
+}
+
+/// Per-worker bounded sort for `ORDER BY <group cols> LIMIT n` when the order isn't an index
+/// prefix: the full group key reordered with the ORDER BY columns first, plus the limit. Stored as
+/// `(group_column_index, ascending, nulls_first)` over the aggregate's group columns.
+pub type WorkerSortAndLimit = (Vec<(usize, bool, bool)>, usize);
+
+#[derive(Debug, Clone)]
+pub struct ClusterSendNode {
+    pub id: usize,
+    pub input: Arc<LogicalPlan>,
+    pub snapshots: Vec<Snapshots>,
+    pub limit_and_reverse: Option<(usize, bool)>,
+    pub worker_sort_and_limit: Option<WorkerSortAndLimit>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct ClusterSendSerialized {
+    pub id: usize,
+    pub snapshots: Vec<Snapshots>,
+    pub limit_and_reverse: Option<(usize, bool)>,
+    #[serde(default)]
+    pub worker_sort_and_limit: Option<WorkerSortAndLimit>,
+}
+
+impl ClusterSendNode {
+    pub fn new(
+        id: usize,
+        input: Arc<LogicalPlan>,
+        snapshots: Vec<Snapshots>,
+        limit_and_reverse: Option<(usize, bool)>,
+    ) -> Self {
+        ClusterSendNode {
+            id,
+            input,
+            snapshots,
+            limit_and_reverse,
+            worker_sort_and_limit: None,
+        }
+    }
+
+    pub fn into_plan(self) -> LogicalPlan {
+        LogicalPlan::Extension(Extension {
+            node: Arc::new(self),
+        })
+    }
+
+    pub fn from_serialized(inputs: &[LogicalPlan], serialized: ClusterSendSerialized) -> Self {
+        Self {
+            id: serialized.id,
+            input: Arc::new(inputs[0].clone()),
+            snapshots: serialized.snapshots,
+            limit_and_reverse: serialized.limit_and_reverse,
+            worker_sort_and_limit: serialized.worker_sort_and_limit,
+        }
+    }
+
+    pub fn to_serialized(&self) -> ClusterSendSerialized {
+        ClusterSendSerialized {
+            id: self.id,
+            snapshots: self.snapshots.clone(),
+            limit_and_reverse: self.limit_and_reverse.clone(),
+            worker_sort_and_limit: self.worker_sort_and_limit.clone(),
+        }
+    }
+}
+
+impl UserDefinedLogicalNode for ClusterSendNode {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "ClusterSend"
+    }
+
+    fn inputs(&self) -> Vec<&LogicalPlan> {
+        vec![self.input.as_ref()]
+    }
+
+    fn schema(&self) -> &DFSchemaRef {
+        self.input.schema()
+    }
+
+    fn check_invariants(&self, _check: InvariantLevel, _plan: &LogicalPlan) -> common::Result<()> {
+        Ok(())
+    }
+
+    fn expressions(&self) -> Vec<Expr> {
+        vec![]
+    }
+
+    fn prevent_predicate_push_down_columns(&self) -> HashSet<String, RandomState> {
+        HashSet::new()
+    }
+
+    fn fmt_for_explain<'a>(&self, f: &mut Formatter<'a>) -> std::fmt::Result {
+        write!(f, "ClusterSend")
+    }
+
+    fn with_exprs_and_inputs(
+        &self,
+        exprs: Vec<Expr>,
+        inputs: Vec<LogicalPlan>,
+    ) -> datafusion::common::Result<Arc<dyn UserDefinedLogicalNode>> {
+        assert!(exprs.is_empty());
+        assert_eq!(inputs.len(), 1);
+
+        Ok(Arc::new(ClusterSendNode {
+            id: self.id,
+            input: Arc::new(inputs[0].clone()),
+            snapshots: self.snapshots.clone(),
+            limit_and_reverse: self.limit_and_reverse.clone(),
+            worker_sort_and_limit: self.worker_sort_and_limit.clone(),
+        }))
+    }
+
+    fn dyn_hash(&self, state: &mut dyn Hasher) {
+        let mut state = state;
+        self.input.hash(&mut state);
+    }
+
+    fn dyn_eq(&self, other: &dyn UserDefinedLogicalNode) -> bool {
+        other
+            .as_any()
+            .downcast_ref::<ClusterSendNode>()
+            .map(|s| self.input.eq(&s.input))
+            .unwrap_or(false)
+    }
+
+    fn dyn_ord(&self, other: &dyn UserDefinedLogicalNode) -> Option<Ordering> {
+        other
+            .as_any()
+            .downcast_ref::<ClusterSendNode>()
+            .and_then(|s| self.input.as_ref().partial_cmp(s.input.as_ref()))
+    }
+}
+
+fn pull_up_cluster_send(mut p: LogicalPlan) -> Result<LogicalPlan, DataFusionError> {
+    let snapshots;
+    match &mut p {
+        // These nodes have no children, return unchanged.
+        LogicalPlan::TableScan { .. }
+        | LogicalPlan::EmptyRelation { .. }
+        | LogicalPlan::Explain { .. } => return Ok(p),
+        // The ClusterSend itself, return unchanged.
+        LogicalPlan::Extension { .. } => return Ok(p),
+        // These nodes collect results from multiple partitions, return unchanged.
+        LogicalPlan::Aggregate { .. }
+        | LogicalPlan::Window { .. }
+        | LogicalPlan::Repartition { .. }
+        | LogicalPlan::Limit { .. } => return Ok(p),
+        // Collects results but let's push sort,fetch underneath the input.
+        LogicalPlan::Sort(Sort { expr, input, fetch }) => {
+            let Some(send) = try_extract_cluster_send(input) else {
+                return Ok(p);
+            };
+            let Some(fetch) = fetch else {
+                return Ok(p);
+            };
+            let id = send.id;
+            snapshots = send.snapshots.clone();
+            let under_sort = LogicalPlan::Sort(Sort {
+                expr: expr.clone(),
+                input: send.input.clone(),
+                fetch: Some(*fetch),
+            });
+            // We discard limit_and_reverse, because we add a Sort node into the plan right here.
+            let limit_and_reverse = None;
+            let new_send =
+                ClusterSendNode::new(id, Arc::new(under_sort), snapshots, limit_and_reverse);
+            *input = Arc::new(new_send.into_plan());
+            return Ok(p);
+        }
+        // We can always pull cluster send for these nodes.
+        LogicalPlan::Projection(Projection { input, .. })
+        | LogicalPlan::Filter(Filter { input, .. })
+        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+        | LogicalPlan::Unnest(Unnest { input, .. }) => {
+            let Some(send) = try_extract_cluster_send(input) else {
+                return Ok(p);
+            };
+            let id = send.id;
+            snapshots = send.snapshots.clone();
+            let limit = send.limit_and_reverse.clone();
+            // These nodes sit below the aggregate and don't change the group columns, so the
+            // worker bounded-sort descriptor (indexed by group column) stays valid.
+            let worker_sort_and_limit = send.worker_sort_and_limit.clone();
+
+            *input = send.input.clone();
+            let mut new_send = ClusterSendNode::new(id, Arc::new(p), snapshots, limit);
+            new_send.worker_sort_and_limit = worker_sort_and_limit;
+            return Ok(new_send.into_plan());
+        }
+        LogicalPlan::Union(Union { inputs, .. }) => {
+            // Handle UNION over constants, e.g. inline data series.
+            if inputs.iter().all(|p| try_extract_cluster_send(p).is_none()) {
+                return Ok(p);
+            }
+            let mut union_snapshots = Vec::new();
+            let mut limits = Vec::new();
+            let mut worker_sort_and_limits = Vec::new();
+            let mut id = 0;
+            for i in inputs.into_iter() {
+                let send;
+                if let Some(s) = try_extract_cluster_send(i) {
+                    send = s;
+                } else {
+                    return Err(DataFusionError::Plan(
+                        "UNION argument not supported".to_string(),
+                    ));
+                }
+                if id == 0 {
+                    id = send.id;
+                }
+                union_snapshots.extend(send.snapshots.concat());
+                limits.push(send.limit_and_reverse);
+                worker_sort_and_limits.push(send.worker_sort_and_limit.clone());
+                *i = send.input.clone();
+            }
+            let limit = if limits.is_empty() || limits.iter().any(|l| l.is_none()) {
+                None
+            } else if limits.iter().any(|l| l.unwrap() != limits[0].unwrap()) {
+                None
+            } else {
+                limits[0]
+            };
+            // The same group-by/limit context descends to every UNION branch, so the per-branch
+            // descriptors are identical and stay valid over the union (same schema, group columns by
+            // position). Keep it only when all branches agree; otherwise drop the pushdown.
+            let worker_sort_and_limit = if worker_sort_and_limits.is_empty()
+                || worker_sort_and_limits.iter().any(|w| w.is_none())
+                || worker_sort_and_limits
+                    .iter()
+                    .any(|w| w != &worker_sort_and_limits[0])
+            {
+                None
+            } else {
+                worker_sort_and_limits[0].clone()
+            };
+            snapshots = vec![union_snapshots];
+            let mut new_send = ClusterSendNode::new(id, Arc::new(p), snapshots, limit);
+            new_send.worker_sort_and_limit = worker_sort_and_limit;
+            return Ok(new_send.into_plan());
+        }
+        LogicalPlan::Join(Join { left, right, .. }) => {
+            let lsend;
+            let rsend;
+            if let (Some(l), Some(r)) = (
+                try_extract_cluster_send(left),
+                try_extract_cluster_send(right),
+            ) {
+                lsend = l;
+                rsend = r;
+            } else {
+                return Ok(p);
+            }
+            let id = lsend.id;
+            snapshots = lsend
+                .snapshots
+                .iter()
+                .chain(rsend.snapshots.iter())
+                .cloned()
+                .collect();
+            *left = lsend.input.clone();
+            *right = rsend.input.clone();
+            return Ok(ClusterSendNode::new(id, Arc::new(p), snapshots, None).into_plan());
+        }
+        x => {
+            return Err(DataFusionError::Internal(format!(
+                "Unsupported operation to distribute: {}",
+                x
+            )))
+        } // TODO upgrade DF
+          // LogicalPlan::Subquery(_) => {}
+          // LogicalPlan::SubqueryAlias(_) => {}
+          // LogicalPlan::Statement(_) => {}
+          // LogicalPlan::Values(_) => {}
+          // LogicalPlan::Analyze(_) => {}
+          // LogicalPlan::Distinct(_) => {}
+          // LogicalPlan::Prepare(_) => {}
+          // LogicalPlan::Execute(_) => {}
+          // LogicalPlan::Dml(_) => {}
+          // LogicalPlan::Ddl(_) => {}
+          // LogicalPlan::Copy(_) => {}
+          // LogicalPlan::DescribeTable(_) => {}
+          // LogicalPlan::Unnest(_) => {}
+          // LogicalPlan::RecursiveQuery(_) => {}
+    }
+}
+
+pub struct CubeExtensionPlanner {
+    pub cluster: Option<Arc<dyn Cluster>>,
+    // Set on the workers.
+    pub worker_partition_count: Option<usize>,
+    pub serialized_plan: Arc<PreSerializedPlan>,
+    /// On the router, this node's own configuration; on a worker, what the router sent.
+    pub planning_flags: PlanningFlags,
+}
+
+#[async_trait]
+impl ExtensionPlanner for CubeExtensionPlanner {
+    async fn plan_extension(
+        &self,
+        planner: &dyn PhysicalPlanner,
+        node: &dyn UserDefinedLogicalNode,
+        logical_inputs: &[&LogicalPlan],
+        physical_inputs: &[Arc<dyn ExecutionPlan>],
+        state: &SessionState,
+    ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
+        let inputs = physical_inputs;
+        if let Some(cs) = node.as_any().downcast_ref::<ClusterSendNode>() {
+            assert_eq!(inputs.len(), 1);
+            let input = inputs.into_iter().next().unwrap();
+
+            pub struct FindClusterSendCutPoint<'n> {
+                pub parent: Option<&'n LogicalPlan>,
+                pub cluster_send_to_find: &'n ClusterSendNode,
+                pub result: Option<&'n LogicalPlan>,
+            }
+
+            impl<'n> TreeNodeVisitor<'n> for FindClusterSendCutPoint<'n> {
+                type Node = LogicalPlan;
+
+                fn f_down(&mut self, node: &'n Self::Node) -> common::Result<TreeNodeRecursion> {
+                    if let LogicalPlan::Extension(Extension { node: n }) = node {
+                        if let Some(cs) = n.as_any().downcast_ref::<ClusterSendNode>() {
+                            if cs.id == self.cluster_send_to_find.id {
+                                if let Some(LogicalPlan::Aggregate(_)) = self.parent {
+                                    self.result = Some(self.parent.clone().unwrap());
+                                } else {
+                                    self.result = Some(node);
+                                }
+                                return Ok(TreeNodeRecursion::Stop);
+                            }
+                        }
+                    }
+                    self.parent = Some(node);
+                    Ok(TreeNodeRecursion::Continue)
+                }
+            }
+
+            let mut find_cluster_send_cut_point = FindClusterSendCutPoint {
+                parent: None,
+                cluster_send_to_find: cs,
+                result: None,
+            };
+
+            self.serialized_plan
+                .logical_plan()
+                .visit(&mut find_cluster_send_cut_point)?;
+            Ok(Some(self.plan_cluster_send(
+                input.clone(),
+                &cs.snapshots,
+                false,
+                usize::MAX,
+                cs.limit_and_reverse.clone(),
+                cs.worker_sort_and_limit.clone(),
+                Some(find_cluster_send_cut_point.result.ok_or_else(|| {
+                    CubeError::internal("ClusterSend cut point not found".to_string())
+                })?),
+                /* required input ordering */ None,
+            )?))
+        } else if let Some(topk_lower) = node.as_any().downcast_ref::<ClusterAggregateTopKLower>() {
+            assert_eq!(inputs.len(), 1);
+
+            // We need a dummy execution plan node, so we can pass DF's assertion of the schema.
+            Ok(Some(Arc::new(DummyTopKLowerExec {
+                schema: topk_lower.schema.inner().clone(),
+                input: inputs[0].clone(),
+            })))
+        } else if let Some(topk_upper) = node.as_any().downcast_ref::<ClusterAggregateTopKUpper>() {
+            assert_eq!(inputs.len(), 1);
+            assert_eq!(logical_inputs.len(), 1);
+            let msg: &'static str =
+                "ClusterAggregateTopKUpper expects its child to be a ClusterAggregateTopKLower";
+            let LogicalPlan::Extension(Extension { node }) = logical_inputs[0] else {
+                return Err(DataFusionError::Internal(msg.to_owned()));
+            };
+            let Some(lower_node) = node.as_any().downcast_ref::<ClusterAggregateTopKLower>() else {
+                return Err(DataFusionError::Internal(msg.to_owned()));
+            };
+
+            // The input should be (and must be) a DummyTopKLowerExec node.
+            let Some(DummyTopKLowerExec {
+                schema: _,
+                input: lower_input,
+            }) = inputs[0].as_any().downcast_ref::<DummyTopKLowerExec>()
+            else {
+                return Err(DataFusionError::Internal("ClusterAggregateTopKUpper expects its physical input to be a DummyTopKLowerExec".to_owned()));
+            };
+
+            Ok(Some(plan_topk(
+                planner,
+                self,
+                topk_upper,
+                lower_node,
+                lower_input.clone(),
+                state,
+            )?))
+        } else if let Some(_) = node.as_any().downcast_ref::<PanicWorkerNode>() {
+            assert_eq!(inputs.len(), 0);
+            Ok(Some(plan_panic_worker()?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+impl CubeExtensionPlanner {
+    pub fn plan_cluster_send(
+        &self,
+        input: Arc<dyn ExecutionPlan>,
+        snapshots: &Vec<Snapshots>,
+        use_streaming: bool,
+        max_batch_rows: usize,
+        limit_and_reverse: Option<(usize, bool)>,
+        worker_sort_and_limit: Option<WorkerSortAndLimit>,
+        logical_plan_to_send: Option<&LogicalPlan>,
+        required_input_ordering: Option<LexRequirement>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        if snapshots.is_empty() {
+            return Ok(Arc::new(EmptyExec::new(input.schema())));
+        }
+        // Note that MergeExecs are added automatically when needed.
+        if let Some(c) = self.cluster.as_ref() {
+            Ok(Arc::new(ClusterSendExec::new(
+                c.clone(),
+                if let Some(logical_plan_to_send) = logical_plan_to_send {
+                    Arc::new(
+                        self.serialized_plan
+                            .replace_logical_plan(logical_plan_to_send.clone())?,
+                    )
+                } else {
+                    self.serialized_plan.clone()
+                },
+                snapshots,
+                input,
+                use_streaming,
+                limit_and_reverse,
+                worker_sort_and_limit,
+                required_input_ordering,
+                self.planning_flags,
+            )?))
+        } else {
+            let worker_partition_count = self.worker_partition_count.expect(
+                "worker_partition_count must be set when CubeExtensionPlanner::cluster is None",
+            );
+            Ok(Arc::new(WorkerExec::new(
+                input,
+                max_batch_rows,
+                limit_and_reverse,
+                required_input_ordering,
+                worker_sort_and_limit,
+                worker_partition_count,
+            )))
+        }
+    }
+}
+
+/// Produced on the worker, marks the subplan that the worker must execute. Anything above is the
+/// router part of the plan and must be ignored.
+#[derive(Debug)]
+pub struct WorkerExec {
+    pub input: Arc<dyn ExecutionPlan>,
+    pub max_batch_rows: usize,
+    pub limit_and_reverse: Option<(usize, bool)>,
+    pub required_input_ordering: Option<LexRequirement>,
+    pub worker_sort_and_limit: Option<WorkerSortAndLimit>,
+    properties: PlanProperties,
+}
+
+impl WorkerExec {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        max_batch_rows: usize,
+        limit_and_reverse: Option<(usize, bool)>,
+        required_input_ordering: Option<LexRequirement>,
+        worker_sort_and_limit: Option<WorkerSortAndLimit>,
+        worker_partition_count: usize,
+    ) -> WorkerExec {
+        // This, importantly, gives us the same PlanProperties as ClusterSendExec.
+        let properties =
+            ClusterSendExec::compute_properties(input.properties(), worker_partition_count);
+        WorkerExec {
+            input,
+            max_batch_rows,
+            limit_and_reverse,
+            required_input_ordering,
+            worker_sort_and_limit,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for WorkerExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        write!(f, "WorkerExec")
+    }
+}
+
+#[async_trait]
+impl ExecutionPlan for WorkerExec {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        assert_eq!(children.len(), 1);
+        let input = children.into_iter().next().unwrap();
+        let properties: PlanProperties = ClusterSendExec::compute_properties(
+            input.properties(),
+            self.properties.output_partitioning().partition_count(),
+        );
+        Ok(Arc::new(WorkerExec {
+            input,
+            max_batch_rows: self.max_batch_rows,
+            limit_and_reverse: self.limit_and_reverse.clone(),
+            required_input_ordering: self.required_input_ordering.clone(),
+            worker_sort_and_limit: self.worker_sort_and_limit.clone(),
+            properties,
+        }))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream, DataFusionError> {
+        self.input.execute(partition, context)
+    }
+
+    fn name(&self) -> &str {
+        "WorkerExec"
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn required_input_distribution(&self) -> Vec<Distribution> {
+        vec![Distribution::SinglePartition; self.children().len()]
+    }
+
+    fn required_input_ordering(&self) -> Vec<Option<LexRequirement>> {
+        vec![self.required_input_ordering.clone()]
+    }
+
+    fn maintains_input_order(&self) -> Vec<bool> {
+        // TODO upgrade DF: If the WorkerExec has the number of partitions so it can produce the same output, we could occasionally return true.
+        // vec![self.input_for_optimizations.output_partitioning().partition_count() <= 1]
+
+        // For now, same as default implementation:
+        vec![false]
+    }
+}
+
+/// Use this to pick the part of the plan that the worker must execute.
+pub fn get_worker_plan(
+    p: &Arc<dyn ExecutionPlan>,
+) -> Option<(Arc<dyn ExecutionPlan>, /*max_batch_rows*/ usize)> {
+    if let Some(p) = p.as_any().downcast_ref::<WorkerExec>() {
+        return Some((p.input.clone(), p.max_batch_rows));
+    } else {
+        let children = p.children();
+        // We currently do not split inside joins or leaf nodes.
+        if children.len() != 1 {
+            return None;
+        } else {
+            return get_worker_plan(&children[0]);
+        }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
+    use datafusion::datasource::DefaultTableSource;
+    use datafusion::sql::parser::Statement as DFStatement;
+    use datafusion::sql::planner::{ContextProvider, SqlToRel};
+    use itertools::Itertools;
+    use pretty_assertions::assert_eq;
+
+    use crate::config::Config;
+    use crate::metastore::multi_index::MultiPartition;
+    use crate::metastore::table::{Table, TablePath};
+    use crate::metastore::{Chunk, Column, ColumnType, IdRow, Index, Partition, Schema};
+    use crate::queryplanner::planning::{
+        choose_index, choose_index_ext, try_extract_cluster_send, PlanIndexStore, Snapshot,
+    };
+    use crate::queryplanner::pretty_printers::PPOptions;
+    use crate::queryplanner::query_executor::ClusterSendExec;
+    use crate::queryplanner::serialized_plan::RowRange;
+    use crate::queryplanner::{
+        pretty_printers, sql_to_rel_options, CubeTableLogical, QueryPlannerImpl,
+    };
+    use crate::sql::parser::{CubeStoreParser, Statement};
+    use crate::table::{Row, TableValue};
+    use crate::CubeError;
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::config::ConfigOptions;
+    use datafusion::error::DataFusionError;
+    use datafusion::execution::{SessionState, SessionStateBuilder};
+    use datafusion::logical_expr::{AggregateUDF, LogicalPlan, ScalarUDF, TableSource, WindowUDF};
+    use datafusion::prelude::SessionConfig;
+    use datafusion::sql::TableReference;
+    use std::collections::HashMap;
+    use std::iter::FromIterator;
+
+    #[tokio::test]
+    pub async fn test_union_all_chain_is_flat() {
+        let indices = default_indices();
+        let sql = "SELECT order_id FROM s.Orders \
+             UNION ALL SELECT 1 AS order_id \
+             UNION ALL SELECT customer_id AS order_id FROM s.Customers \
+             UNION ALL SELECT order_customer AS order_id FROM s.Orders";
+
+        // The chain must be flat before type coercion; flattening after it is quadratic.
+        let state = QueryPlannerImpl::make_execution_context(SessionConfig::new()).state();
+        let flatten = &state.analyzer().rules[0];
+        assert_eq!(flatten.name(), "flatten_union");
+        let plan = flatten
+            .analyze(unoptimized_plan(sql, &indices), &ConfigOptions::new())
+            .unwrap();
+        let LogicalPlan::Union(union) = &plan else {
+            panic!("expected a union, got {}", pretty_printers::pp_plan(&plan));
+        };
+        assert_eq!(union.inputs.len(), 4);
+        assert!(union
+            .inputs
+            .iter()
+            .all(|i| !matches!(i.as_ref(), LogicalPlan::Union(_))));
+
+        let plan = initial_plan(sql, &indices);
+        assert_eq!(
+            pretty_printers::pp_plan(&plan),
+            "Union, schema: fields:[s.Orders.order_id], metadata:{}\
+            \n  Scan s.Orders, source: CubeTableLogical, fields: [order_id]\
+            \n  Projection, [order_id]\
+            \n    Empty\
+            \n  Projection, [order_id]\
+            \n    Scan s.Customers, source: CubeTableLogical, fields: [customer_id]\
+            \n  Projection, [order_id]\
+            \n    Scan s.Orders, source: CubeTableLogical, fields: [order_customer]"
+        );
+        assert_eq!(plan.schema().field(0).data_type(), &DataType::Int64);
+
+        // Inputs of different types are coerced level by level, as without the rule.
+        let sql = "SELECT order_id FROM s.Orders \
+             UNION ALL SELECT 1.5 AS order_id \
+             UNION ALL SELECT order_customer AS order_id FROM s.Orders";
+        let plan = flatten
+            .analyze(unoptimized_plan(sql, &indices), &ConfigOptions::new())
+            .unwrap();
+        let LogicalPlan::Union(union) = &plan else {
+            panic!("expected a union, got {}", pretty_printers::pp_plan(&plan));
+        };
+        assert_eq!(union.inputs.len(), 2);
+        assert!(matches!(union.inputs[0].as_ref(), LogicalPlan::Union(_)));
+    }
+
+    #[tokio::test]
+    pub async fn test_prune_union_columns() {
+        let indices = default_indices();
+        let state = QueryPlannerImpl::make_execution_context(SessionConfig::new()).state();
+        let union_widths = |sql: &str| {
+            let plan = state
+                .analyzer()
+                .execute_and_check(
+                    unoptimized_plan(sql, &indices),
+                    state.config_options(),
+                    |_, _| {},
+                )
+                .unwrap();
+            let mut widths = Vec::new();
+            plan.apply(|p| {
+                if let LogicalPlan::Union(u) = p {
+                    widths.push(u.schema.fields().len());
+                    widths.extend(u.inputs.iter().map(|i| i.schema().fields().len()));
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .unwrap();
+            widths
+        };
+        let union = "SELECT * FROM s.Orders UNION ALL SELECT * FROM s.Orders";
+
+        assert_eq!(
+            union_widths(&format!(
+                "SELECT order_customer, SUM(order_amount) FROM ({union}) AS o \
+                 WHERE o.order_city > 1 GROUP BY 1 ORDER BY 2 LIMIT 10"
+            )),
+            vec![3, 3, 3]
+        );
+        assert_eq!(
+            union_widths(&format!("SELECT count(*) FROM ({union}) AS o")),
+            vec![1, 1, 1]
+        );
+        assert_eq!(
+            union_widths(&format!("SELECT * FROM ({union}) AS o")),
+            vec![5, 5, 5]
+        );
+        // Narrowing a distinct union would change what it deduplicates on.
+        assert_eq!(
+            union_widths(
+                "SELECT order_customer FROM (SELECT * FROM s.Orders UNION SELECT * FROM s.Orders) AS o"
+            ),
+            vec![5, 5, 5]
+        );
+        // Same-named columns from both sides of a join.
+        assert_eq!(
+            union_widths(
+                "SELECT order_id FROM (\
+                 SELECT o1.order_id, o2.order_id, o1.order_amount FROM s.Orders o1 \
+                 JOIN s.Orders o2 ON o1.order_id = o2.order_id \
+                 UNION ALL \
+                 SELECT o1.order_id, o2.order_id, o1.order_amount FROM s.Orders o1 \
+                 JOIN s.Orders o2 ON o1.order_id = o2.order_id) AS o"
+            ),
+            vec![1, 1, 1]
+        );
+        // A join reads columns of the union outside the projection chain.
+        assert_eq!(
+            union_widths(&format!(
+                "SELECT customer_name FROM ({union}) AS o \
+                 JOIN s.Customers c ON o.order_customer = c.customer_id"
+            )),
+            vec![5, 5, 5]
+        );
+
+        let plan = initial_plan(
+            &format!("SELECT order_customer, SUM(order_amount) FROM ({union}) AS o GROUP BY 1"),
+            &indices,
+        );
+        assert_eq!(
+            pretty_printers::pp_plan(&plan),
+            "Aggregate\
+            \n  SubqueryAlias\
+            \n    Union, schema: fields:[o.order_customer, o.order_amount], metadata:{}\
+            \n      SubqueryAlias\
+            \n        Scan s.Orders, source: CubeTableLogical, fields: [order_customer, order_amount]\
+            \n      SubqueryAlias\
+            \n        Scan s.Orders, source: CubeTableLogical, fields: [order_customer, order_amount]"
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_choose_index() {
+        let indices = default_indices();
+        let plan = initial_plan("SELECT * FROM s.Customers WHERE customer_id = 1", &indices);
+        assert_eq!(
+            pretty_printers::pp_plan(&plan),
+            "Filter\
+            \n  Scan s.Customers, source: CubeTableLogical, fields: *"
+        );
+
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        assert_eq!(
+            pretty_printers::pp_plan(&plan),
+            "ClusterSend, indices: [[0]]\
+            \n  Filter\
+            \n    Scan s.Customers, source: CubeTable(index: default:0:[]:sort_on[customer_id]), fields: *"
+        );
+
+        let plan = initial_plan(
+            "SELECT order_customer, order_id \
+             FROM s.Orders \
+             GROUP BY order_customer, order_id
+             ",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "Aggregate\
+            \n  ClusterSend, indices: [[2]]\
+            \n    Scan s.Orders, source: CubeTable(index: default:2:[]:sort_on[order_id, order_customer]), fields: [order_id, order_customer]";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+        let plan = initial_plan(
+            "SELECT order_customer, order_id \
+             FROM s.Orders \
+             GROUP BY order_id, order_customer
+             ",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "Projection, [s.Orders.order_customer:order_customer, s.Orders.order_id:order_id]\
+            \n  Aggregate\
+            \n    ClusterSend, indices: [[2]]\
+            \n      Scan s.Orders, source: CubeTable(index: default:2:[]:sort_on[order_id, order_customer]), fields: [order_id, order_customer]";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+
+        let plan = initial_plan(
+            "SELECT order_customer, order_id \
+             FROM s.Orders \
+             WHERE order_customer = 'ffff'
+             GROUP BY order_customer, order_id
+             ",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "Aggregate\
+            \n  ClusterSend, indices: [[3]]\
+            \n    Filter\
+            \n      Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer, order_id]), fields: [order_id, order_customer]";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+
+        let plan = initial_plan(
+            "SELECT order_customer, order_id \
+             FROM s.Orders \
+             WHERE order_customer = 'ffff'
+             GROUP BY order_id, order_customer
+             ",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "Projection, [s.Orders.order_customer:order_customer, s.Orders.order_id:order_id]\
+            \n  Aggregate\
+            \n    ClusterSend, indices: [[3]]\
+            \n      Filter\
+            \n        Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer, order_id]), fields: [order_id, order_customer]";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+
+        let plan = initial_plan(
+            "SELECT order_customer, order_id \
+             FROM s.Orders \
+             WHERE order_customer = 'ffff'
+             GROUP BY order_id, order_customer, order_product
+             ",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+
+        let expected =
+            "Projection, [s.Orders.order_customer:order_customer, s.Orders.order_id:order_id]\
+            \n  Aggregate\
+            \n    ClusterSend, indices: [[2]]\
+            \n      Filter\
+            \n        Scan s.Orders, source: CubeTable(index: default:2:[]:sort_on[order_id, order_customer, order_product]), fields: [order_id, order_customer, order_product]";
+
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+
+        //Should prefer a non-default index for joins.
+        let plan = initial_plan(
+            "SELECT order_id, order_amount, customer_name \
+             FROM s.Orders \
+             JOIN s.Customers ON order_customer = customer_id",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "ClusterSend, indices: [[3], [0]]\
+            \n  Projection, [s.Orders.order_id:order_id, s.Orders.order_amount:order_amount, s.Customers.customer_name:customer_name]\
+            \n    Join on: [s.Orders.order_customer = s.Customers.customer_id]\
+            \n      Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_id, order_customer, order_amount]\
+            \n      Scan s.Customers, source: CubeTable(index: default:0:[]:sort_on[customer_id]), fields: [customer_id, customer_name]";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+
+        let plan = initial_plan(
+            "SELECT order_id, customer_name, product_name \
+             FROM s.Orders \
+             JOIN s.Customers on order_customer = customer_id \
+             JOIN s.Products ON order_product = product_id",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "ClusterSend, indices: [[3], [0], [5]]\
+            \n  Projection, [s.Orders.order_id:order_id, s.Customers.customer_name:customer_name, s.Products.product_name:product_name]\
+            \n    Join on: [s.Orders.order_product = s.Products.product_id]\
+            \n      Projection, [s.Orders.order_id:order_id, s.Orders.order_product:order_product, s.Customers.customer_name:customer_name]\
+            \n        Join on: [s.Orders.order_customer = s.Customers.customer_id]\
+            \n          Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_id, order_customer, order_product]\
+            \n          Scan s.Customers, source: CubeTable(index: default:0:[]:sort_on[customer_id]), fields: [customer_id, customer_name]\
+            \n      Scan s.Products, source: CubeTable(index: default:5:[]:sort_on[product_id]), fields: *";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+
+        let plan = initial_plan(
+            "SELECT c2.customer_name \
+             FROM s.Orders \
+             JOIN s.Customers c1 on order_customer = c1.customer_id \
+             JOIN s.Customers c2 ON order_city = c2.customer_city \
+             WHERE c1.customer_name = 'Customer 1'",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let expected =
+            "ClusterSend, indices: [[3], [0], [1]]\
+            \n  Projection, [c2.customer_name:customer_name]\
+            \n    Join on: [s.Orders.order_city = c2.customer_city]\
+            \n      Projection, [s.Orders.order_city:order_city]\
+            \n        Join on: [s.Orders.order_customer = c1.customer_id]\
+            \n          Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_customer, order_city]\
+            \n          SubqueryAlias\
+            \n            Projection, [s.Customers.customer_id:customer_id]\
+            \n              Filter\
+            \n                Scan s.Customers, source: CubeTable(index: default:0:[]:sort_on[customer_id]), fields: [customer_id, customer_name]\
+            \n      SubqueryAlias\
+            \n        Scan s.Customers, source: CubeTable(index: by_city:1:[]:sort_on[customer_city]), fields: [customer_name, customer_city]";
+        assert_eq!(pretty_printers::pp_plan(&plan), expected);
+    }
+
+    #[tokio::test]
+    pub async fn test_materialize_topk() {
+        let indices = default_indices();
+        let plan = initial_plan(
+            "SELECT order_customer, SUM(order_amount) FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+
+        assert_eq!(
+            pretty_printers::pp_plan(&plan),
+            "ClusterAggregateTopK, limit: 10\
+            \n  Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_customer, order_amount]"
+        );
+
+        // Projections should be handled properly.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 10",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        assert_eq!(
+            pretty_printers::pp_plan(&plan),
+            "Projection, [customer, amount]\
+           \n  ClusterAggregateTopK, limit: 10\
+           \n    Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_customer, order_amount]"
+        );
+
+        let plan = initial_plan(
+            "SELECT SUM(order_amount) `amount`, order_customer `customer` FROM s.Orders \
+             GROUP BY 2 ORDER BY 1 DESC NULLS LAST LIMIT 10",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let mut with_sort_by = PPOptions::default();
+        with_sort_by.show_sort_by = true;
+        assert_eq!(
+            pretty_printers::pp_plan_ext(&plan, &with_sort_by),
+            "Projection, [amount, customer]\
+           \n  ClusterAggregateTopK, limit: 10, sortBy: [2 desc nulls last]\
+           \n    Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_customer, order_amount]"
+        );
+
+        // Ascending order is also ok.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 ASC LIMIT 10",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        assert_eq!(
+            pretty_printers::pp_plan_ext(&plan, &with_sort_by),
+            "Projection, [customer, amount]\
+           \n  ClusterAggregateTopK, limit: 10, sortBy: [2 nulls last]\
+           \n    Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_customer, order_amount]"
+        );
+
+        // MAX and MIN are ok, as well as multiple aggregation.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount`, \
+                    MIN(order_amount) `min_amount`, MAX(order_amount) `max_amount` \
+             FROM s.Orders \
+             GROUP BY 1 ORDER BY 3 DESC NULLS LAST, 2 ASC LIMIT 10",
+            &indices,
+        );
+        let mut verbose = with_sort_by;
+        verbose.show_aggregations = true;
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        assert_eq!(
+            pretty_printers::pp_plan_ext(&plan, &verbose),
+            "Projection, [customer, amount, min_amount, max_amount]\
+           \n  ClusterAggregateTopK, limit: 10, aggs: [sum(s.Orders.order_amount), min(s.Orders.order_amount), max(s.Orders.order_amount)], sortBy: [3 desc nulls last, 2 nulls last]\
+           \n    Scan s.Orders, source: CubeTable(index: by_customer:3:[]:sort_on[order_customer]), fields: [order_customer, order_amount]"
+        );
+
+        // Should not introduce TopK by mistake in unsupported cases.
+        // No 'order by'.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 LIMIT 10",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+
+        // No limit.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 DESC",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+
+        // Sort by group key, not the aggregation result.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 1 DESC LIMIT 10",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+
+        // Unsupported aggregation function.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, AVG(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, COUNT(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+
+        // Distinct aggregations.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(DISTINCT order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY 2 DESC LIMIT 10",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+
+        // Complicated sort expressions.
+        let plan = initial_plan(
+            "SELECT order_customer `customer`, SUM(order_amount) `amount` FROM s.Orders \
+             GROUP BY 1 ORDER BY amount * amount  DESC LIMIT 10",
+            &indices,
+        );
+        let pp = pretty_printers::pp_plan(&choose_index(plan, &indices).await.unwrap().0);
+        assert!(!pp.contains("TopK"), "plan contained topk:\n{}", pp);
+    }
+
+    #[tokio::test]
+    pub async fn test_partitioned_index_join() {
+        let mut indices = indices_with_partitioned_index();
+        let plan = initial_plan(
+            "SELECT customer_name, order_city FROM s.Orders JOIN s.Customers \
+               ON order_customer = customer_id",
+            &indices,
+        );
+
+        let pp = pretty_printers::pp_plan(&choose_index(plan.clone(), &indices).await.unwrap().0);
+        assert_eq!(pp, "ClusterSend, indices: [[6], [2]]\
+                      \n  Projection, [s.Customers.customer_name:customer_name, s.Orders.order_city:order_city]\
+                      \n    Join on: [s.Orders.order_customer = s.Customers.customer_id]\
+                      \n      Scan s.Orders, source: CubeTable(index: #mi0:6:[]:sort_on[order_customer]), fields: [order_customer, order_city]\
+                      \n      Scan s.Customers, source: CubeTable(index: #mi0:2:[]:sort_on[customer_id]), fields: [customer_id, customer_name]");
+
+        // Add some multi-partitions and validate how it runs.
+        indices
+            .multi_partitions
+            .push(MultiPartition::new_root(0).set_active(false));
+        indices.multi_partitions.push(
+            MultiPartition::new_child(
+                &indices.get_multi_partition(0),
+                None,
+                Some(Row::new(vec![TableValue::Int(100)])),
+            )
+            .set_active(false),
+        );
+        indices.multi_partitions.push(
+            MultiPartition::new_child(
+                &indices.get_multi_partition(0),
+                Some(Row::new(vec![TableValue::Int(100)])),
+                None,
+            )
+            .set_active(true),
+        );
+        indices.multi_partitions.push(
+            MultiPartition::new_child(
+                &indices.get_multi_partition(1),
+                None,
+                Some(Row::new(vec![TableValue::Int(25)])),
+            )
+            .set_active(true),
+        );
+        indices.multi_partitions.push(
+            MultiPartition::new_child(
+                &indices.get_multi_partition(1),
+                Some(Row::new(vec![TableValue::Int(25)])),
+                Some(Row::new(vec![TableValue::Int(100)])),
+            )
+            .set_active(true),
+        );
+        for i in 0..indices.indices.len() {
+            // This name marks indices for multi-index.
+            if indices.indices[i].get_name() == "#mi0" {
+                add_multipart_partitions(
+                    i as u64,
+                    &indices.multi_partitions,
+                    &mut indices.partitions,
+                );
+            }
+        }
+        for p in 0..indices.partitions.len() {
+            indices
+                .chunks
+                .push(Chunk::new(p as u64, 123, None, None, false).set_uploaded(true));
+        }
+
+        // Plan again.
+        let (with_index, meta) = choose_index(plan, &indices).await.unwrap();
+        let pp = pretty_printers::pp_plan(&with_index);
+        assert_eq!(pp, "ClusterSend, indices: [[6], [2]]\
+                      \n  Projection, [s.Customers.customer_name:customer_name, s.Orders.order_city:order_city]\
+                      \n    Join on: [s.Orders.order_customer = s.Customers.customer_id]\
+                      \n      Scan s.Orders, source: CubeTable(index: #mi0:6:[5, 6, 7, 8, 9]:sort_on[order_customer]), fields: [order_customer, order_city]\
+                      \n      Scan s.Customers, source: CubeTable(index: #mi0:2:[0, 1, 2, 3, 4]:sort_on[customer_id]), fields: [customer_id, customer_name]");
+
+        let c = Config::test("partitioned_index_join").update_config(|mut c| {
+            c.server_name = "router".to_string();
+            c.select_workers = vec!["worker1".to_string(), "worker2".to_string()];
+            c
+        });
+        let cs = &try_extract_cluster_send(&with_index).unwrap().snapshots;
+        let assigned = ClusterSendExec::distribute_to_workers(
+            c.config_obj().as_ref(),
+            &cs,
+            &meta.multi_part_subtree,
+        )
+        .unwrap();
+
+        let part = |id: u64, start: Option<i64>, end: Option<i64>| {
+            let start = start.map(|i| Row::new(vec![TableValue::Int(i)]));
+            let end = end.map(|i| Row::new(vec![TableValue::Int(i)]));
+            (id, RowRange { start, end })
+        };
+        assert_eq!(
+            assigned,
+            vec![
+                (
+                    "worker1".to_string(),
+                    (
+                        vec![
+                            part(2, None, None),
+                            part(7, None, None),
+                            part(0, Some(100), None),
+                            part(5, Some(100), None),
+                            part(3, None, None),
+                            part(8, None, None),
+                            part(1, None, Some(25)),
+                            part(6, None, Some(25)),
+                            part(0, None, Some(25)),
+                            part(5, None, Some(25)),
+                        ],
+                        vec![]
+                    )
+                ),
+                (
+                    "worker2".to_string(),
+                    (
+                        vec![
+                            part(4, None, None),
+                            part(9, None, None),
+                            part(1, Some(25), Some(100)),
+                            part(6, Some(25), Some(100)),
+                            part(0, Some(25), Some(100)),
+                            part(5, Some(25), Some(100)),
+                        ],
+                        vec![]
+                    )
+                )
+            ]
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_ordinary_partition_join_distribution() {
+        let mut indices = default_indices();
+
+        // Plan a join query without partitioned indices.
+        let plan = initial_plan(
+            "SELECT customer_name, order_city FROM s.Orders JOIN s.Customers \
+               ON order_customer = customer_id",
+            &indices,
+        );
+
+        let (with_index, meta) = choose_index(plan.clone(), &indices).await.unwrap();
+        let pp = pretty_printers::pp_plan(&with_index);
+        // Verify we get a join plan with ClusterSend.
+        assert!(pp.contains("Join on:"), "Expected join in plan: {}", pp);
+        assert!(
+            pp.contains("ClusterSend"),
+            "Expected ClusterSend in plan: {}",
+            pp
+        );
+
+        // Without partitions/chunks there's nothing to distribute.
+        assert!(
+            meta.multi_part_subtree.is_empty(),
+            "Expected no multi-partitions for ordinary join"
+        );
+
+        // Now add multiple ordinary partitions per index to simulate rollup join scenario.
+        // Index 3 = by_customer for Orders, Index 0 = default for Customers.
+        // Add 3 partitions for Orders (index 3).
+        for _ in 0..3 {
+            let p = Partition::new(3, None, None, None).to_active(true);
+            indices.partitions.push(p);
+        }
+        // Add 2 partitions for Customers (index 0).
+        for _ in 0..2 {
+            let p = Partition::new(0, None, None, None).to_active(true);
+            indices.partitions.push(p);
+        }
+        // Add chunks for each partition.
+        for p in 0..indices.partitions.len() {
+            indices
+                .chunks
+                .push(Chunk::new(p as u64, 123, None, None, false).set_uploaded(true));
+        }
+
+        // Plan again with partitions.
+        let (with_index, meta) = choose_index(plan, &indices).await.unwrap();
+        assert!(
+            meta.multi_part_subtree.is_empty(),
+            "Expected no multi-partitions for ordinary join"
+        );
+
+        let c = Config::test("ordinary_partition_join").update_config(|mut c| {
+            c.server_name = "router".to_string();
+            c.select_workers = vec!["worker1".to_string(), "worker2".to_string()];
+            c
+        });
+        let cs = &try_extract_cluster_send(&with_index).unwrap().snapshots;
+        let assigned = ClusterSendExec::distribute_to_workers(
+            c.config_obj().as_ref(),
+            &cs,
+            &meta.multi_part_subtree,
+        )
+        .unwrap();
+
+        // Only root (Orders, 3 partitions) is split; right tables (Customers, 2)
+        // are included whole.  Budget = 5 - 2 = 3, root fits in one chunk.
+        let total_partition_entries: usize = assigned
+            .iter()
+            .map(|(_, (partitions, _))| partitions.len())
+            .sum();
+        assert_eq!(
+            total_partition_entries, 5,
+            "Expected 1 batch with 3+2=5 partitions, got {}. Assigned: {:?}",
+            total_partition_entries, assigned
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_ordinary_partition_3_table_join_distribution() {
+        let mut indices = default_indices();
+
+        // 3-table join: Orders JOIN Customers JOIN Products
+        let plan = initial_plan(
+            "SELECT customer_name, order_city, product_name \
+               FROM s.Orders \
+               JOIN s.Customers ON order_customer = customer_id \
+               JOIN s.Products ON order_product = product_id",
+            &indices,
+        );
+
+        let (with_index, _meta) = choose_index(plan.clone(), &indices).await.unwrap();
+        let pp = pretty_printers::pp_plan(&with_index);
+        assert!(pp.contains("Join on:"), "Expected join in plan: {}", pp);
+
+        // Add partitions: Orders(3), Customers(2), Products(1).
+        // Index 3 = by_customer for Orders, Index 0 = default for Customers.
+        // For the 3-table join the planner picks indices based on join keys.
+        // We need to find which indices are actually used.
+        let cs_node = try_extract_cluster_send(&with_index).unwrap();
+
+        // Collect index IDs used in the plan.
+        let mut used_index_ids = Vec::new();
+        for union in &cs_node.snapshots {
+            for snap in union {
+                match snap {
+                    Snapshot::Index(idx) => used_index_ids.push(idx.index.get_id()),
+                    _ => {}
+                }
+            }
+        }
+
+        // Add partitions for each used index.
+        // Orders gets 3 partitions, Customers gets 2, Products gets 1.
+        let partition_counts = vec![3usize, 2, 1];
+        for (i, &count) in used_index_ids.iter().zip(partition_counts.iter()) {
+            for _ in 0..count {
+                let p = Partition::new(*i, None, None, None).to_active(true);
+                indices.partitions.push(p);
+            }
+        }
+        for p in 0..indices.partitions.len() {
+            indices
+                .chunks
+                .push(Chunk::new(p as u64, 123, None, None, false).set_uploaded(true));
+        }
+
+        // Plan again with partitions.
+        let (with_index, meta) = choose_index(plan, &indices).await.unwrap();
+        assert!(meta.multi_part_subtree.is_empty());
+
+        let c = Config::test("ordinary_3_table_join").update_config(|mut c| {
+            c.server_name = "router".to_string();
+            c.select_workers = vec!["worker1".to_string(), "worker2".to_string()];
+            c
+        });
+        let cs = &try_extract_cluster_send(&with_index).unwrap().snapshots;
+        let assigned = ClusterSendExec::distribute_to_workers(
+            c.config_obj().as_ref(),
+            &cs,
+            &meta.multi_part_subtree,
+        )
+        .unwrap();
+
+        // Only root (Orders, 3 partitions) is split; right tables
+        // (Customers 2 + Products 1 = 3) are whole in every batch.
+        // Budget = 5 - 3 = 2, root chunks: [0,1] and [2].
+        //   Batch 1: Orders[0,1] + Customers(2) + Products(1) = 5
+        //   Batch 2: Orders[2]   + Customers(2) + Products(1) = 4
+        // Total: 9 partition entries in 2 batches.
+        let total_partition_entries: usize = assigned
+            .iter()
+            .map(|(_, (partitions, _))| partitions.len())
+            .sum();
+        assert_eq!(
+            total_partition_entries, 9,
+            "Expected 2 batches with 5+4=9 partitions, got {}. Assigned: {:?}",
+            total_partition_entries, assigned
+        );
+    }
+
+    /// The limit-pushdown descriptors every `ClusterSend` in the chosen plan carries, as printed
+    /// lines. One line per `ClusterSend`, so a plan with several of them (a nested aggregate, a
+    /// join) shows what each one got.
+    async fn limit_pushdown_of(sql: &str, indices: &TestIndices) -> Vec<String> {
+        limit_pushdown_of_ext(sql, indices, true).await
+    }
+
+    async fn limit_pushdown_of_ext(
+        sql: &str,
+        indices: &TestIndices,
+        limit_pushdown: bool,
+    ) -> Vec<String> {
+        let plan = initial_plan(sql, indices);
+        let plan = choose_index_ext(plan, indices, /* enable_topk */ true, limit_pushdown)
+            .await
+            .unwrap()
+            .0;
+        let mut opts = PPOptions::none();
+        opts.show_limit_pushdown = true;
+        pretty_printers::pp_plan_ext(&plan, &opts)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| l.starts_with("ClusterSend"))
+            .collect()
+    }
+
+    /// A `LIMIT` bounds the rows of the relation it sits on. The worker pushdown lands on the
+    /// aggregate nearest the scan, so it is sound only while that aggregate is the one the limit
+    /// counts the rows of. These are the shapes where it is and is not.
+    #[tokio::test]
+    pub async fn test_limit_pushdown_scope() {
+        let indices = default_indices();
+
+        // Owning aggregate, ORDER BY on the index sort prefix: the limit rides the index.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(order_amount) FROM s.Orders \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 10, reverse: false"]
+        );
+
+        // Owning aggregate, ORDER BY on a group column that is not an index prefix: the bounded
+        // worker sort takes over, ordered by the ORDER BY column first then the rest of the key.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, order_customer, sum(order_amount) FROM s.Orders \
+                 GROUP BY 1, 2 ORDER BY 2 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec![
+                "ClusterSend, indices: [[2]], worker_sort: [1 asc nulls last, 0 asc nulls first], worker_fetch: 10"
+            ]
+        );
+
+        // Owning aggregate, bare LIMIT: the total order is the group key in group-by order.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(order_amount) FROM s.Orders GROUP BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 10, reverse: false"]
+        );
+
+        // A UNION below the owning aggregate keeps the pushdown: the union of the branches' first
+        // `limit` groups contains the global first `limit`, and the router re-cuts.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(order_amount) FROM \
+                 (SELECT order_id, order_amount FROM s.Orders \
+                  UNION ALL SELECT order_id, order_amount FROM s.Orders) u \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2, 2]], limit: 10, reverse: false"]
+        );
+
+        // Nested aggregate: the limit counts the OUTER aggregate's groups, so bounding the inner
+        // one drops rows the outer one still needs.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(v) FROM \
+                 (SELECT order_id, order_customer, sum(order_amount) v FROM s.Orders \
+                  GROUP BY 1, 2) i \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]]"]
+        );
+
+        // Same with an expression in the inner group key. `group_expr_to_column_names` fails on it,
+        // and the outer aggregate's keys must not be inherited in its place -- the descriptor would
+        // then index the inner aggregate's key by the outer one's positions.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT k, sum(v) FROM \
+                 (SELECT order_id + 1 k, order_customer, sum(order_amount) v FROM s.Orders \
+                  GROUP BY 1, 2) i \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]]"]
+        );
+
+        // An aggregate inside a join branch: the join drops and multiplies rows, so the query's
+        // limit does not bound either input.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT x.order_id, sum(x.v) FROM \
+                 (SELECT order_id, sum(order_amount) v FROM s.Orders GROUP BY 1) x \
+                 JOIN s.Customers c ON x.order_id = c.customer_id \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]]", "ClusterSend, indices: [[0]]",]
+        );
+
+        // An inner LIMIT starts a new scope: the aggregate nearest below it owns that limit, even
+        // though an outer aggregate already claimed an outer one. Bounding the inner aggregate to
+        // its own 5 is sound, so the pushdown stays.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(v) FROM \
+                 (SELECT order_id, sum(order_amount) v FROM s.Orders \
+                  GROUP BY 1 ORDER BY 1 LIMIT 5) i \
+                 GROUP BY 1",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 5, reverse: false"]
+        );
+
+        // No aggregate at all: no group key to bound, so no descriptor today either. Pinned so the
+        // scoping change is not mistaken for having removed one.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id FROM s.Orders ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]]"]
+        );
+
+        // DataFusion drops an ORDER BY inside the aggregate's input before we ever see it, so
+        // there is no inner sort to mistake for the query's order. Pinned so a DataFusion upgrade
+        // that starts keeping it fails here instead of silently flipping `reverse`.
+        for sql in [
+            "SELECT order_id, sum(order_amount) FROM \
+             (SELECT order_id, order_amount FROM s.Orders ORDER BY order_id DESC) i \
+             GROUP BY 1 ORDER BY 1 ASC LIMIT 10",
+            "SELECT order_id, sum(order_amount) FROM \
+             (SELECT order_id, order_amount FROM s.Orders ORDER BY order_id ASC) i \
+             GROUP BY 1 ORDER BY 1 ASC LIMIT 10",
+            "SELECT order_id, sum(order_amount) FROM \
+             (SELECT order_id, order_amount FROM s.Orders) i \
+             GROUP BY 1 ORDER BY 1 ASC LIMIT 10",
+        ] {
+            assert_eq!(
+                limit_pushdown_of(sql, &indices).await,
+                vec!["ClusterSend, indices: [[2]], limit: 10, reverse: false"],
+                "{}",
+                sql
+            );
+        }
+
+        // An inner LIMIT starts a new scope, so the outer ORDER BY DESC does not reach the inner
+        // relation -- reading its index from the tail on account of an order that describes a
+        // different relation.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(v) FROM \
+                 (SELECT order_id, order_customer, sum(order_amount) v FROM s.Orders \
+                  GROUP BY 1, 2 LIMIT 5) i \
+                 GROUP BY 1 ORDER BY order_id DESC LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 5, reverse: false"]
+        );
+
+        // The toggle has to actually remove the descriptor. Comparing results with it on and off
+        // cannot show that: they stay equal when the flag is ignored entirely, which is exactly how
+        // a newly threaded parameter fails.
+        assert_eq!(
+            limit_pushdown_of_ext(
+                "SELECT order_id, sum(order_amount) FROM s.Orders \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices,
+                false
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]]"]
+        );
+        assert_eq!(
+            limit_pushdown_of_ext(
+                "SELECT order_id, order_customer, sum(order_amount) FROM s.Orders \
+                 GROUP BY 1, 2 ORDER BY 2 LIMIT 10",
+                &indices,
+                false
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]]"]
+        );
+
+        // DISTINCT over a UNION feeding an outer aggregate -- the CORE-815 key-grid shape. Already
+        // clean here; pinned so it stays clean.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT m, count(*) FROM \
+                 (SELECT DISTINCT order_id, order_customer m FROM \
+                  (SELECT order_id, order_customer FROM s.Orders \
+                   UNION ALL SELECT order_id, order_customer FROM s.Orders) u) d \
+                 GROUP BY 1 ORDER BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2, 2]]"]
+        );
+    }
+
+    /// A bare `LIMIT` over plain rows is satisfied by any `limit` rows, so every worker may stop at
+    /// `limit` (plus the offset) of its own.
+    #[tokio::test]
+    pub async fn test_limit_pushdown_without_order_by_and_group_by() {
+        let indices = default_indices();
+
+        assert_eq!(
+            limit_pushdown_of("SELECT * FROM s.Orders LIMIT 10", &indices).await,
+            vec!["ClusterSend, indices: [[2]], limit: 10, reverse: false"]
+        );
+
+        assert_eq!(
+            limit_pushdown_of("SELECT * FROM s.Orders LIMIT 10 OFFSET 5", &indices).await,
+            vec!["ClusterSend, indices: [[2]], limit: 15, reverse: false"]
+        );
+
+        // DataFusion copies the limit into every UNION branch, so each one is cut on its own.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, order_amount FROM \
+                 (SELECT * FROM s.Orders UNION ALL SELECT * FROM s.Orders) u LIMIT 10",
+                &indices
+            )
+            .await,
+            vec![
+                "ClusterSend, indices: [[2]], limit: 10, reverse: false",
+                "ClusterSend, indices: [[2]], limit: 10, reverse: false"
+            ]
+        );
+
+        // The filter travels to the workers below the fetch, so the cut counts matching rows.
+        let plan = initial_plan(
+            "SELECT * FROM s.Orders WHERE order_customer = 1 LIMIT 10",
+            &indices,
+        );
+        let plan = choose_index(plan, &indices).await.unwrap().0;
+        let mut opts = PPOptions::none();
+        opts.show_limit_pushdown = true;
+        let lines = pretty_printers::pp_plan_ext(&plan, &opts)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .collect::<Vec<_>>();
+        let send = lines
+            .iter()
+            .position(|l| l.starts_with("ClusterSend"))
+            .unwrap();
+        let filter = lines.iter().position(|l| l.starts_with("Filter")).unwrap();
+        assert!(lines[send].ends_with("limit: 10, reverse: false"));
+        assert!(send < filter, "{:#?}", lines);
+
+        // The router sorts all rows before it cuts, so a per-worker cut would drop some of them.
+        for sql in [
+            "SELECT * FROM s.Orders ORDER BY order_amount LIMIT 10",
+            "SELECT * FROM s.Orders ORDER BY order_amount + 1 LIMIT 10",
+            "SELECT * FROM s.Orders ORDER BY order_id ASC, order_customer DESC LIMIT 10",
+        ] {
+            assert_eq!(
+                limit_pushdown_of(sql, &indices).await,
+                vec!["ClusterSend, indices: [[2]]"],
+                "{}",
+                sql
+            );
+        }
+
+        // An inner LIMIT below an ORDER BY has to produce all of its own rows for the sort to pick
+        // from, however few the outer limit keeps.
+        for sql in [
+            "SELECT * FROM (SELECT * FROM s.Orders LIMIT 100 OFFSET 50) i \
+             ORDER BY order_amount LIMIT 10",
+            "SELECT * FROM (SELECT * FROM s.Orders LIMIT 100 OFFSET 50) i \
+             ORDER BY order_amount + 1 LIMIT 10",
+        ] {
+            assert_eq!(
+                limit_pushdown_of(sql, &indices).await,
+                vec!["ClusterSend, indices: [[2]], limit: 150, reverse: false"],
+                "{}",
+                sql
+            );
+        }
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT * FROM (SELECT order_id, sum(order_amount) v FROM s.Orders \
+                 GROUP BY 1 LIMIT 100 OFFSET 50) i ORDER BY v LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 150, reverse: false"]
+        );
+
+        // Same for a filter or an aggregate between the two limits: the inner one keeps its own
+        // row count, and the outer predicate says nothing about the rows below it.
+        for sql in [
+            "SELECT * FROM (SELECT * FROM s.Orders LIMIT 100) i WHERE order_amount > 5 LIMIT 10",
+            "SELECT order_id, sum(order_amount) FROM (SELECT * FROM s.Orders LIMIT 100) i \
+             GROUP BY 1 LIMIT 10",
+            "SELECT order_id, sum(order_amount) FROM (SELECT * FROM s.Orders LIMIT 100) i \
+             WHERE order_customer = 1 GROUP BY 1 LIMIT 10",
+        ] {
+            assert_eq!(
+                limit_pushdown_of(sql, &indices).await,
+                vec!["ClusterSend, indices: [[2]], limit: 100, reverse: false"],
+                "{}",
+                sql
+            );
+        }
+        // Nothing but projections in between: the tighter limit wins.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id FROM (SELECT * FROM s.Orders LIMIT 100) i LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 10, reverse: false"]
+        );
+
+        // The limit counts the rows of the aggregate, not of the scan below it.
+        for sql in [
+            "SELECT count(*) FROM s.Orders LIMIT 10",
+            "SELECT order_id + 1, sum(order_amount) FROM s.Orders GROUP BY 1 LIMIT 10",
+            "SELECT DISTINCT order_amount FROM s.Orders LIMIT 10",
+        ] {
+            let pushdown = limit_pushdown_of(sql, &indices).await;
+            assert_eq!(pushdown.len(), 1, "{}", sql);
+            assert!(!pushdown[0].contains("limit:"), "{}: {:?}", sql, pushdown);
+        }
+
+        // Neither side of a join is bounded by the limit on its output.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT * FROM s.Orders o JOIN s.Customers c \
+                 ON o.order_customer = c.customer_id LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[3], [0]]"]
+        );
+
+        // An aggregate grouped by the index sort prefix owns the limit and rides the index.
+        assert_eq!(
+            limit_pushdown_of(
+                "SELECT order_id, sum(order_amount) FROM s.Orders GROUP BY 1 LIMIT 10",
+                &indices
+            )
+            .await,
+            vec!["ClusterSend, indices: [[2]], limit: 10, reverse: false"]
+        );
+
+        assert_eq!(
+            limit_pushdown_of_ext("SELECT * FROM s.Orders LIMIT 10", &indices, false).await,
+            vec!["ClusterSend, indices: [[2]]"]
+        );
+    }
+
+    fn default_indices() -> TestIndices {
+        make_test_indices(false)
+    }
+
+    fn indices_with_partitioned_index() -> TestIndices {
+        make_test_indices(true)
+    }
+
+    fn add_multipart_partitions(
+        index_id: u64,
+        multi_parts: &[MultiPartition],
+        partitions: &mut Vec<Partition>,
+    ) {
+        let first_part_i = partitions.len() as u64;
+        for i in 0..multi_parts.len() {
+            let mp = &multi_parts[i];
+            let mut p = Partition::new(
+                index_id,
+                Some(i as u64),
+                mp.min_row().cloned(),
+                mp.max_row().cloned(),
+            );
+            if let Some(parent) = mp.parent_multi_partition_id() {
+                assert!(parent <= multi_parts.len() as u64);
+                p = p.update_parent_partition_id(Some(first_part_i + parent));
+            }
+            if mp.active() {
+                p = p.to_warmed_up().to_active(true);
+            }
+
+            partitions.push(p);
+        }
+    }
+
+    /// Most tests in this module use this schema.
+    fn make_test_indices(add_multi_indices: bool) -> TestIndices {
+        const SCHEMA: u64 = 0;
+        const PARTITIONED_INDEX: u64 = 0; // Only 1 partitioned index for now.
+        let mut i = TestIndices::new();
+
+        let customers_cols = int_columns(&[
+            "customer_id",
+            "customer_name",
+            "customer_city",
+            "customer_registered_date",
+        ]);
+        let customers = i.add_table(Table::new(
+            "Customers".to_string(),
+            SCHEMA,
+            customers_cols.clone(),
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+        i.indices.push(
+            Index::try_new(
+                "by_city".to_string(),
+                customers,
+                put_first("customer_city", &customers_cols),
+                1,
+                None,
+                None,
+                Index::index_type_default(),
+            )
+            .unwrap(),
+        );
+        if add_multi_indices {
+            i.indices.push(
+                Index::try_new(
+                    "#mi0".to_string(),
+                    customers,
+                    put_first("customer_id", &customers_cols),
+                    1,
+                    None,
+                    Some(PARTITIONED_INDEX),
+                    Index::index_type_default(),
+                )
+                .unwrap(),
+            );
+        }
+
+        let orders_cols = int_columns(&[
+            "order_id",
+            "order_customer",
+            "order_product",
+            "order_amount",
+            "order_city",
+        ]);
+        let orders = i.add_table(Table::new(
+            "Orders".to_string(),
+            SCHEMA,
+            orders_cols.clone(),
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+
+        i.indices.push(
+            Index::try_new(
+                "by_customer".to_string(),
+                orders,
+                put_first("order_customer", &orders_cols),
+                2,
+                None,
+                None,
+                Index::index_type_default(),
+            )
+            .unwrap(),
+        );
+        i.indices.push(
+            Index::try_new(
+                "by_city".to_string(),
+                customers,
+                put_first("order_city", &orders_cols),
+                2,
+                None,
+                None,
+                Index::index_type_default(),
+            )
+            .unwrap(),
+        );
+        if add_multi_indices {
+            i.indices.push(
+                Index::try_new(
+                    "#mi0".to_string(),
+                    orders,
+                    put_first("order_customer", &orders_cols),
+                    1,
+                    None,
+                    Some(PARTITIONED_INDEX),
+                    Index::index_type_default(),
+                )
+                .unwrap(),
+            );
+        }
+
+        i.add_table(Table::new(
+            "Products".to_string(),
+            SCHEMA,
+            int_columns(&["product_id", "product_name"]),
+            None,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+        ));
+
+        i
+    }
+
+    fn put_first(c: &str, cols: &[Column]) -> Vec<Column> {
+        let mut cols = cols.iter().cloned().collect_vec();
+        let pos = cols.iter().position(|col| col.get_name() == c).unwrap();
+        cols.swap(0, pos);
+        cols
+    }
+
+    fn int_columns(names: &[&str]) -> Vec<Column> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| Column::new(n.to_string(), ColumnType::Int, i))
+            .collect()
+    }
+
+    fn initial_plan(s: &str, i: &TestIndices) -> LogicalPlan {
+        QueryPlannerImpl::make_execution_context(SessionConfig::new())
+            .state()
+            .optimize(&unoptimized_plan(s, i))
+            .unwrap()
+    }
+
+    fn unoptimized_plan(s: &str, i: &TestIndices) -> LogicalPlan {
+        let statement = match CubeStoreParser::new(s, None)
+            .unwrap()
+            .parse_statement()
+            .unwrap()
+        {
+            Statement::Statement(s) => s,
+            other => panic!("not a statement, actual {:?}", other),
+        };
+
+        SqlToRel::new_with_options(i, sql_to_rel_options())
+            .statement_to_plan(DFStatement::Statement(Box::new(statement)))
+            .unwrap()
+    }
+
+    #[derive(Debug)]
+    pub struct TestIndices {
+        session_state: Arc<SessionState>,
+        tables: Vec<Table>,
+        indices: Vec<Index>,
+        partitions: Vec<Partition>,
+        chunks: Vec<Chunk>,
+        multi_partitions: Vec<MultiPartition>,
+        config_options: ConfigOptions,
+    }
+
+    impl TestIndices {
+        pub fn new() -> TestIndices {
+            TestIndices {
+                session_state: Arc::new(SessionStateBuilder::new().with_default_features().build()),
+                tables: Vec::new(),
+                indices: Vec::new(),
+                partitions: Vec::new(),
+                chunks: Vec::new(),
+                multi_partitions: Vec::new(),
+                config_options: ConfigOptions::default(),
+            }
+        }
+        pub fn add_table(&mut self, t: Table) -> u64 {
+            assert_eq!(t.get_schema_id(), 0);
+            let table_id = self.tables.len() as u64;
+            self.indices.push(
+                Index::try_new(
+                    "default".to_string(),
+                    table_id,
+                    t.get_columns().clone(),
+                    t.get_columns().len() as u64,
+                    None,
+                    None,
+                    Index::index_type_default(),
+                )
+                .unwrap(),
+            );
+            self.tables.push(t);
+            table_id
+        }
+
+        pub fn get_multi_partition(&self, id: u64) -> IdRow<MultiPartition> {
+            IdRow::new(id, self.multi_partitions[id as usize].clone())
+        }
+
+        pub fn chunks_for_partition(&self, partition_id: u64) -> Vec<IdRow<Chunk>> {
+            let mut r = Vec::new();
+            for i in 0..self.chunks.len() {
+                if self.chunks[i].get_partition_id() != partition_id {
+                    continue;
+                }
+                r.push(IdRow::new(i as u64, self.chunks[i].clone()));
+            }
+            r
+        }
+
+        pub fn schema(&self) -> IdRow<Schema> {
+            IdRow::new(0, Schema::new("s".to_string()))
+        }
+    }
+
+    impl ContextProvider for TestIndices {
+        fn get_table_source(
+            &self,
+            name: TableReference,
+        ) -> Result<Arc<dyn TableSource>, DataFusionError> {
+            let name = match name {
+                TableReference::Partial { schema, table } => {
+                    if schema.as_ref() != "s" {
+                        return Err(DataFusionError::Plan(format!(
+                            "Schema not found {}",
+                            schema
+                        )));
+                    }
+                    table
+                }
+                TableReference::Bare { .. } | TableReference::Full { .. } => {
+                    return Err(DataFusionError::Plan(format!("Table not found {}", name)))
+                }
+            };
+            self.tables
+                .iter()
+                .find_position(|t| t.get_table_name() == name.as_ref())
+                .map(|(id, t)| -> Arc<dyn TableSource> {
+                    let schema = Arc::new(ArrowSchema::new(
+                        t.get_columns()
+                            .iter()
+                            .map(|c| c.clone().into())
+                            .collect::<Vec<Field>>(),
+                    ));
+                    Arc::new(DefaultTableSource::new(Arc::new(CubeTableLogical {
+                        table: TablePath::new(
+                            Arc::new(self.schema()),
+                            IdRow::new(id as u64, t.clone()),
+                        ),
+                        schema,
+                    })))
+                })
+                .ok_or(DataFusionError::Plan(format!("Table not found {}", name)))
+        }
+
+        fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
+            // Note that this is missing HLL functions.
+            let name = name.to_ascii_lowercase();
+            self.session_state.scalar_functions().get(&name).cloned()
+        }
+
+        fn get_aggregate_meta(&self, name_param: &str) -> Option<Arc<AggregateUDF>> {
+            // Note that this is missing HLL functions.
+            let name = name_param.to_ascii_lowercase();
+            self.session_state.aggregate_functions().get(&name).cloned()
+        }
+
+        fn get_window_meta(&self, name: &str) -> Option<Arc<WindowUDF>> {
+            let name = name.to_ascii_lowercase();
+            self.session_state.window_functions().get(&name).cloned()
+        }
+
+        fn get_variable_type(&self, _variable_names: &[String]) -> Option<DataType> {
+            None
+        }
+
+        fn options(&self) -> &ConfigOptions {
+            &self.config_options
+        }
+
+        fn udf_names(&self) -> Vec<String> {
+            self.session_state
+                .scalar_functions()
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        fn udaf_names(&self) -> Vec<String> {
+            self.session_state
+                .aggregate_functions()
+                .keys()
+                .cloned()
+                .collect()
+        }
+
+        fn udwf_names(&self) -> Vec<String> {
+            self.session_state
+                .window_functions()
+                .keys()
+                .cloned()
+                .collect()
+        }
+    }
+
+    #[async_trait]
+    impl PlanIndexStore for TestIndices {
+        async fn get_tables_with_indexes(
+            &self,
+            inputs: Vec<(String, String)>,
+        ) -> Result<Vec<(IdRow<Schema>, IdRow<Table>, Vec<IdRow<Index>>)>, CubeError> {
+            let mut r = Vec::with_capacity(inputs.len());
+            for (schema, table) in inputs {
+                let table = self.get_table(schema, table).await?;
+                let schema = self
+                    .get_schema_by_id(table.get_row().get_schema_id())
+                    .await?;
+
+                let mut indexes;
+                indexes = self.get_table_indexes(table.get_id()).await?;
+                indexes.insert(0, self.get_default_index(table.get_id()).await?);
+
+                r.push((schema, table, indexes))
+            }
+            Ok(r)
+        }
+
+        async fn get_active_partitions_and_chunks_by_index_id_for_select(
+            &self,
+            index_id: Vec<u64>,
+        ) -> Result<Vec<Vec<(IdRow<Partition>, Vec<IdRow<Chunk>>)>>, CubeError> {
+            Ok(index_id
+                .iter()
+                .map(|index_id| {
+                    self.partitions
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p.get_index_id() == *index_id)
+                        .map(|(id, p)| {
+                            (
+                                IdRow::new(id as u64, p.clone()),
+                                self.chunks_for_partition(id as u64),
+                            )
+                        })
+                        .filter(|(p, chunks)| p.get_row().is_active() || !chunks.is_empty())
+                        .collect()
+                })
+                .collect())
+        }
+
+        async fn get_multi_partition_subtree(
+            &self,
+            _multi_part_ids: Vec<u64>,
+        ) -> Result<HashMap<u64, MultiPartition>, CubeError> {
+            Ok(HashMap::from_iter(
+                self.multi_partitions
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| (i as u64, p.clone())),
+            ))
+        }
+    }
+
+    impl TestIndices {
+        async fn get_table(
+            &self,
+            schema_name: String,
+            table_name: String,
+        ) -> Result<IdRow<Table>, CubeError> {
+            if schema_name != "s" {
+                return Err(CubeError::internal(
+                    "only 's' schema defined in tests".to_string(),
+                ));
+            }
+            let (pos, table) = self
+                .tables
+                .iter()
+                .find_position(|t| t.get_table_name() == &table_name)
+                .ok_or_else(|| CubeError::internal(format!("table {} not found", table_name)))?;
+            Ok(IdRow::new(pos as u64, table.clone()))
+        }
+
+        async fn get_schema_by_id(&self, schema_id: u64) -> Result<IdRow<Schema>, CubeError> {
+            if schema_id != 0 {
+                return Err(CubeError::internal(
+                    "only 's' schema with id = 0 defined in tests".to_string(),
+                ));
+            }
+            return Ok(self.schema());
+        }
+
+        async fn get_default_index(&self, table_id: u64) -> Result<IdRow<Index>, CubeError> {
+            let (pos, index) = self
+                .indices
+                .iter()
+                .find_position(|i| i.table_id() == table_id)
+                .ok_or_else(|| {
+                    CubeError::internal(format!("index for table {} not found", table_id))
+                })?;
+            Ok(IdRow::new(pos as u64, index.clone()))
+        }
+
+        async fn get_table_indexes(&self, table_id: u64) -> Result<Vec<IdRow<Index>>, CubeError> {
+            Ok(self
+                .indices
+                .iter()
+                .enumerate()
+                .filter(|(_, i)| i.table_id() == table_id)
+                .map(|(pos, index)| IdRow::new(pos as u64, index.clone()))
+                .collect())
+        }
+    }
+}

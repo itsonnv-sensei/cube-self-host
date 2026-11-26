@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "src",
+    "codegen",
+    "test"
+  ],
+  "compilerOptions": {
+    "types": ["node", "jest"],
+    "noImplicitAny": false,
+    "outDir": "dist",
+    "rootDir": ".",
+  },
+  "references": [
+    { "path": "../../rust/cubestore" },
+    { "path": "../cubejs-backend-native" },
+    { "path": "../cubejs-backend-shared" },
+    { "path": "../cubejs-base-driver" }
+  ]
+}

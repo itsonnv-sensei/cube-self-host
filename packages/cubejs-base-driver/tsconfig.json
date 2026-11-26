@@ -1,0 +1,16 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "src",
+    "test"
+  ],
+  "compilerOptions": {
+    "types": ["node", "jest"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "allowJs": true
+  },
+  "references": [
+    { "path": "../cubejs-backend-shared" }
+  ]
+}

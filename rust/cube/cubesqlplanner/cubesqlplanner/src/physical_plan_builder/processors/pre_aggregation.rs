@@ -1,0 +1,202 @@
+use super::super::context::PushDownBuilderContext;
+use super::super::{LogicalNodeProcessor, ProcessableNode};
+use crate::logical_plan::{
+    PreAggregation, PreAggregationJoin, PreAggregationSource, PreAggregationTable,
+    PreAggregationUnion,
+};
+use crate::physical_plan::sql_nodes::SqlNodesFactory;
+use crate::physical_plan::{
+    From, FromSource, JoinBuilder, JoinCondition, QualifiedColumnName, QueryPlan, Schema,
+    SelectBuilder, SingleAliasedSource, SingleSource, Union,
+};
+use crate::physical_plan_builder::PhysicalPlanBuilder;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::SqlJoinCondition;
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+pub struct PreAggregationProcessor<'a> {
+    builder: &'a PhysicalPlanBuilder,
+}
+
+impl PreAggregationProcessor<'_> {
+    fn make_pre_aggregation_table_source(
+        &self,
+        table: &PreAggregationTable,
+    ) -> Result<SingleAliasedSource, CubeError> {
+        let query_tools = self.builder.query_tools();
+        let name = table.alias.clone().unwrap_or_else(|| table.name.clone());
+        let base_table_name = query_tools
+            .base_tools()
+            .pre_aggregation_table_name(table.cube_name.clone(), name.clone())?;
+        let table_name = match table.usage_index {
+            Some(idx) => format!("{}__usage_{}", base_table_name, idx),
+            None => base_table_name,
+        };
+        let alias = PlanSqlTemplates::member_alias_name(&table.cube_name, &name, &None);
+        let res = SingleAliasedSource::new_from_table_reference(
+            table_name,
+            Rc::new(Schema::empty()),
+            Some(alias),
+        );
+        Ok(res)
+    }
+
+    fn make_pre_aggregation_join_single_source(
+        &self,
+        source: &PreAggregationSource,
+    ) -> Result<SingleAliasedSource, CubeError> {
+        match source {
+            PreAggregationSource::Single(table) => self.make_pre_aggregation_table_source(table),
+            PreAggregationSource::Union(_) => Err(CubeError::user(format!(
+                "Lambda rollups not allowed inside join rollups"
+            ))),
+            PreAggregationSource::Join(_) => {
+                Err(CubeError::user(format!("Nested rollup joins not allowed")))
+            }
+        }
+    }
+
+    fn make_pre_aggregation_join_source(
+        &self,
+        join: &PreAggregationJoin,
+    ) -> Result<Rc<From>, CubeError> {
+        let root_table_source = self.make_pre_aggregation_join_single_source(&join.root)?;
+        let mut join_builder = JoinBuilder::new(root_table_source);
+        for item in join.items.iter() {
+            let to_table_source = self.make_pre_aggregation_join_single_source(&item.to)?;
+            let condition = SqlJoinCondition::try_new(item.on_sql.clone())?;
+            let on = JoinCondition::new_base_join(condition);
+            join_builder.left_join_aliased_source(to_table_source, on);
+        }
+        let from = From::new_from_join(join_builder.build());
+        Ok(from)
+    }
+
+    fn make_pre_aggregation_union_source(
+        &self,
+        pre_aggregation: &PreAggregation,
+        union: &PreAggregationUnion,
+    ) -> Result<Rc<From>, CubeError> {
+        if union.items.len() == 1 {
+            let table_source = self.make_pre_aggregation_table_source(&union.items[0].table)?;
+            return Ok(From::new(FromSource::Single(table_source)));
+        }
+        let query_tools = self.builder.query_tools();
+
+        let mut union_sources = Vec::new();
+        for item in union.items.iter() {
+            let table_source = self.make_pre_aggregation_table_source(&item.table)?;
+            let from = From::new(FromSource::Single(table_source));
+            let mut select_builder = SelectBuilder::new(from);
+            for dim in pre_aggregation.dimensions().iter() {
+                // Read this branch's stored column for the lambda dimension and
+                // project it under the lambda's unified alias.
+                let branch_dim = item.find_member(dim, &item.dimensions)?;
+                select_builder.add_projection_reference_member(
+                    &dim,
+                    QualifiedColumnName::new(None, branch_dim.canonical_alias()),
+                    Some(dim.canonical_alias()),
+                );
+            }
+            // Match time dimensions on their base member so the granularity
+            // suffix is applied consistently on both the read and output sides.
+            let branch_time_bases = item
+                .time_dimensions
+                .iter()
+                .map(|td| {
+                    if let Ok(t) = td.as_time_dimension() {
+                        t.base_symbol().clone()
+                    } else {
+                        td.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            for dim in pre_aggregation.time_dimensions().iter() {
+                let (lambda_base, granularity) = if let Ok(td) = dim.as_time_dimension() {
+                    (td.base_symbol().clone(), td.granularity().clone())
+                } else {
+                    (dim.clone(), None)
+                };
+
+                let branch_base = item.find_member(&lambda_base, &branch_time_bases)?;
+
+                let read_suffix = if let Some(granularity) = &granularity {
+                    format!("_{}", granularity)
+                } else {
+                    String::new()
+                };
+                let name_in_table = format!("{}{}", branch_base.canonical_alias(), read_suffix);
+
+                let out_suffix = if let Some(granularity) = &granularity {
+                    format!("_{}", granularity)
+                } else {
+                    "_day".to_string()
+                };
+                let alias = format!("{}{}", lambda_base.canonical_alias(), out_suffix);
+                select_builder.add_projection_reference_member(
+                    &dim,
+                    QualifiedColumnName::new(None, name_in_table),
+                    Some(alias),
+                );
+            }
+            for meas in pre_aggregation.measures().iter() {
+                let branch_meas = item.find_member(meas, &item.measures)?;
+                select_builder.add_projection_reference_member(
+                    &meas,
+                    QualifiedColumnName::new(None, branch_meas.canonical_alias()),
+                    Some(meas.canonical_alias()),
+                );
+            }
+            let context = SqlNodesFactory::new();
+            let select = select_builder.build(query_tools.clone(), context);
+            let query_plan = QueryPlan::Select(Rc::new(select));
+            union_sources.push(query_plan);
+        }
+
+        let plan = QueryPlan::Union(Rc::new(Union::new(union_sources)));
+        let source = SingleSource::new_subquery(Rc::new(plan));
+        let alias = PlanSqlTemplates::member_alias_name(
+            pre_aggregation.cube_name(),
+            pre_aggregation.name(),
+            &None,
+        );
+        let aliased_source = SingleAliasedSource { source, alias };
+        let from = From::new(FromSource::Single(aliased_source));
+        Ok(from)
+    }
+}
+
+impl<'a> LogicalNodeProcessor<'a, PreAggregation> for PreAggregationProcessor<'a> {
+    type PhysycalNode = Rc<From>;
+    fn new(builder: &'a PhysicalPlanBuilder) -> Self {
+        Self { builder }
+    }
+
+    fn process(
+        &self,
+        pre_aggregation: &PreAggregation,
+        _context: &PushDownBuilderContext,
+    ) -> Result<Self::PhysycalNode, CubeError> {
+        let source = pre_aggregation.source();
+        let from = match source.as_ref() {
+            PreAggregationSource::Single(table) => {
+                let table_source = self.make_pre_aggregation_table_source(&table)?;
+                From::new(FromSource::Single(table_source))
+            }
+            PreAggregationSource::Union(union) => {
+                let source = self.make_pre_aggregation_union_source(pre_aggregation, &union)?;
+                source
+            }
+            PreAggregationSource::Join(join) => {
+                let source = self.make_pre_aggregation_join_source(&join)?;
+                source
+            }
+        };
+        Ok(from)
+    }
+}
+
+impl ProcessableNode for PreAggregation {
+    type ProcessorType<'a> = PreAggregationProcessor<'a>;
+}

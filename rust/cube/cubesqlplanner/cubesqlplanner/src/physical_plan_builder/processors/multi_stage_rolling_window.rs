@@ -1,0 +1,187 @@
+use super::super::context::PushDownBuilderContext;
+use super::super::{LogicalNodeProcessor, ProcessableNode};
+use crate::logical_plan::transforms;
+use crate::logical_plan::{MultiStageRollingWindow, MultiStageRollingWindowType};
+use crate::physical_plan::{
+    column_reference, measure_over_column, Expr, From, JoinBuilder, JoinCondition,
+    MemberExpression, QualifiedColumnName, QueryPlan, ReferenceSubstitutions, ReferencesBuilder,
+    SelectBuilder,
+};
+use crate::physical_plan_builder::PhysicalPlanBuilder;
+use crate::planner::MeasureRenderModifier;
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+pub struct MultiStageRollingWindowProcessor<'a> {
+    builder: &'a PhysicalPlanBuilder,
+}
+
+impl<'a> LogicalNodeProcessor<'a, MultiStageRollingWindow>
+    for MultiStageRollingWindowProcessor<'a>
+{
+    type PhysycalNode = QueryPlan;
+    fn new(builder: &'a PhysicalPlanBuilder) -> Self {
+        Self { builder }
+    }
+
+    fn process(
+        &self,
+        rolling_window: &MultiStageRollingWindow,
+        context: &PushDownBuilderContext,
+    ) -> Result<Self::PhysycalNode, CubeError> {
+        let query_tools = self.builder.query_tools();
+        let time_dimension = rolling_window.rolling_time_dimension.clone();
+        let time_series_ref = rolling_window.time_series_input.name().clone();
+        let measure_input_ref = rolling_window.measure_input.name().clone();
+
+        let time_series_schema = context.get_cte_schema(&rolling_window.time_series_input)?;
+
+        let measure_input_schema = context.get_cte_schema(&rolling_window.measure_input)?;
+
+        let base_time_dimension_alias = measure_input_schema
+            .resolve_member_alias(&rolling_window.time_dimension_in_measure_input);
+
+        let root_alias = format!("time_series");
+        let measure_input_alias = format!("rolling_source");
+
+        let mut join_builder = JoinBuilder::new_from_table_reference(
+            time_series_ref.clone(),
+            time_series_schema,
+            Some(root_alias.clone()),
+        );
+
+        let on = match &rolling_window.rolling_window {
+            MultiStageRollingWindowType::Regular(regular_rolling_window) => {
+                JoinCondition::new_regular_rolling_join(
+                    root_alias.clone(),
+                    regular_rolling_window.trailing.clone(),
+                    regular_rolling_window.leading.clone(),
+                    regular_rolling_window.offset.clone(),
+                    Expr::Reference(QualifiedColumnName::new(
+                        Some(measure_input_alias.clone()),
+                        base_time_dimension_alias,
+                    )),
+                )
+            }
+            MultiStageRollingWindowType::ToDate(to_date_rolling_window) => {
+                JoinCondition::new_to_date_rolling_join(
+                    root_alias.clone(),
+                    to_date_rolling_window.granularity_obj.clone(),
+                    Expr::Reference(QualifiedColumnName::new(
+                        Some(measure_input_alias.clone()),
+                        base_time_dimension_alias,
+                    )),
+                    query_tools.clone(),
+                )
+            }
+        };
+
+        join_builder.left_join_table_reference(
+            measure_input_ref.clone(),
+            measure_input_schema.clone(),
+            Some(measure_input_alias.clone()),
+            on,
+        );
+
+        let context_factory = context.make_sql_nodes_factory()?;
+        let from = From::new_from_join(join_builder.build());
+        let references_builder = ReferencesBuilder::new(from.clone());
+
+        let mut substitutions = ReferenceSubstitutions::new();
+        let date_from = || QualifiedColumnName::new(Some(root_alias.clone()), format!("date_from"));
+        // The series is built at this granularity, so no date_trunc is needed.
+        substitutions.insert(
+            time_dimension.id().clone(),
+            column_reference(&time_dimension, date_from()),
+        );
+        // Time dimensions at other granularities truncate the axis column.
+        let base_time_dimension = time_dimension.as_time_dimension()?.base_symbol().clone();
+        substitutions.insert(
+            base_time_dimension.id().clone(),
+            column_reference(&base_time_dimension, date_from()),
+        );
+
+        // Time dimensions are read from the rolling source input, where they
+        // are already timezone-converted and truncated, so they must render
+        // without the conversion.
+        let schema = transforms::mark_tz_converted_at_source_in_schema(&rolling_window.schema)?;
+        // An ungrouped rolling select emits row-level values: count-like
+        // measures render a not-null indicator over the input column;
+        // otherwise the select merges the window's partial values.
+        let schema = if rolling_window.is_ungrouped {
+            transforms::measures_render_modifier_in_schema(
+                &schema,
+                &MeasureRenderModifier::UngroupedFinal,
+            )?
+        } else {
+            transforms::measures_render_modifier_in_schema(
+                &schema,
+                &MeasureRenderModifier::RollingMerge,
+            )?
+        };
+
+        for dim in schema.dimensions.iter() {
+            if dim.clone().resolve_reference_chain()
+                != time_dimension.clone().resolve_reference_chain()
+            {
+                references_builder.collect_substitutions_for_member(
+                    dim.clone(),
+                    &Some(measure_input_alias.clone()),
+                    &mut substitutions,
+                )?;
+            }
+        }
+
+        for measure in schema.measures.iter() {
+            let column = QualifiedColumnName::new(
+                Some(measure_input_alias.clone()),
+                measure_input_schema.resolve_member_alias(measure),
+            );
+            if let Some(over_column) = measure_over_column(measure, column) {
+                substitutions.insert(measure.id().clone(), over_column);
+            }
+        }
+
+        let schema = transforms::substitute_symbols_in_schema(&schema, &substitutions)?;
+
+        let mut select_builder = SelectBuilder::new(from.clone());
+
+        for dim in schema.time_dimensions.iter() {
+            let alias = references_builder
+                .resolve_alias_for_member(&dim, &Some(measure_input_alias.clone()));
+            select_builder.add_projection_member(dim, alias);
+        }
+
+        for dim in schema.dimensions.iter() {
+            let alias = references_builder
+                .resolve_alias_for_member(&dim, &Some(measure_input_alias.clone()));
+            select_builder.add_projection_member(dim, alias);
+        }
+
+        for measure in schema.measures.iter() {
+            select_builder.add_projection_member(&measure, None);
+        }
+
+        if !rolling_window.is_ungrouped {
+            let group_by = schema
+                .all_dimensions()
+                .map(|dim| -> Result<_, CubeError> {
+                    Ok(Expr::Member(MemberExpression::new(dim.clone())))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            select_builder.set_group_by(group_by);
+            select_builder.set_order_by(self.builder.make_order_by(
+                &schema,
+                &rolling_window.order_by,
+                &substitutions,
+            )?);
+        }
+
+        let select = Rc::new(select_builder.build(query_tools.clone(), context_factory));
+        Ok(QueryPlan::Select(select))
+    }
+}
+
+impl ProcessableNode for MultiStageRollingWindow {
+    type ProcessorType<'a> = MultiStageRollingWindowProcessor<'a>;
+}

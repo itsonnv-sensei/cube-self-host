@@ -1,0 +1,173 @@
+use super::sql_nodes::SqlNode;
+use super::CubeRefEvaluator;
+use super::QualifiedColumnName;
+use crate::planner::filter::Filter;
+use crate::planner::planners::multi_stage::FilterParamsTimeShifts;
+use crate::planner::query_tools::QueryTools;
+use crate::planner::sql_call::CubeRef;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::MemberSymbol;
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+#[derive(Clone)]
+pub struct SqlEvaluatorVisitor {
+    query_tools: Rc<QueryTools>,
+    cube_ref_evaluator: Rc<CubeRefEvaluator>,
+    all_filters: Option<Filter>, //To pass to FILTER_PARAMS and FILTER_GROUP
+    /// The stage's time shifts as FILTER_PARAMS rendering sees them: which
+    /// binding of a member renders, and whether its column carries an offset.
+    filter_params_time_shifts: FilterParamsTimeShifts,
+    ignore_tz_convert: bool,
+    // The member is read as a time dimension: by a granularity or a date
+    // filter, which a stored grain column serves, not a raw one.
+    time_dimension_read: bool,
+    // The stored column a member is read from, chosen by the caller.
+    stored_column: Option<(String, QualifiedColumnName)>,
+    /// When `true`, the caller (typically a `SqlCall` substitution site) expects
+    /// the rendered expression to be safe for embedding next to operators —
+    /// i.e. a compound top-level result should be wrapped in parentheses.
+    arg_needs_paren_safe: bool,
+    /// Rendered predicate the measure being rendered aggregates its rows
+    /// under, on top of its own `measure_filters`. Consumed by the measure
+    /// node it is set for; its inputs render without it.
+    measure_row_condition: Option<String>,
+}
+
+impl SqlEvaluatorVisitor {
+    pub fn new(
+        query_tools: Rc<QueryTools>,
+        cube_ref_evaluator: Rc<CubeRefEvaluator>,
+        all_filters: Option<Filter>,
+    ) -> Self {
+        Self {
+            query_tools,
+            cube_ref_evaluator,
+            all_filters,
+            filter_params_time_shifts: FilterParamsTimeShifts::default(),
+            ignore_tz_convert: false,
+            time_dimension_read: false,
+            stored_column: None,
+            arg_needs_paren_safe: false,
+            measure_row_condition: None,
+        }
+    }
+
+    pub fn with_measure_row_condition(&self, condition: Option<String>) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.measure_row_condition = condition;
+        self_copy
+    }
+
+    pub fn measure_row_condition(&self) -> Option<&String> {
+        self.measure_row_condition.as_ref()
+    }
+
+    pub fn with_filter_params_time_shifts(&self, shifts: FilterParamsTimeShifts) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.filter_params_time_shifts = shifts;
+        self_copy
+    }
+
+    pub fn filter_params_time_shifts(&self) -> &FilterParamsTimeShifts {
+        &self.filter_params_time_shifts
+    }
+
+    pub fn with_ignore_tz_convert(&self) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.ignore_tz_convert = true;
+        self_copy
+    }
+
+    pub fn with_time_dimension_read(&self) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.time_dimension_read = true;
+        self_copy
+    }
+
+    /// The visitor reading each member from its default column.
+    pub fn with_default_read(&self) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.time_dimension_read = false;
+        self_copy.stored_column = None;
+        self_copy
+    }
+
+    pub fn time_dimension_read(&self) -> bool {
+        self.time_dimension_read
+    }
+
+    pub fn with_stored_column(&self, member: String, column: QualifiedColumnName) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.stored_column = Some((member, column));
+        self_copy
+    }
+
+    pub fn stored_column_for(&self, member: &str) -> Option<&QualifiedColumnName> {
+        match &self.stored_column {
+            Some((name, column)) if name == member => Some(column),
+            _ => None,
+        }
+    }
+
+    pub fn with_arg_needs_paren_safe(&self, value: bool) -> Self {
+        let mut self_copy = self.clone();
+        self_copy.arg_needs_paren_safe = value;
+        self_copy
+    }
+
+    pub fn arg_needs_paren_safe(&self) -> bool {
+        self.arg_needs_paren_safe
+    }
+
+    pub fn all_filters(&self) -> Option<Filter> {
+        self.all_filters.clone()
+    }
+
+    pub fn apply(
+        &self,
+        node: &Rc<MemberSymbol>,
+        node_processor: Rc<dyn SqlNode>,
+        templates: &PlanSqlTemplates,
+    ) -> Result<String, CubeError> {
+        let result = node_processor.to_sql(
+            self,
+            node,
+            self.query_tools.clone(),
+            node_processor.clone(),
+            templates,
+        )?;
+        Ok(result)
+    }
+
+    /// Evaluate a member symbol in filter-mode: timezone conversion is suppressed
+    /// because filter values are already normalized to the database timezone.
+    pub fn apply_for_filter(
+        &self,
+        node: &Rc<MemberSymbol>,
+        node_processor: Rc<dyn SqlNode>,
+        templates: &PlanSqlTemplates,
+    ) -> Result<String, CubeError> {
+        self.with_ignore_tz_convert()
+            .apply(node, node_processor, templates)
+    }
+
+    pub fn ignore_tz_convert(&self) -> bool {
+        self.ignore_tz_convert
+    }
+
+    pub fn evaluate_cube_ref(
+        &self,
+        cube_ref: &CubeRef,
+        node_processor: Rc<dyn SqlNode>,
+        templates: &PlanSqlTemplates,
+    ) -> Result<String, CubeError> {
+        self.cube_ref_evaluator.evaluate(
+            cube_ref,
+            self,
+            node_processor,
+            self.query_tools.clone(),
+            templates,
+        )
+    }
+}

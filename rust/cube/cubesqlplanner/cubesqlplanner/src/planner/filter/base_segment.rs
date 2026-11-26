@@ -1,0 +1,117 @@
+use crate::planner::{
+    CubeId, CubeTableSymbol, MemberExpressionExpression, MemberExpressionSymbol, MemberId,
+    MemberSymbol, SqlCall,
+};
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+/// One `segments:` entry from the data model — a boolean expression
+/// attached to a cube under a name, materialised as a synthetic
+/// `MemberExpression` so it plugs into the same member machinery as
+/// dimensions and measures.
+#[derive(Clone)]
+pub struct BaseSegment {
+    member_evaluator: Rc<MemberSymbol>,
+    cube_id: CubeId,
+    name: String,
+    /// True when this segment is an ad-hoc query-level member expression (no
+    /// registered `segments:` path), as opposed to a named cube segment.
+    is_member_expression: bool,
+}
+
+impl PartialEq for BaseSegment {
+    fn eq(&self, other: &Self) -> bool {
+        self.id() == other.id()
+    }
+}
+
+impl BaseSegment {
+    pub fn try_new(
+        expression: Rc<SqlCall>,
+        cube_symbol: Rc<CubeTableSymbol>,
+        name: String,
+        is_member_expression: bool,
+    ) -> Result<Rc<Self>, CubeError> {
+        let cube_id = cube_symbol.cube_id().clone();
+        let member_expression_symbol = if is_member_expression {
+            MemberExpressionSymbol::try_new(
+                cube_symbol,
+                name.clone(),
+                MemberExpressionExpression::SqlCall(expression),
+                None,
+                None,
+                vec![cube_id.clone()],
+            )?
+        } else {
+            MemberExpressionSymbol::try_new_segment(
+                cube_symbol,
+                name.clone(),
+                expression,
+                None,
+                vec![cube_id.clone()],
+            )?
+        };
+        let member_evaluator = MemberSymbol::new_member_expression(member_expression_symbol);
+
+        Ok(Rc::new(Self {
+            member_evaluator,
+            cube_id,
+            name,
+            is_member_expression,
+        }))
+    }
+
+    pub fn is_member_expression(&self) -> bool {
+        self.is_member_expression
+    }
+
+    /// Whether `member` names this segment, as a `FILTER_PARAMS` binding or a
+    /// filter-tree target does. A view exposes a segment under its own path
+    /// while a binding in the underlying cube's sql names the cube's, so every
+    /// segment in the reference chain counts, not only the name the query asked
+    /// for. The chain stops at the first non-segment: a segment whose sql is a
+    /// bare reference resolves on to that dimension, whose own binding states a
+    /// column to compare a value against rather than a predicate.
+    pub fn matches_member_name(&self, member: &str) -> bool {
+        if self.is_member_expression {
+            return false;
+        }
+        let mut current = Some(self.member_evaluator.clone());
+        while let Some(symbol) = current {
+            if symbol.as_member_expression().is_err() {
+                return false;
+            }
+            if symbol.full_name() == member {
+                return true;
+            }
+            current = symbol.reference_member();
+        }
+        false
+    }
+
+    pub fn full_name(&self) -> String {
+        self.member_evaluator.full_name()
+    }
+
+    pub fn id(&self) -> &MemberId {
+        self.member_evaluator.id()
+    }
+
+    pub fn member_evaluator(&self) -> Rc<MemberSymbol> {
+        self.member_evaluator.clone()
+    }
+
+    pub fn with_member_evaluator(&self, member_evaluator: Rc<MemberSymbol>) -> Rc<Self> {
+        let mut result = self.clone();
+        result.member_evaluator = member_evaluator;
+        Rc::new(result)
+    }
+
+    pub fn cube_id(&self) -> &CubeId {
+        &self.cube_id
+    }
+
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+}

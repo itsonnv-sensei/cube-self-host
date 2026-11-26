@@ -1,0 +1,453 @@
+import R from 'ramda';
+import Graph from 'node-dijkstra';
+import { JoinPathNotFoundError } from './UserError';
+
+import type { CubeValidator } from './CubeValidator';
+import type { CubeEvaluator, MeasureDefinition } from './CubeEvaluator';
+import type { CubeDefinition, JoinDefinition } from './CubeSymbols';
+import type { ErrorReporter } from './ErrorReporter';
+import inflection from 'inflection';
+import { CompilerInterface } from './PrepareCompiler';
+
+export type JoinEdge = {
+  join: JoinDefinition,
+  from: string,
+  to: string,
+  originalFrom: string,
+  originalTo: string,
+};
+
+type JoinTreeJoins = JoinEdge[];
+
+type JoinTree = {
+  root: string,
+  joins: JoinTreeJoins,
+};
+
+export type FinishedJoinTree = JoinTree & {
+  multiplicationFactor: Record<string, boolean>,
+};
+
+export type JoinHint = string | string[];
+
+export type JoinHints = JoinHint[];
+
+export class JoinGraph implements CompilerInterface {
+  private readonly cubeValidator: CubeValidator;
+
+  private readonly cubeEvaluator: CubeEvaluator;
+
+  // source node -> destination node -> weight
+  private nodes: Record<string, Record<string, 1>>;
+
+  // source node -> destination node -> weight
+  private undirectedNodes: Record<string, Record<string, 1>>;
+
+  private edges: Record<string, JoinEdge>;
+
+  private builtJoins: Record<string, FinishedJoinTree>;
+
+  private graph: Graph | null;
+
+  private cachedConnectedComponents: Record<string, number> | null;
+
+  // Cube names by the name their SQL alias renders under
+  private renderedCubeNames: Map<string, string> = new Map();
+
+  public constructor(cubeValidator: CubeValidator, cubeEvaluator: CubeEvaluator) {
+    this.cubeValidator = cubeValidator;
+    this.cubeEvaluator = cubeEvaluator;
+    this.nodes = {};
+    this.undirectedNodes = {};
+    this.edges = {};
+    this.builtJoins = {};
+    this.cachedConnectedComponents = null;
+    this.graph = null;
+  }
+
+  public compile(cubes: unknown, errorReporter: ErrorReporter): void {
+    this.renderedCubeNames = new Map(this.cubeEvaluator.cubeList.map(
+      cube => [this.renderedCubeName(cube), cube.name]
+    ));
+    this.edges = Object.fromEntries(
+      this.cubeEvaluator.cubeList
+        .filter(v => this.cubeValidator.isCubeValid(v))
+        .flatMap(v => this.buildJoinEdges(v, errorReporter.inContext(`${v.name} cube`)))
+    );
+
+    this.nodes = {};
+    this.undirectedNodes = {};
+
+    for (const join of Object.values(this.edges)) {
+      JoinGraph.addNodeEdge(this.nodes, join.from, join.to);
+      JoinGraph.addNodeEdge(this.undirectedNodes, join.to, join.from);
+      JoinGraph.addNodeEdge(this.undirectedNodes, join.from, join.to);
+    }
+
+    this.graph = new Graph(this.nodes);
+  }
+
+  protected static addNodeEdge(nodes: Record<string, Record<string, 1>>, from: string, to: string): void {
+    if (!nodes[from]) {
+      nodes[from] = {};
+    }
+    nodes[from][to] = 1;
+  }
+
+  protected buildJoinEdges(cube: CubeDefinition, errorReporter: ErrorReporter): Array<[string, JoinEdge]> {
+    if (!cube.joins) {
+      return [];
+    }
+
+    const getMultipliedMeasures = (cubeName: string): MeasureDefinition[] => {
+      const measures = this.cubeEvaluator.measuresForCube(cubeName);
+      return Object.values(measures).filter((m: MeasureDefinition) => (m.sql &&
+          this.cubeEvaluator.funcArguments(m.sql).length === 0 &&
+          m.sql() === 'count(*)') ||
+        ['sum', 'avg', 'count', 'number'].includes(m.type));
+    };
+
+    const joinRequired =
+      (v: string) => `primary key for '${v}' is required when join is defined in order to make aggregates work properly`;
+
+    const conflicting = this.reportConflictingJoins(cube, errorReporter);
+
+    return cube.joins
+      .filter(join => {
+        // Which of the conflicting declarations was meant is unknowable, so none
+        // of them becomes an edge
+        if (conflicting.has(join.alias ?? join.name)) {
+          return false;
+        }
+
+        if (!this.cubeEvaluator.cubeExists(join.name)) {
+          errorReporter.error(`Cube ${join.name} doesn't exist`);
+          return false;
+        }
+
+        const fromMultipliedMeasures = getMultipliedMeasures(cube.name);
+        if (!this.cubeEvaluator.primaryKeys[cube.name].length && fromMultipliedMeasures.length > 0) {
+          errorReporter.error(joinRequired(cube.name));
+          return false;
+        }
+
+        const toMultipliedMeasures = getMultipliedMeasures(join.name);
+        if (!this.cubeEvaluator.primaryKeys[join.name].length && toMultipliedMeasures.length > 0) {
+          errorReporter.error(joinRequired(join.name));
+          return false;
+        }
+
+        // An aliased join is reachable only through its alias, and join paths
+        // can not name an alias yet
+        return !join.alias;
+      })
+      .map(join => {
+        const joinEdge: JoinEdge = {
+          join,
+          from: cube.name,
+          to: join.name,
+          originalFrom: cube.name,
+          originalTo: join.name
+        };
+
+        return [`${cube.name}-${join.name}`, joinEdge] as [string, JoinEdge];
+      });
+  }
+
+  /**
+   * A join is named by its alias, or the joined cube; names are unique within a
+   * cube, and several joins to one cube must all be aliased. Returns the joins to drop.
+   */
+  protected reportConflictingJoins(cube: CubeDefinition, errorReporter: ErrorReporter): Set<string> {
+    const conflicting = new Set<string>();
+    // The raw definition, not `cube.joins`: `extends` merges the parent's joins
+    // in, and a child redeclaring one of them is a supported override. Conflicts
+    // a parent declares are reported and dropped on the parent's own edges; a
+    // cube extending it still resolves through one of them
+    const ownJoins = this.cubeEvaluator.cubeDefinitions[cube.name]?.joins;
+
+    // The map form is keyed by the joined cube name and can not hold duplicates
+    if (!Array.isArray(ownJoins)) {
+      return conflicting;
+    }
+
+    const byTarget = new Map<string, number[]>();
+    const byName = new Map<string, number[]>();
+    const push = (map: Map<string, number[]>, key: string, index: number) => {
+      const indexes = map.get(key) ?? [];
+      indexes.push(index);
+      map.set(key, indexes);
+    };
+
+    ownJoins.forEach((join, index) => {
+      if (!join?.name) {
+        return;
+      }
+      push(byTarget, join.name, index);
+      push(byName, join.alias ?? join.name, index);
+    });
+
+    const declarations = (indexes: number[]) => indexes.map(index => `joins[${index}]`).join(', ');
+
+    const memberNames = new Set<string>(
+      (['measures', 'dimensions', 'segments', 'preAggregations'] as const)
+        .flatMap(type => Object.keys(cube[type] || {}))
+    );
+    // The SQL alias of an instance joins the declaring cube's name and the
+    // alias, snake-cased: aliases that read alike there would share it
+    const sqlName = (name: string) => inflection.underscore(name);
+    const sqlNames = new Map<string, string>();
+    const renderedCube = this.renderedCubeName(cube);
+    ownJoins.forEach((join, index) => {
+      if (!join?.alias) {
+        return;
+      }
+      // A path segment naming the alias must not be readable as a member too
+      let problem: string | undefined;
+      if (memberNames.has(join.alias) || join.alias === 'CUBE' || join.alias === 'TABLE') {
+        problem = `which is the name of a member of '${cube.name}' or a reserved name`;
+      } else if (join.alias.includes('__')) {
+        problem = 'which contains \'__\', the separator of the names it is rendered under';
+      } else if (sqlNames.has(sqlName(join.alias))) {
+        problem = `which renders under the same name as the alias '${sqlNames.get(sqlName(join.alias))}'`;
+      } else if (join.alias !== join.name && this.cubeEvaluator.cubeExists(join.alias)) {
+        problem = `which is the name of the cube '${join.alias}' and would hide it from the members of '${cube.name}'`;
+      } else if (this.renderedCubeNames.has(`${renderedCube}__${sqlName(join.alias)}`)) {
+        problem = `which renders under the same name as the cube '${this.renderedCubeNames.get(`${renderedCube}__${sqlName(join.alias)}`)}'`;
+      } else {
+        // Members of the instance render as `<alias>__<member>` after the cube
+        const prefix = `${sqlName(join.alias)}__`;
+        const clashing = [...memberNames].find(member => sqlName(member).startsWith(prefix));
+        if (clashing) {
+          problem = `whose members would render under the same name as the member '${clashing}'`;
+        }
+      }
+      sqlNames.set(sqlName(join.alias), join.alias);
+      if (problem) {
+        conflicting.add(join.alias);
+        errorReporter.error(
+          `Cube '${cube.name}' declares a join to '${join.name}' (joins[${index}]) with the alias '${join.alias}', ${problem}. Pick a different alias`,
+          cube.fileName
+        );
+      }
+    });
+
+    ownJoins.forEach((join, index) => {
+      // Would read as unaliased while being dropped from the graph as aliased
+      if (join?.alias && join.alias === join.name) {
+        conflicting.add(join.name);
+        errorReporter.error(
+          `Cube '${cube.name}' declares a join to '${join.name}' (joins[${index}]) with the alias '${join.alias}', which is the name of the joined cube. Remove the alias, or pick a different one`,
+          cube.fileName
+        );
+      }
+    });
+
+    for (const [joinedCube, indexes] of byTarget.entries()) {
+      if (indexes.length > 1 && indexes.some(index => !ownJoins[index].alias)) {
+        conflicting.add(joinedCube);
+        errorReporter.error(
+          `Cube '${cube.name}' declares ${indexes.length} joins to '${joinedCube}' (${declarations(indexes)}). Several joins to the same cube must each declare a distinct alias. Add an alias to each of them, or keep a single join to '${joinedCube}'`,
+          cube.fileName
+        );
+      }
+    }
+
+    for (const [name, indexes] of byName.entries()) {
+      // Unaliased joins sharing a name share the joined cube, reported above
+      if (indexes.length > 1 && indexes.some(index => ownJoins[index].alias)) {
+        conflicting.add(name);
+        errorReporter.error(
+          `Cube '${cube.name}' declares ${indexes.length} joins named '${name}' (${declarations(indexes)}). A join is named by its alias, or by the joined cube when it has no alias, and the name must be unique within a cube`,
+          cube.fileName
+        );
+      }
+    }
+
+    // `extends` puts the parent's joins first, and an alias resolves to the
+    // first join it names, so an aliased one can not be overridden
+    const allJoins = cube.joins ?? [];
+    const inherited = allJoins.slice(0, Math.max(0, allJoins.length - ownJoins.length));
+    ownJoins.forEach((join, index) => {
+      const name = join?.alias ?? join?.name;
+      const parentJoin = inherited.find(j => (j.alias ?? j.name) === name);
+      if (name && parentJoin && (join.alias || parentJoin.alias)) {
+        conflicting.add(name);
+        errorReporter.error(
+          `Cube '${cube.name}' declares a join named '${name}' (joins[${index}]), which redeclares an aliased join of the cube it extends. An aliased join can not be overridden, pick a different alias`,
+          cube.fileName
+        );
+      }
+    });
+
+    return conflicting;
+  }
+
+  private renderedCubeName(cube: CubeDefinition & { sqlAlias?: string }): string {
+    return inflection.underscore(cube.sqlAlias ?? cube.name);
+  }
+
+  protected buildJoinNode(cube: CubeDefinition): Record<string, 1> {
+    if (!cube.joins) {
+      return {};
+    }
+
+    return cube.joins.reduce((acc, join) => {
+      acc[join.name] = 1;
+      return acc;
+    }, {} as Record<string, 1>);
+  }
+
+  public buildJoin(cubesToJoin: JoinHints): FinishedJoinTree | null {
+    if (!cubesToJoin.length) {
+      return null;
+    }
+    const key = JSON.stringify(cubesToJoin);
+    if (!this.builtJoins[key]) {
+      const join = R.sortBy(
+        joinTree => joinTree.joins.length,
+        cubesToJoin
+          .map(cube => this.buildJoinTreeForRoot(cube, R.without([cube], cubesToJoin)))
+          .filter((joinTree): joinTree is JoinTree => joinTree !== null)
+      )[0];
+
+      if (!join) {
+        throw new JoinPathNotFoundError(`Can't find join path to join ${cubesToJoin.map(v => `'${v}'`).join(', ')}`);
+      }
+
+      this.builtJoins[key] = Object.assign(join, {
+        multiplicationFactor: Object.fromEntries(
+          cubesToJoin.map(v => [this.cubeFromPath(v), this.findMultiplicationFactorFor(this.cubeFromPath(v), join.joins)])
+        )
+      });
+    }
+    return this.builtJoins[key];
+  }
+
+  protected cubeFromPath(cubePath: JoinHint): string {
+    if (Array.isArray(cubePath)) {
+      return cubePath[cubePath.length - 1];
+    }
+    return cubePath;
+  }
+
+  protected buildJoinTreeForRoot(root: JoinHint, cubesToJoin: JoinHints): JoinTree | null {
+    const self = this;
+
+    const { graph } = this;
+    if (graph === null) {
+      // JoinGraph was not compiled
+      return null;
+    }
+
+    if (Array.isArray(root)) {
+      const [newRoot, ...additionalToJoin] = root;
+      if (additionalToJoin.length > 0) {
+        cubesToJoin = [additionalToJoin, ...cubesToJoin];
+      }
+      root = newRoot;
+    }
+    const nodesJoined: Record<string, boolean> = {};
+    const result = cubesToJoin.flatMap(joinHints => {
+      if (!Array.isArray(joinHints)) {
+        joinHints = [joinHints];
+      }
+      let prevNode = root;
+      return joinHints.filter(toJoin => toJoin !== prevNode).map(toJoin => {
+        if (nodesJoined[toJoin]) {
+          prevNode = toJoin;
+          return { joins: [] };
+        }
+
+        const path = graph.path(prevNode, toJoin);
+        if (!path) {
+          return null;
+        }
+        if (!Array.isArray(path)) {
+          // Unexpected object return from graph, it should do so only when path cost was requested
+          return null;
+        }
+
+        const foundJoins = self.joinsByPath(path);
+        prevNode = toJoin;
+        nodesJoined[toJoin] = true;
+        return { cubes: path, joins: foundJoins };
+      });
+    }).reduce<{ joins: [number, JoinEdge][] } | null>((joined, res) => {
+      if (!res || !joined) {
+        return null;
+      }
+      return {
+        joins: [...joined.joins, ...res.joins.map((j, i): [number, JoinEdge] => [i + joined.joins.length, j])],
+      };
+    }, { joins: [] });
+
+    if (!result) {
+      return null;
+    }
+
+    // Each edge is one object per `from-to` pair (see `joinsByPath`), so equal edges are the same
+    // object and deduplicating by reference matches a deep comparison.
+    return {
+      joins: [...new Set(R.sortBy(([index]) => index, result.joins).map(([_, join]) => join))],
+      root
+    };
+  }
+
+  protected findMultiplicationFactorFor(cube: string, joins: JoinTreeJoins): boolean {
+    const visited: Record<string, boolean> = {};
+    const self = this;
+    function findIfMultipliedRecursive(currentCube: string): boolean {
+      if (visited[currentCube]) {
+        return false;
+      }
+      visited[currentCube] = true;
+      function nextNode(nextJoin: JoinEdge): string {
+        return nextJoin.from === currentCube ? nextJoin.to : nextJoin.from;
+      }
+      const nextJoins = joins.filter(j => j.from === currentCube || j.to === currentCube);
+      if (nextJoins.find(
+        nextJoin => self.checkIfCubeMultiplied(currentCube, nextJoin) && !visited[nextNode(nextJoin)]
+      )) {
+        return true;
+      }
+      return !!nextJoins.find(
+        nextJoin => findIfMultipliedRecursive(nextNode(nextJoin))
+      );
+    }
+    return findIfMultipliedRecursive(cube);
+  }
+
+  protected checkIfCubeMultiplied(cube: string, join: JoinEdge): boolean {
+    return join.from === cube && join.join.relationship === 'hasMany' ||
+      join.to === cube && join.join.relationship === 'belongsTo';
+  }
+
+  protected joinsByPath(path: string[]): JoinEdge[] {
+    return R.range(0, path.length - 1).map(i => this.edges[`${path[i]}-${path[i + 1]}`]);
+  }
+
+  public connectedComponents(): Record<string, number> {
+    if (!this.cachedConnectedComponents) {
+      let componentId = 1;
+      const components = {};
+      R.toPairs(this.nodes).map(nameToConnection => nameToConnection[0]).forEach(node => {
+        this.findConnectedComponent(componentId, node, components);
+        componentId += 1;
+      });
+      this.cachedConnectedComponents = components;
+    }
+    return this.cachedConnectedComponents;
+  }
+
+  protected findConnectedComponent(componentId: number, node: string, components: Record<string, number>): void {
+    if (!components[node]) {
+      components[node] = componentId;
+      R.toPairs(this.undirectedNodes[node])
+        .map(connectedNodeNames => connectedNodeNames[0])
+        .forEach(connectedNode => {
+          this.findConnectedComponent(componentId, connectedNode, components);
+        });
+    }
+  }
+}

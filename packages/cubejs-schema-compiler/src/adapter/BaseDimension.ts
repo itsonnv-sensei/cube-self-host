@@ -1,0 +1,175 @@
+import type { BaseQuery } from './BaseQuery';
+import type { DimensionDefinition, SegmentDefinition } from '../compiler/CubeEvaluator';
+
+export class BaseDimension {
+  public readonly expression: any;
+
+  public readonly expressionCubeName: any;
+
+  public readonly expressionName: string | undefined;
+
+  public readonly isMemberExpression: boolean = false;
+
+  public readonly joinHint: Array<string> = [];
+
+  // The path the member was requested by, when it goes through a join alias
+  public aliasPath: string | undefined;
+
+  public constructor(
+    protected readonly query: BaseQuery,
+    public readonly dimension: any
+  ) {
+    if (dimension && dimension.expression) {
+      this.expression = dimension.expression;
+      this.expressionCubeName = dimension.cubeName;
+      // In case of SQL push down expressionName doesn't contain cube name. It's just a column name.
+      this.expressionName = dimension.expressionName || `${dimension.cubeName}.${dimension.name}`;
+      this.isMemberExpression = !!dimension.definition;
+    } else {
+      // TODO move this `as` to static types
+      const dimensionPath = dimension as string | null;
+      if (dimensionPath !== null) {
+        const { path, joinHint, aliasPath } = this.query.memberPathForModel(dimensionPath);
+        this.dimension = path;
+        this.joinHint = joinHint;
+        this.aliasPath = aliasPath;
+      }
+    }
+  }
+
+  public selectColumns(): string[] | null {
+    return [`${this.dimensionSql()} ${this.aliasName()}`];
+  }
+
+  public hasNoRemapping(): boolean {
+    return this.dimensionSql() === this.aliasName();
+  }
+
+  public cumulativeSelectColumns() {
+    return [`${this.aliasName()}`];
+  }
+
+  public dimensionSql(): string {
+    if (this.expression) {
+      return this.convertTzForRawTimeDimensionIfNeeded(() => this.query.evaluateSymbolSql(this.expressionCubeName, this.expressionName!, this.definition(), 'dimension'));
+    }
+    if (this.query.cubeEvaluator.isSegment(this.dimension)) {
+      return this.query.wrapSegmentForDimensionSelect(this.query.dimensionSql(this));
+    }
+    const sql = this.convertTzForRawTimeDimensionIfNeeded(() => this.query.dimensionSql(this));
+    // Only the projection is wrapped: a wrapped column in a filter defeats index pruning
+    return this.definition().type === 'boolean' ? this.query.wrapBooleanDimension(sql) : sql;
+  }
+
+  // We need this for dimensions however we don't for filters for performance reasons
+  public convertTzForRawTimeDimensionIfNeeded(sql: () => string): string {
+    if (this.query.options.convertTzForRawTimeDimension) {
+      return this.query.evaluateSymbolSqlWithContext(sql, {
+        convertTzForRawTimeDimension: true
+      });
+    } else {
+      return sql();
+    }
+  }
+
+  public sqlDefinition() {
+    return this.dimensionDefinition().sql;
+  }
+
+  public getMembers() {
+    return [this];
+  }
+
+  public isMultiStage() {
+    if (this.expression) { // TODO
+      return false;
+    }
+    return this.definition().multiStage;
+  }
+
+  public cube() {
+    if (this.expression) {
+      return this.query.cubeEvaluator.cubeFromPath(this.expressionCubeName);
+    }
+    return this.query.cubeEvaluator.cubeFromPath(this.dimension);
+  }
+
+  public dimensionDefinition(): DimensionDefinition | SegmentDefinition {
+    if (this.query.cubeEvaluator.isSegment(this.dimension)) {
+      return this.query.cubeEvaluator.segmentByPath(this.dimension);
+    }
+
+    return this.query.cubeEvaluator.dimensionByPath(this.dimension);
+  }
+
+  public definition(): DimensionDefinition | SegmentDefinition {
+    if (this.expression) {
+      return {
+        sql: this.expression,
+        // TODO use actual dimension type even though it isn't used right now
+        type: 'number'
+      } as DimensionDefinition;
+    }
+
+    return this.dimensionDefinition();
+  }
+
+  public aliasName(): string | null {
+    // Require should be here because of cycle depend
+    return this.query.escapeColumnName(this.unescapedAliasName());
+  }
+
+  public unescapedAliasName(): string {
+    if (this.expression && this.expressionName) {
+      return this.query.aliasName(this.expressionName);
+    }
+
+    return this.query.aliasName(this.memberPath());
+  }
+
+  /**
+   * The path naming the member in the query and its output.
+   */
+  public memberPath(): string {
+    return this.aliasPath ?? this.dimension;
+  }
+
+  /**
+   * The column this dimension has in a pre-aggregation table, whatever alias the query
+   * asked for it.
+   */
+  public preAggregationColumnName(): string {
+    return this.query.escapeColumnName(
+      this.query.canonicalAliasName(this.expression && this.expressionName ? this.expressionName : this.dimension)
+    );
+  }
+
+  public dateFieldType() {
+    return this.dimensionDefinition().fieldType;
+  }
+
+  public path(): string[] | null {
+    if (this.expression) {
+      return null;
+    }
+
+    if (this.query.cubeEvaluator.isSegment(this.dimension)) {
+      return this.query.cubeEvaluator.parsePath('segments', this.dimension);
+    }
+
+    return this.query.cubeEvaluator.parsePath('dimensions', this.dimension);
+  }
+
+  public expressionPath(): string {
+    if (this.expression) {
+      return `expr:${this.expressionName}`;
+    }
+
+    const path = this.path();
+    if (path === null) {
+      // Sanity check, this should not actually happen because we checked this.expression earlier
+      throw new Error('Unexpected null path');
+    }
+    return this.query.cubeEvaluator.pathFromArray(path);
+  }
+}

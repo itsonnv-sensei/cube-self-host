@@ -1,0 +1,170 @@
+use super::planners::multi_stage::{check_multi_stage_depth, PlanningScope};
+use super::planners::QueryPlanner;
+use super::state::State;
+use super::QueryProperties;
+use crate::logical_plan::FilteredLeafMergeOptimizer;
+use crate::logical_plan::OriginalSqlCollector;
+use crate::logical_plan::PreAggregationOptimizer;
+use crate::logical_plan::PreAggregationUsage;
+use crate::logical_plan::RollingBaseScanOptimizer;
+use crate::logical_plan::RootQuery;
+use crate::logical_plan::StageCalculationFusionOptimizer;
+use crate::logical_plan::StageLeafScanOptimizer;
+use crate::physical_plan_builder::PhysicalPlanBuilder;
+use cubenativeutils::CubeError;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+pub struct TopLevelPlanner {
+    query_tools: Rc<State>,
+    request: Rc<QueryProperties>,
+}
+
+impl TopLevelPlanner {
+    pub fn new(request: Rc<QueryProperties>, query_tools: Rc<State>) -> Self {
+        Self {
+            request,
+            query_tools,
+        }
+    }
+
+    pub fn plan(&self) -> Result<(String, Vec<PreAggregationUsage>), CubeError> {
+        let options = self.query_tools.request_options();
+        check_multi_stage_depth(
+            &self.request.all_used_symbols()?,
+            options.max_multi_stage_depth(),
+        )?;
+
+        let query_planner = QueryPlanner::new(self.request.clone(), self.query_tools.clone());
+        let mut scope = PlanningScope::new();
+        let query = query_planner.plan(&mut scope)?;
+        let logical_plan = Rc::new(
+            RootQuery::builder()
+                .subqueries(scope.into_members())
+                .query(query)
+                .build(),
+        );
+        logical_plan.check_integrity()?;
+
+        let (optimized_plan, usages) = self.try_pre_aggregations(logical_plan.clone())?;
+        optimized_plan.check_integrity()?;
+
+        // Match-only mode (refresh/metadata path): the caller only needs the matched
+        // pre-aggregation(s), not the outer query SQL. Skip the physical build, which for a
+        // rolling-window measure would render a time series that requires a date range the
+        // refresh path doesn't provide (and which non-generated-time-series dialects can't
+        // build without one). The pre-agg's own load SQL is built separately on the JS side.
+        if options.is_pre_aggregations_match_only() {
+            return Ok((String::new(), usages));
+        }
+
+        // Ordering is load-bearing: merging is only safe once rollups have been
+        // matched, because a scan carrying two measures can no longer be served
+        // by a rollup holding one of them. Moved above `try_pre_aggregations`,
+        // a model storing one rollup per rolling measure silently falls back to
+        // the fact table for all of them.
+        let optimized_plan = RollingBaseScanOptimizer::new().optimize(optimized_plan)?;
+        optimized_plan.check_integrity()?;
+        let (optimized_plan, usages) = if options.multi_stage_leaf_merge() {
+            let (plan, folded_usages) =
+                FilteredLeafMergeOptimizer::new(&usages, self.query_tools.query_tools())
+                    .optimize(optimized_plan)?;
+            plan.check_integrity()?;
+            (plan, folded_usages.apply(usages))
+        } else {
+            (optimized_plan, usages)
+        };
+        // After the fold above: a leaf sharing its scan carries several
+        // measures, and the fold takes a leaf of one. Only Cube Store has been
+        // proven to run shared plans; a query a data source runs keeps its plan.
+        let served_by_cube_store =
+            !usages.is_empty() && usages.iter().all(|usage| usage.pre_aggregation.external());
+        let (optimized_plan, usages) = if options.multi_stage_scan_sharing() && served_by_cube_store
+        {
+            let (plan, folded_usages) =
+                StageLeafScanOptimizer::new(&usages).optimize(optimized_plan)?;
+            plan.check_integrity()?;
+            let plan = StageCalculationFusionOptimizer::new().optimize(plan)?;
+            plan.check_integrity()?;
+            (plan, folded_usages.apply(usages))
+        } else {
+            (optimized_plan, usages)
+        };
+        // A folded leaf leaves its inline subqueries unread.
+        let optimized_plan = optimized_plan.without_unread_inline_subqueries();
+        optimized_plan.check_integrity()?;
+
+        let is_external = if !usages.is_empty() {
+            usages.iter().all(|usage| usage.pre_aggregation.external())
+        } else {
+            false
+        };
+
+        let templates = self.query_tools.plan_sql_templates(is_external)?;
+        let union_full_key_aggregate = if is_external {
+            options.cubestore_union_full_key_aggregate()
+        } else {
+            options.union_full_key_aggregate()
+        };
+        let physical_plan_builder = PhysicalPlanBuilder::new(
+            self.query_tools.query_tools().clone(),
+            templates.clone(),
+            union_full_key_aggregate,
+        );
+
+        // Substitute a cube's base SQL with its `originalSql` pre-aggregation table when:
+        // reading (regular query), or building a rollup that opted in via
+        // `useOriginalSqlPreAggregationsInPreAggregation`.
+        let original_sql_pre_aggregations = if !self.request.is_pre_aggregation_query()
+            || options.use_original_sql_pre_aggregations_in_pre_aggregation()
+        {
+            OriginalSqlCollector::new(self.query_tools.query_tools().clone())
+                .collect(&optimized_plan)?
+        } else {
+            HashMap::new()
+        };
+
+        let physical_plan = physical_plan_builder.build(
+            optimized_plan,
+            original_sql_pre_aggregations,
+            options.is_total_query(),
+        )?;
+
+        let sql = physical_plan.to_sql(&templates)?;
+
+        Ok((sql, usages))
+    }
+
+    fn try_pre_aggregations(
+        &self,
+        plan: Rc<RootQuery>,
+    ) -> Result<(Rc<RootQuery>, Vec<PreAggregationUsage>), CubeError> {
+        let options = self.query_tools.request_options();
+        let result = if !self.request.is_pre_aggregation_query() {
+            let mut pre_aggregation_optimizer = PreAggregationOptimizer::new(
+                self.query_tools.clone(),
+                self.request.query_join_hints().clone(),
+                options.cubestore_support_multistage(),
+            );
+            let disable_external_pre_aggregations = options.disable_external_pre_aggregations();
+            let pre_aggregation_id = options.pre_aggregation_id();
+            if let Some(result) = pre_aggregation_optimizer.try_optimize(
+                plan.clone(),
+                disable_external_pre_aggregations,
+                pre_aggregation_id,
+            )? {
+                let usages = pre_aggregation_optimizer.take_usages();
+                if !usages.is_empty() {
+                    (result, usages)
+                } else {
+                    (plan.clone(), Vec::new())
+                }
+            } else {
+                (plan.clone(), Vec::new())
+            }
+        } else {
+            (plan.clone(), Vec::new())
+        };
+        Ok(result)
+    }
+}

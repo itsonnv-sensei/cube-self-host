@@ -1,0 +1,77 @@
+import { z } from 'zod';
+import { isValidRequestId, INVALID_REQUEST_ID_MESSAGE } from '@cubejs-backend/shared';
+
+const messageId = z.union([z.string().max(16), z.int()]).transform(String);
+
+export const validateMessageId = (value: unknown): string | undefined => {
+  const result = messageId.safeParse(value);
+  return result.success ? result.data : undefined;
+};
+
+const requestId = z.string().refine(isValidRequestId, INVALID_REQUEST_ID_MESSAGE).optional();
+
+export const authMessageSchema = z.object({
+  authorization: z.string(),
+}).strict();
+
+export const unsubscribeMessageSchema = z.object({
+  unsubscribe: messageId,
+}).strict();
+
+const queryParams = z.object({
+  query: z.unknown(),
+  queryType: z.string().optional(),
+  cache: z.string().optional(),
+}).strict();
+
+const queryOnlyParams = z.object({
+  query: z.unknown(),
+}).strict();
+
+// Method-based messages using discriminatedUnion
+export const methodMessageSchema = z.discriminatedUnion('method', [
+  z.object({
+    method: z.literal('load'),
+    messageId,
+    requestId,
+    params: queryParams,
+  }).strict(),
+  z.object({
+    method: z.literal('sql'),
+    messageId,
+    requestId,
+    params: queryOnlyParams,
+  }).strict(),
+  z.object({
+    method: z.literal('dry-run'),
+    messageId,
+    requestId,
+    params: queryOnlyParams,
+  }).strict(),
+  z.object({
+    method: z.literal('meta'),
+    messageId,
+    requestId,
+    params: z.object({
+      onlyViews: z.boolean().optional(),
+    }).strict().optional(),
+  }).strict(),
+  z.object({
+    method: z.literal('subscribe'),
+    messageId,
+    requestId,
+    params: queryParams,
+  }).strict(),
+  z.object({
+    method: z.literal('unsubscribe'),
+    messageId,
+    requestId,
+    params: z.object({}).strict().optional(),
+  }).strict(),
+]);
+
+// Export types
+export type AuthMessage = z.infer<typeof authMessageSchema>;
+export type UnsubscribeMessage = z.infer<typeof unsubscribeMessageSchema>;
+export type MethodMessage = z.infer<typeof methodMessageSchema>;
+export type WsMessage = AuthMessage | UnsubscribeMessage | MethodMessage;

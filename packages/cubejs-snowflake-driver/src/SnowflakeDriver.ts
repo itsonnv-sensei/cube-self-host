@@ -1,0 +1,1186 @@
+/**
+ * @copyright Cube Dev, Inc.
+ * @license Apache-2.0
+ * @fileoverview The `SnowflakeDriver` and related types declaration.
+ */
+
+import {
+  assertDataSource,
+  getEnv,
+  CancelablePromise,
+  extractRequestUUID,
+} from '@cubejs-backend/shared';
+import snowflake, { Column, Connection, DataType, RowStatement, StatementOption } from 'snowflake-sdk';
+import {
+  BaseDriver,
+  DownloadQueryResultsOptions,
+  DownloadQueryResultsResult,
+  DownloadTableCSVData,
+  DownloadTableMemoryData,
+  DriverCapabilities,
+  DriverInterface,
+  GenericDataBaseType,
+  QueryOptions,
+  StreamOptions,
+  StreamTableDataWithTypes,
+  TableStructure,
+  UnloadOptions,
+} from '@cubejs-backend/base-driver';
+import fs from 'fs/promises';
+import crypto from 'crypto';
+import { Readable } from 'stream';
+import { S3ClientConfig } from '@aws-sdk/client-s3';
+import { HydrationMap, HydrationStream } from './HydrationStream';
+import { hydrators } from './type-parsers';
+import { ConnectionError } from './errors';
+
+const SUPPORTED_BUCKET_TYPES = ['s3', 'gcs', 'azure'];
+export const CANCEL_ACK_TIMEOUT = 30 * 1000;
+
+const FETCH_AS_STRING: DataType[] = [
+  // It's not possible to store big numbers in Number, It's a common way how to handle it in Cube
+  'Number',
+  // VARIANT, OBJECT, ARRAY are mapped to JSON type in Snowflake SDK
+  'JSON',
+];
+
+type UnloadResponse = {
+  // eslint-disable-next-line camelcase
+  rows_unloaded: string
+};
+
+const SnowflakeToGenericType: Record<string, GenericDataBaseType> = {
+  // It's a limitation for now, because anyway we don't work with JSON objects in Cube Store.
+  object: 'HLL_SNOWFLAKE',
+  number: 'decimal',
+  // For some reason, snowflake SDK returns `fixed` type for DWH types like NUMBER(38, 15)
+  // @see https://docs.snowflake.com/en/sql-reference/data-types-numeric for more info on types
+  fixed: 'decimal',
+  // @see https://docs.snowflake.com/en/sql-reference/data-types-datetime
+  timestamp_ntz: 'timestamp',
+  timestamp_ltz: 'timestamp',
+  timestamp_tz: 'timestamp'
+};
+
+// User can create own stage to pass permission restrictions.
+export interface SnowflakeDriverExportAWS {
+  bucketType: 's3',
+  bucketName: string,
+  keyId?: string,
+  secretKey?: string,
+  region: string,
+  integrationName?: string,
+}
+
+export interface SnowflakeDriverExportGCS {
+  bucketType: 'gcs',
+  integrationName: string,
+  bucketName: string,
+  credentials: any,
+}
+
+export interface SnowflakeDriverExportAzure {
+  bucketType: 'azure',
+  bucketName: string,
+  azureKey?: string,
+  sasToken?: string,
+  integrationName?: string,
+  /**
+   * The client ID of a Microsoft Entra app registration.
+   */
+  clientId?: string,
+  /**
+   * ID of the application's Microsoft Entra tenant. Also called its directory ID.
+   */
+  tenantId?: string,
+  /**
+   * The path to a file containing a Kubernetes service account token that authenticates the identity.
+   */
+  tokenFilePath?: string,
+}
+
+export type SnowflakeDriverExportBucket = SnowflakeDriverExportAWS | SnowflakeDriverExportGCS
+  | SnowflakeDriverExportAzure;
+
+export interface SnowflakeDriverOptions {
+  host?: string,
+  account: string,
+  username: string,
+  password: string,
+  region?: string,
+  warehouse?: string,
+  role?: string,
+  clientSessionKeepAlive?: boolean,
+  database?: string,
+  authenticator?: string,
+  oauthToken?: string,
+  oauthTokenPath?: string,
+  token?: string,
+  privateKeyPath?: string,
+  privateKeyPass?: string,
+  privateKey?: string,
+  resultPrefetch?: number,
+  exportBucket?: SnowflakeDriverExportBucket,
+  executionTimeout?: number,
+  identIgnoreCase?: boolean,
+  application: string,
+  readOnly?: boolean,
+  queryTag?: string,
+
+  /**
+   * The export bucket CSV file escape symbol.
+   */
+  exportBucketCsvEscapeSymbol?: string,
+}
+
+type SessionParameterValue = string | number | boolean | undefined;
+
+export class SnowflakeDriver extends BaseDriver implements DriverInterface {
+  public static getDefaultConcurrency(): number {
+    return 8;
+  }
+
+  /**
+   * Returns the configurable driver options
+   * Note: It returns the unprefixed option names.
+   * In case of using multi-sources options need to be prefixed manually.
+   */
+  public static driverEnvVariables() {
+    return [
+      'CUBEJS_DB_NAME',
+      'CUBEJS_DB_USER',
+      'CUBEJS_DB_PASS',
+      'CUBEJS_DB_SNOWFLAKE_ACCOUNT',
+      'CUBEJS_DB_SNOWFLAKE_REGION',
+      'CUBEJS_DB_SNOWFLAKE_WAREHOUSE',
+      'CUBEJS_DB_SNOWFLAKE_ROLE',
+      'CUBEJS_DB_SNOWFLAKE_CLIENT_SESSION_KEEP_ALIVE',
+      'CUBEJS_DB_SNOWFLAKE_AUTHENTICATOR',
+      'CUBEJS_DB_SNOWFLAKE_OAUTH_TOKEN',
+      'CUBEJS_DB_SNOWFLAKE_OAUTH_TOKEN_PATH',
+      'CUBEJS_DB_SNOWFLAKE_HOST',
+      'CUBEJS_DB_SNOWFLAKE_PRIVATE_KEY',
+      'CUBEJS_DB_SNOWFLAKE_PRIVATE_KEY_PATH',
+      'CUBEJS_DB_SNOWFLAKE_PRIVATE_KEY_PASS',
+      'CUBEJS_DB_SNOWFLAKE_QUOTED_IDENTIFIERS_IGNORE_CASE',
+    ];
+  }
+
+  protected connection: Promise<Connection> | null = null;
+
+  protected readonly config: SnowflakeDriverOptions;
+
+  public constructor(
+    config: Partial<SnowflakeDriverOptions> & {
+      /**
+       * Data source name.
+       */
+      dataSource?: string,
+
+      /**
+       * Whether this driver is used for pre-aggregations.
+       */
+      preAggregations?: boolean,
+
+      /**
+       * Max pool size value for the [cube]<-->[db] pool.
+       */
+      maxPoolSize?: number,
+
+      /**
+       * Time to wait for a response from a connection after validation
+       * request before determining it as not valid. Default - 10000 ms.
+       */
+      testConnectionTimeout?: number,
+    } = {}
+  ) {
+    super({
+      testConnectionTimeout: config.testConnectionTimeout,
+    });
+
+    const dataSource =
+      config.dataSource ||
+      assertDataSource('default');
+    const preAggregations = config.preAggregations || false;
+
+    let privateKey = getEnv('snowflakePrivateKey', { dataSource, preAggregations });
+
+    if (privateKey) {
+      // If the private key is encrypted - we need to decrypt it before passing to
+      // snowflake sdk.
+      if (privateKey.includes('BEGIN ENCRYPTED PRIVATE KEY')) {
+        const keyPasswd = getEnv('snowflakePrivateKeyPass', { dataSource, preAggregations });
+
+        if (!keyPasswd) {
+          throw new Error(
+            'Snowflake encrypted private key provided, but no passphrase was given.'
+          );
+        }
+
+        const privateKeyObject = crypto.createPrivateKey({
+          key: privateKey,
+          format: 'pem',
+          passphrase: keyPasswd
+        });
+
+        privateKey = privateKeyObject.export({
+          format: 'pem',
+          type: 'pkcs8'
+        });
+      }
+    }
+
+    snowflake.configure({ logLevel: 'OFF' });
+
+    this.config = {
+      readOnly: false,
+      host: getEnv('snowflakeHost', { dataSource, preAggregations }),
+      account: getEnv('snowflakeAccount', { dataSource, preAggregations }),
+      region: getEnv('snowflakeRegion', { dataSource, preAggregations }),
+      warehouse: getEnv('snowflakeWarehouse', { dataSource, preAggregations }),
+      role: getEnv('snowflakeRole', { dataSource, preAggregations }),
+      clientSessionKeepAlive: getEnv('snowflakeSessionKeepAlive', { dataSource, preAggregations }),
+      database: getEnv('dbName', { dataSource, preAggregations }),
+      username: getEnv('dbUser', { dataSource, preAggregations }),
+      password: getEnv('dbPass', { dataSource, preAggregations }),
+      authenticator: getEnv('snowflakeAuthenticator', { dataSource, preAggregations }),
+      oauthToken: getEnv('snowflakeOAuthToken', { dataSource, preAggregations }),
+      oauthTokenPath: getEnv('snowflakeOAuthTokenPath', { dataSource, preAggregations }),
+      privateKeyPath: getEnv('snowflakePrivateKeyPath', { dataSource, preAggregations }),
+      privateKeyPass: getEnv('snowflakePrivateKeyPass', { dataSource, preAggregations }),
+      ...(privateKey ? { privateKey } : {}),
+      exportBucket: this.getExportBucket(dataSource, preAggregations),
+      resultPrefetch: 1,
+      executionTimeout: getEnv('dbQueryTimeout', { dataSource, preAggregations }),
+      identIgnoreCase: getEnv('snowflakeQuotedIdentIgnoreCase', { dataSource, preAggregations }),
+      exportBucketCsvEscapeSymbol: getEnv('dbExportBucketCsvEscapeSymbol', { dataSource, preAggregations }),
+      application: 'CubeDev_Cube',
+      ...config
+    };
+  }
+
+  /**
+   * Driver read-only flag.
+   */
+  public readOnly(): boolean {
+    return !!this.config.readOnly;
+  }
+
+  /**
+   * Returns driver's capabilities object.
+   */
+  public capabilities(): DriverCapabilities {
+    return {
+      unloadWithoutTempTable: true,
+      incrementalSchemaLoading: true,
+    };
+  }
+
+  protected createExportBucket(
+    dataSource: string,
+    bucketType: string,
+    preAggregations?: boolean,
+  ): SnowflakeDriverExportBucket {
+    if (bucketType === 's3') {
+      // integrationName is optional for s3
+      const integrationName = getEnv('dbExportIntegration', { dataSource, preAggregations });
+      // keyId and secretKey are optional for s3 if IAM role is used
+      const keyId = getEnv('dbExportBucketAwsKey', { dataSource, preAggregations });
+      const secretKey = getEnv('dbExportBucketAwsSecret', { dataSource, preAggregations });
+
+      return {
+        bucketType,
+        bucketName: getEnv('dbExportBucket', { dataSource, preAggregations }),
+        region: getEnv('dbExportBucketAwsRegion', { dataSource, preAggregations }),
+        ...(integrationName !== undefined && { integrationName }),
+        ...(keyId !== undefined && { keyId }),
+        ...(secretKey !== undefined && { secretKey }),
+      };
+    }
+
+    if (bucketType === 'gcs') {
+      // integrationName is required for gcs as the only possible way in snowflake
+      return {
+        bucketType,
+        bucketName: getEnv('dbExportBucket', { dataSource, preAggregations }),
+        integrationName: getEnv('dbExportIntegration', { dataSource, preAggregations }),
+        credentials: getEnv('dbExportGCSCredentials', { dataSource, preAggregations }),
+      };
+    }
+
+    if (bucketType === 'azure') {
+      // integrationName is optional for azure
+      const integrationName = getEnv('dbExportIntegration', { dataSource, preAggregations });
+      // sasToken is optional for azure if storage integration is used
+      const sasToken = getEnv('dbExportAzureSasToken', { dataSource, preAggregations });
+
+      if (!integrationName && !sasToken) {
+        throw new Error(
+          'Unsupported exportBucket configuration, some keys are empty: integrationName|sasToken'
+        );
+      }
+
+      // azureKey is optional if DefaultAzureCredential() is used
+      const azureKey = getEnv('dbExportBucketAzureKey', { dataSource, preAggregations });
+
+      // These 3 options make sense in case you want to authorize to Azure from
+      // application running in the k8s environment.
+      const clientId = getEnv('dbExportBucketAzureClientId', { dataSource, preAggregations });
+      const tenantId = getEnv('dbExportBucketAzureTenantId', { dataSource, preAggregations });
+      const tokenFilePath = getEnv('dbExportBucketAzureTokenFilePAth', { dataSource, preAggregations });
+
+      return {
+        bucketType,
+        bucketName: getEnv('dbExportBucket', { dataSource, preAggregations }),
+        ...(integrationName !== undefined && { integrationName }),
+        ...(sasToken !== undefined && { sasToken }),
+        ...(azureKey !== undefined && { azureKey }),
+        ...(clientId !== undefined && { clientId }),
+        ...(tenantId !== undefined && { tenantId }),
+        ...(tokenFilePath !== undefined && { tokenFilePath }),
+      };
+    }
+
+    throw new Error(
+      `Unsupported EXPORT_BUCKET_TYPE, supported: ${SUPPORTED_BUCKET_TYPES.join(',')}`
+    );
+  }
+
+  private getRequiredExportBucketKeys(
+    exportBucket: SnowflakeDriverExportBucket,
+    emptyKeys: string[]
+  ): string[] {
+    if (exportBucket.bucketType === 's3') {
+      const s3Config = exportBucket as SnowflakeDriverExportAWS;
+      if (s3Config.integrationName) {
+        return emptyKeys.filter(key => key !== 'keyId' && key !== 'secretKey');
+      }
+    }
+
+    return emptyKeys;
+  }
+
+  protected getExportBucket(
+    dataSource: string,
+    preAggregations?: boolean,
+  ): SnowflakeDriverExportBucket | undefined {
+    const bucketType = getEnv('dbExportBucketType', {
+      dataSource,
+      preAggregations,
+      supported: SUPPORTED_BUCKET_TYPES,
+    });
+    if (bucketType) {
+      const exportBucket = this.createExportBucket(
+        dataSource,
+        bucketType,
+        preAggregations,
+      );
+
+      const emptyKeys = Object.keys(exportBucket)
+        .filter((key: string) => exportBucket[<keyof SnowflakeDriverExportBucket>key] === undefined);
+      const keysToValidate = this.getRequiredExportBucketKeys(exportBucket, emptyKeys);
+
+      if (keysToValidate.length) {
+        throw new Error(
+          `Unsupported configuration exportBucket, some configuration keys are empty: ${keysToValidate.join(',')}`
+        );
+      }
+
+      return exportBucket;
+    }
+
+    return undefined;
+  }
+
+  private async readOAuthToken() {
+    const tokenPath = this.config.oauthTokenPath || '/snowflake/session/token';
+
+    try {
+      await fs.access(tokenPath);
+    } catch (error) {
+      throw new Error(`File ${tokenPath} provided by CUBEJS_DB_SNOWFLAKE_OAUTH_TOKEN_PATH does not exist.`);
+    }
+
+    const token = await fs.readFile(tokenPath, 'utf8');
+    return token.trim();
+  }
+
+  private async prepareConnectOptions(): Promise<snowflake.ConnectionOptions> {
+    const config: Record<string, any> = {
+      account: this.config.account,
+      region: this.config.region,
+      host: this.config.host,
+      application: this.config.application,
+      authenticator: this.config.authenticator,
+      clientSessionKeepAlive: this.config.clientSessionKeepAlive,
+      database: this.config.database,
+      warehouse: this.config.warehouse,
+      role: this.config.role,
+      resultPrefetch: this.config.resultPrefetch,
+    };
+
+    if (this.config.queryTag) {
+      config.queryTag = this.config.queryTag;
+    }
+
+    if (this.config.authenticator?.toUpperCase() === 'OAUTH') {
+      config.token = this.config.oauthToken || await this.readOAuthToken();
+    } else if (this.config.authenticator?.toUpperCase() === 'SNOWFLAKE_JWT') {
+      config.username = this.config.username;
+      config.privateKey = this.config.privateKey;
+      config.privateKeyPath = this.config.privateKeyPath;
+      config.privateKeyPass = this.config.privateKeyPass;
+    } else {
+      config.username = this.config.username;
+      config.password = this.config.password;
+    }
+
+    return config as snowflake.ConnectionOptions;
+  }
+
+  protected async createConnection() {
+    const config = await this.prepareConnectOptions();
+
+    return snowflake.createConnection(config);
+  }
+
+  /**
+   * Test driver's connection.
+   */
+  public async testConnection() {
+    let connection: Connection;
+
+    try {
+      connection = await this.createConnection();
+    } catch (e) {
+      throw new ConnectionError(e as Error);
+    }
+
+    const destroy = () => new Promise<void>(
+      (resolve, reject) => connection.destroy((err) => (err ? reject(err) : resolve()))
+    );
+
+    let failure: ConnectionError | undefined;
+
+    try {
+      await new Promise(
+        (resolve, reject) => connection.connect((err, conn) => (err ? reject(err) : resolve(conn)))
+      );
+
+      if (!connection.isUp()) {
+        failure = new ConnectionError(new Error('connection is not up after connect'));
+      }
+    } catch (e) {
+      failure = new ConnectionError(e as Error);
+    }
+
+    if (failure) {
+      // A failed connection still holds HTTP agents with keep-alive sockets that only
+      // destroy() releases; its own error (not connected) must not hide the failure.
+      await destroy().catch(() => undefined);
+      throw failure;
+    }
+
+    await destroy();
+  }
+
+  /**
+   * Values are interpolated rather than bound because Snowflake does not
+   * support bind variables in `ALTER SESSION SET` (it rejects `?` with
+   * "invalid value [?] for parameter"; see
+   * snowflakedb/snowflake-connector-nodejs#315).
+   *
+   * I've tested it on 04 jun 2026, and it still does not work.
+   */
+  protected buildAlterSessionSql(params: Record<string, SessionParameterValue>): string {
+    const assignments = Object.entries(params)
+      .filter(([, value]) => value !== undefined)
+      .map(([key, value]) => `${key} = ${typeof value === 'string' ? `'${value}'` : value}`)
+      .join(', ');
+
+    return `ALTER SESSION SET ${assignments}`;
+  }
+
+  protected async initConnection() {
+    try {
+      const connection = await this.createConnection();
+
+      await new Promise(
+        (resolve, reject) => connection.connect((err, conn) => (err ? reject(err) : resolve(conn)))
+      );
+
+      await this.execute(
+        connection,
+        this.buildAlterSessionSql({
+          TIMEZONE: 'UTC',
+          STATEMENT_TIMEOUT_IN_SECONDS: this.config.executionTimeout,
+          QUOTED_IDENTIFIERS_IGNORE_CASE: this.config.identIgnoreCase,
+        }),
+        [],
+        false,
+      );
+      return connection;
+    } catch (e) {
+      this.connection = null;
+
+      throw e;
+    }
+  }
+
+  /**
+   * Resolves connection to the Snowflake.
+   */
+  protected async getConnection(): Promise<Connection> {
+    if (this.connection) {
+      const connection = await this.connection;
+
+      // Return a connection if not in a fatal state.
+      if (connection.isUp()) {
+        return connection;
+      }
+    }
+
+    this.connection = this.initConnection();
+    return this.connection;
+  }
+
+  /**
+   * Executes query and returns queried rows.
+   * Returns a cancelable promise that will abort the Snowflake statement on cancel.
+   */
+  public query<R = unknown>(query: string, values?: unknown[], options?: QueryOptions): CancelablePromise<R> {
+    return this.execute<R>(this.getConnection(), query, values, true, options?.requestId);
+  }
+
+  /**
+   * Determines whether export bucket feature is configured or not.
+   */
+  public async isUnloadSupported() {
+    return this.config.exportBucket !== undefined;
+  }
+
+  /**
+   * Returns to the Cubestore an object with links to unloaded to the
+   * export bucket data.
+   */
+  public async unload(
+    tableName: string,
+    options: UnloadOptions,
+  ): Promise<DownloadTableCSVData> {
+    if (!this.config.exportBucket) {
+      throw new Error('Export bucket is not configured.');
+    }
+    if (!SUPPORTED_BUCKET_TYPES.includes(this.config.exportBucket.bucketType as string)) {
+      throw new Error(`Unsupported export bucket type: ${
+        this.config.exportBucket.bucketType
+      }`);
+    }
+
+    const { types, exportedCount } = options.query
+      ? await this.unloadWithSql(tableName, options)
+      : await this.unloadWithTable(tableName, options);
+    // Snowflake doesn't produce csv files if no data is exported (no data rows)
+    // so it's important not to call getCsvFiles(), because it checks for empty files list
+    // and throws an error.
+    const csvFile = exportedCount > 0 ? await this.getCsvFiles(tableName) : [];
+
+    return {
+      exportBucketCsvEscapeSymbol: this.config.exportBucketCsvEscapeSymbol,
+      csvFile,
+      types,
+      csvNoHeader: true,
+    };
+  }
+
+  private buildBucketUrl(tableName: string): string {
+    const { bucketType } = <SnowflakeDriverExportBucket> this.config.exportBucket;
+
+    let bucketName: string;
+    let exportPrefix: string;
+    let path: string;
+
+    if (bucketType === 'azure') {
+      ({ bucketName, path } = this.parseBucketUrl(this.config.exportBucket!.bucketName));
+      const pathArr = path.split('/');
+      bucketName = `${bucketName}/${pathArr[0]}`;
+      exportPrefix = pathArr.length > 1 ? `${pathArr.slice(1).join('/')}/${tableName}` : tableName;
+    } else {
+      ({ bucketName, path } = this.parseBucketUrl(this.config.exportBucket!.bucketName));
+      exportPrefix = path ? `${path}/${tableName}` : tableName;
+    }
+
+    return `${bucketType}://${bucketName}/${exportPrefix}/`;
+  }
+
+  /**
+   * Unload data from a SQL query to an export bucket.
+   */
+  private async unloadWithSql(
+    tableName: string,
+    options: UnloadOptions,
+  ): Promise<{ types: TableStructure, exportedCount: number }> {
+    if (!options.query) {
+      throw new Error('Unload query is missed.');
+    } else {
+      const types = await this.queryColumnTypes(options.query.sql, options.query.params, { requestId: options.requestId });
+      const connection = await this.getConnection();
+      const bucketUrl = this.buildBucketUrl(tableName);
+
+      const unloadSql = `
+        COPY INTO '${bucketUrl}'
+        FROM (${options.query.sql})
+        ${this.exportOptionsClause(options)}`;
+      const result = await this.execute<UnloadResponse[]>(
+        connection,
+        unloadSql,
+        options.query.params,
+        false,
+        options.requestId,
+      );
+      if (!result) {
+        throw new Error('Missing `COPY INTO` query result.');
+      }
+      return { types, exportedCount: parseInt(result[0].rows_unloaded, 10) };
+    }
+  }
+
+  /**
+   * Returns an array of queried fields meta info.
+   */
+  public queryColumnTypes(sql: string, params: unknown[], options?: QueryOptions): CancelablePromise<TableStructure> {
+    return this.executeCancelable<TableStructure>(
+      this.getConnection(),
+      {
+        sqlText: `${sql} LIMIT 0`,
+        binds: <string[] | undefined>params,
+        fetchAsString: FETCH_AS_STRING,
+        parameters: this.statementParameters(options?.requestId),
+      },
+      (stmt) => this.getTypes(stmt),
+    );
+  }
+
+  /**
+   * Unload data from a temp table to an export bucket.
+   */
+  private async unloadWithTable(
+    tableName: string,
+    options: UnloadOptions,
+  ): Promise<{ types: TableStructure, exportedCount: number }> {
+    const types = await this.tableColumnTypes(tableName, { requestId: options.requestId });
+    const connection = await this.getConnection();
+    const bucketUrl = this.buildBucketUrl(tableName);
+
+    const unloadSql = `
+      COPY INTO '${bucketUrl}'
+      FROM ${tableName}
+      ${this.exportOptionsClause(options)}`;
+    const result = await this.execute<UnloadResponse[]>(
+      connection,
+      unloadSql,
+      [],
+      false,
+      options.requestId,
+    );
+
+    if (!result) {
+      throw new Error('Missing `COPY INTO` query result.');
+    }
+
+    return { types, exportedCount: parseInt(result[0].rows_unloaded, 10) };
+  }
+
+  /**
+   * Returns an array of table fields meta info.
+   */
+  public override async tableColumnTypes(table: string, options?: QueryOptions) {
+    const [schema, name] = table.split('.');
+    const columns = await this.query<{
+      COLUMN_NAME: string,
+      DATA_TYPE: string,
+      NUMERIC_PRECISION: number | null,
+      NUMERIC_SCALE: number | null
+    }[]>(
+      `SELECT COLUMNS.COLUMN_NAME,
+        CASE
+          WHEN
+            COLUMNS.NUMERIC_SCALE = 0 AND
+            COLUMNS.DATA_TYPE = 'NUMBER'
+          THEN 'int'
+          ELSE COLUMNS.DATA_TYPE
+        END as DATA_TYPE,
+        COLUMNS.NUMERIC_PRECISION,
+        COLUMNS.NUMERIC_SCALE
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE
+        TABLE_NAME = ${this.param(0)} AND
+        TABLE_SCHEMA = ${this.param(1)}
+      ORDER BY ORDINAL_POSITION`,
+      [name.toUpperCase(), schema.toUpperCase()],
+      options,
+    );
+    return columns.map(c => ({
+      name: c.COLUMN_NAME,
+      type: this.toGenericType(c.DATA_TYPE, c.NUMERIC_PRECISION, c.NUMERIC_SCALE),
+    }));
+  }
+
+  /**
+   * Returns export options clause.
+   */
+  private exportOptionsClause(options: UnloadOptions): string {
+    const { bucketType } =
+      <SnowflakeDriverExportBucket> this.config.exportBucket;
+    const optionsToExport: Record<string, string> = {
+      HEADER: 'false',
+      INCLUDE_QUERY_ID: 'true',
+      MAX_FILE_SIZE: (options.maxFileSize * 1024 * 1024).toFixed(),
+      FILE_FORMAT: '(' +
+        'TYPE = CSV, ' +
+        'COMPRESSION = GZIP, ' +
+        'DATE_FORMAT = \'YYYY-MM-DD\', ' +
+        'TIMESTAMP_FORMAT = \'YYYY-MM-DD"T"HH24:MI:SS.FF3TZH:TZM\', ' +
+        'FIELD_OPTIONALLY_ENCLOSED_BY = \'"\'' +
+        ')',
+    };
+    if (bucketType === 's3') {
+      const conf = <SnowflakeDriverExportAWS> this.config.exportBucket;
+
+      // Storage integration export flow takes precedence over direct auth if it is defined
+      if (conf.integrationName) {
+        optionsToExport.STORAGE_INTEGRATION = conf.integrationName;
+      } else if (conf.keyId && conf.secretKey) {
+        optionsToExport.CREDENTIALS = `(AWS_KEY_ID = '${conf.keyId}' AWS_SECRET_KEY = '${conf.secretKey}')`;
+      }
+    } else if (bucketType === 'gcs') {
+      optionsToExport.STORAGE_INTEGRATION = (
+        <SnowflakeDriverExportGCS> this.config.exportBucket
+      ).integrationName;
+    } else if (bucketType === 'azure') {
+      // @see https://docs.snowflake.com/en/sql-reference/sql/copy-into-location
+      // @see https://docs.snowflake.com/en/user-guide/data-unload-azure
+      const conf = <SnowflakeDriverExportAzure> this.config.exportBucket;
+
+      // Storage integration export flow takes precedence over direct auth if it is defined
+      if (conf.integrationName) {
+        optionsToExport.STORAGE_INTEGRATION = conf.integrationName;
+      } else {
+        optionsToExport.CREDENTIALS = `(AZURE_SAS_TOKEN = '${conf.sasToken}')`;
+      }
+    } else {
+      throw new Error('Unsupported export bucket type.');
+    }
+    const clause = Object.entries(optionsToExport)
+      .map(([key, value]) => `${key} = ${value}`)
+      .join(' ');
+    return clause;
+  }
+
+  /**
+   * Returns an array of signed URLs of the unloaded csv files.
+   */
+  private async getCsvFiles(tableName: string): Promise<string[]> {
+    const { bucketType } =
+      <SnowflakeDriverExportBucket> this.config.exportBucket;
+
+    if (bucketType === 's3') {
+      const { keyId, secretKey, region } = <SnowflakeDriverExportAWS> this.config.exportBucket;
+
+      const { bucketName, path } = this.parseBucketUrl(this.config.exportBucket!.bucketName);
+      const exportPrefix = path ? `${path}/${tableName}` : tableName;
+
+      const s3Config: S3ClientConfig = { region };
+      if (keyId && secretKey) {
+        // If access key and secret are provided, use them as credentials
+        // Otherwise, let the SDK use the default credential chain (IRSA, instance profile, etc.)
+        s3Config.credentials = {
+          accessKeyId: keyId,
+          secretAccessKey: secretKey,
+        };
+      }
+
+      return this.extractUnloadedFilesFromS3(
+        s3Config,
+        bucketName,
+        exportPrefix,
+      );
+    } else if (bucketType === 'gcs') {
+      const { credentials } = (
+        <SnowflakeDriverExportGCS> this.config.exportBucket
+      );
+
+      const { bucketName, path } = this.parseBucketUrl(this.config.exportBucket!.bucketName);
+      const exportPrefix = path ? `${path}/${tableName}` : tableName;
+
+      return this.extractFilesFromGCS({ credentials }, bucketName, exportPrefix);
+    } else if (bucketType === 'azure') {
+      const { azureKey, sasToken, clientId, tenantId, tokenFilePath } = (
+        <SnowflakeDriverExportAzure> this.config.exportBucket
+      );
+
+      const { bucketName, path } = this.parseBucketUrl(this.config.exportBucket!.bucketName);
+      const pathArr = path.split('/');
+      const azureBucketPath = `${bucketName}/${pathArr[0]}`;
+
+      const exportPrefix = pathArr.length > 1 ? `${pathArr.slice(1).join('/')}/${tableName}` : tableName;
+
+      return this.extractFilesFromAzure(
+        { azureKey, sasToken, clientId, tenantId, tokenFilePath },
+        azureBucketPath,
+        exportPrefix,
+      );
+    } else {
+      throw new Error(`Unsupported export bucket type: ${bucketType}`);
+    }
+  }
+
+  /**
+   * Executes a query and returns either query result memory data or
+   * query result stream, depending on options.
+   */
+  public downloadQueryResults(
+    query: string,
+    values: unknown[],
+    options: DownloadQueryResultsOptions,
+  ): CancelablePromise<DownloadQueryResultsResult> {
+    if (!options.streamImport) {
+      return this.memory(query, values, options.requestId);
+    } else {
+      return this.stream(query, values, options);
+    }
+  }
+
+  /**
+   * Executes query and returns table memory data that includes rows
+   * and queried fields types.
+   */
+  public memory(
+    query: string,
+    values: unknown[],
+    requestId?: string,
+  ): CancelablePromise<DownloadTableMemoryData & { types: TableStructure }> {
+    return this.executeCancelable<DownloadTableMemoryData & { types: TableStructure }>(
+      this.getConnection(),
+      {
+        sqlText: query,
+        binds: <string[] | undefined>values,
+        fetchAsString: FETCH_AS_STRING,
+        parameters: this.statementParameters(requestId),
+      },
+      (stmt, rows) => {
+        const hydrationMap = this.generateHydrationMap(stmt.getColumns() ?? []);
+        const types: { name: string, type: string }[] =
+          this.getTypes(stmt);
+        if (rows?.length && Object.keys(hydrationMap).length) {
+          for (const row of rows) {
+            for (const [field, toValue] of Object.entries(hydrationMap)) {
+              if (row.hasOwnProperty(field)) {
+                row[field] = toValue(row[field]);
+              }
+            }
+          }
+        }
+        return { types, rows: rows || [] };
+      },
+    );
+  }
+
+  /**
+   * Returns stream table object that includes query result stream and
+   * queried fields types.
+   */
+  public stream(
+    query: string,
+    values: unknown[],
+    options: StreamOptions,
+  ): CancelablePromise<StreamTableDataWithTypes> {
+    const stmtPromise = this.executeCancelable<RowStatement>(
+      this.getConnection(),
+      {
+        sqlText: query,
+        binds: <string[] | undefined>values,
+        fetchAsString: FETCH_AS_STRING,
+        streamResult: true,
+        parameters: this.statementParameters(options?.requestId),
+      },
+      (stmt) => stmt,
+    );
+
+    // Reused by release() below. It is idempotent and a no-op once the
+    // statement settled, so a stream that finished normally is never
+    // needlessly aborted, and release() + cancel() cannot double-abort.
+    const abort = stmtPromise.cancel;
+
+    const promise = <CancelablePromise<StreamTableDataWithTypes>>stmtPromise.then((stmt) => {
+      const types: { name: string, type: string }[] =
+        this.getTypes(stmt);
+      const hydrationMap = this.generateHydrationMap(stmt.getColumns() ?? []);
+
+      const sourceStream = stmt.streamRows();
+      const rowStream = this.buildRowStream(sourceStream, hydrationMap);
+
+      return {
+        rowStream,
+        types,
+        release: async () => {
+          // No-op when the statement already completed, which is the normal
+          // path: QueryCache's streamHandler calls release() from
+          // rowStream.once('end'). Only reaches Snowflake when the consumer
+          // bailed out before the statement finished.
+          await abort();
+
+          // .pipe() does not propagate destroy() upstream, so stop the SDK's
+          // pull-based chunk downloader explicitly.
+          if (!sourceStream.readableEnded) {
+            sourceStream.destroy();
+          }
+
+          if (rowStream !== sourceStream && !rowStream.readableEnded) {
+            rowStream.destroy();
+          }
+        },
+      };
+    });
+    promise.cancel = abort;
+
+    return promise;
+  }
+
+  protected buildRowStream(source: Readable, hydrationMap: HydrationMap): Readable {
+    if (!Object.keys(hydrationMap).length) {
+      return source;
+    }
+
+    const rowStream = new HydrationStream(hydrationMap);
+
+    // Attached before pipe() resumes the source, so no failure can land before
+    // anyone is listening. destroy() on an already destroyed stream is a no-op,
+    // which is what keeps a failure arriving after release() silent instead of
+    // surfacing on a stream the consumer has already finished with.
+    source.on('error', (err) => rowStream.destroy(err));
+
+    return source.pipe(rowStream);
+  }
+
+  private getTypes(stmt: RowStatement) {
+    return (stmt.getColumns() ?? []).map((column) => {
+      const type = {
+        name: column.getName().toLowerCase(),
+        type: '',
+      };
+      if (column.isNumber()) {
+        const precision = column.getPrecision();
+        const scale = column.getScale();
+
+        if (scale === 0) {
+          type.type = 'int';
+        } else {
+          type.type = this.toGenericType(column.getType(), precision, scale);
+        }
+      } else {
+        type.type = this.toGenericType(column.getType());
+      }
+      return type;
+    });
+  }
+
+  protected generateHydrationMap(columns: Column[]): HydrationMap {
+    const hydrationMap: Record<string, any> = {};
+
+    for (const column of columns) {
+      for (const hydrator of hydrators) {
+        if (hydrator.types.includes(column.getType())) {
+          const fnOrNull = hydrator.toValue(column);
+          if (fnOrNull) {
+            hydrationMap[column.getName()] = fnOrNull;
+          }
+
+          break;
+        }
+      }
+    }
+
+    return hydrationMap;
+  }
+
+  protected cancelStatement(stmt: RowStatement): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let settled = false;
+
+      const finish = (warning?: string, error?: any) => {
+        // The SDK is free to call back after the timeout has already given up,
+        // and a synchronous throw can land after the callback fired.
+        if (settled) {
+          return;
+        }
+
+        settled = true;
+
+        if (timer) {
+          clearTimeout(timer);
+        }
+
+        if (warning && this.logger) {
+          this.logger(warning, {
+            queryId: stmt.getQueryId(),
+            ...(error !== undefined && {
+              error: (error?.stack || error?.message || error)?.toString(),
+            }),
+          });
+        }
+
+        resolve();
+      };
+
+      timer = setTimeout(
+        () => finish('Snowflake statement cancel timeout'),
+        CANCEL_ACK_TIMEOUT,
+      );
+
+      try {
+        stmt.cancel((err) => finish(err ? 'Snowflake statement cancel error' : undefined, err));
+      } catch (e) {
+        finish('Snowflake statement cancel error', e);
+      }
+    });
+  }
+
+  /**
+   * Tags the statement with the Cube request id, so it can be traced in Snowflake `QUERY_HISTORY`.
+   * A configured `queryTag` wins: the SDK overwrites the statement `QUERY_TAG` with it anyway.
+   */
+  protected statementParameters(requestId?: string): StatementOption['parameters'] {
+    if (!requestId || this.config.queryTag) {
+      return undefined;
+    }
+
+    return { QUERY_TAG: extractRequestUUID(requestId) };
+  }
+
+  protected executeCancelable<R>(
+    connectionPromise: Promise<Connection>,
+    options: Omit<StatementOption, 'complete'>,
+    onComplete: (stmt: RowStatement, rows: any[] | undefined) => R | PromiseLike<R>,
+  ): CancelablePromise<R> {
+    let stmt: RowStatement | undefined;
+    let cancelled = false;
+    let settled = false;
+
+    const promise = <CancelablePromise<R>>(async () => {
+      const connection = await connectionPromise;
+
+      if (cancelled) {
+        // Cancelled while we were still connecting - never issue the statement.
+        throw new Error('Query was cancelled');
+      }
+
+      return new Promise<R>((resolve, reject) => {
+        stmt = connection.execute({
+          ...options,
+          complete: (err, statement, rows) => {
+            settled = true;
+
+            if (cancelled) {
+              // Snowflake reports its own `SQL execution canceled.` here.
+              // Normalize it so callers see one consistent message, and so a
+              // query that happened to succeed microseconds before the abort
+              // landed does not return a result nobody is waiting for anymore.
+              reject(new Error('Query was cancelled'));
+              return;
+            }
+
+            if (err) {
+              reject(err);
+              return;
+            }
+
+            resolve(onComplete(<RowStatement>statement, rows));
+          },
+        });
+      });
+    })();
+
+    promise.cancel = async () => {
+      if (cancelled || settled) {
+        return;
+      }
+
+      cancelled = true;
+
+      if (stmt) {
+        await this.cancelStatement(stmt);
+      }
+    };
+
+    return promise;
+  }
+
+  protected execute<R = unknown>(
+    connection: Connection | Promise<Connection>,
+    query: string,
+    values?: unknown[],
+    rehydrate: boolean = true,
+    requestId?: string,
+  ): CancelablePromise<R> {
+    return this.executeCancelable<R>(
+      Promise.resolve(connection),
+      {
+        sqlText: query,
+        binds: <string[] | undefined>values,
+        fetchAsString: FETCH_AS_STRING,
+        parameters: this.statementParameters(requestId),
+      },
+      (stmt, rows) => {
+        if (rehydrate && rows?.length) {
+          const hydrationMap = this.generateHydrationMap(stmt.getColumns() ?? []);
+          if (Object.keys(hydrationMap).length) {
+            for (const row of rows) {
+              for (const [field, toValue] of Object.entries(hydrationMap)) {
+                if (row.hasOwnProperty(field)) {
+                  row[field] = toValue(row[field]);
+                }
+              }
+            }
+          }
+        }
+
+        return <any>rows;
+      },
+    );
+  }
+
+  public informationSchemaQuery() {
+    return `
+        SELECT COLUMNS.COLUMN_NAME as "column_name",
+               COLUMNS.TABLE_NAME as "table_name",
+               COLUMNS.TABLE_SCHEMA as "table_schema",
+               CASE WHEN COLUMNS.NUMERIC_SCALE = 0 AND COLUMNS.DATA_TYPE = 'NUMBER' THEN 'int' ELSE COLUMNS.DATA_TYPE END as "data_type"
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE COLUMNS.TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA')
+     `;
+  }
+
+  public async release(): Promise<void> {
+    if (this.connection) {
+      this.connection.then((connection) => new Promise<void>(
+        (resolve, reject) => connection.destroy((err) => (err ? reject(err) : resolve()))
+      ));
+    }
+  }
+
+  protected override toGenericType(columnType: string, precision?: number | null, scale?: number | null) {
+    const genericType = SnowflakeToGenericType[columnType.toLowerCase()] || super.toGenericType(columnType);
+
+    if (genericType === 'decimal' && precision && scale && getEnv('preciseDecimalInCubestore')) {
+      return `decimal(${precision}, ${scale})`;
+    }
+
+    return genericType;
+  }
+
+  public async getTablesQuery(schemaName: string) {
+    const tables = await super.getTablesQuery(schemaName.toUpperCase());
+    return tables.map(t => ({ table_name: t.TABLE_NAME?.toLowerCase() }));
+  }
+}

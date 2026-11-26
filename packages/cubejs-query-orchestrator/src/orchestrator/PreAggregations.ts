@@ -1,0 +1,1055 @@
+import R from 'ramda';
+import crypto from 'crypto';
+import { getEnv, LoggerFn } from '@cubejs-backend/shared';
+
+import { BaseDriver, CreateTableIndex, InlineTable, TableColumn, } from '@cubejs-backend/base-driver';
+import type { QueryKeyHash, TableQueryResult } from '@cubejs-backend/base-driver';
+import { CubeStoreDriver } from '@cubejs-backend/cubestore-driver';
+import { LRUCache } from 'lru-cache';
+
+import { DataSourceQueueOptions, PreAggTableToTempTable, Query, QueryBody, QueryCache, QueryWithParams } from './QueryCache';
+import { DriverFactory, DriverFactoryByDataSource } from './DriverFactory';
+import { QueryQueue } from './QueryQueue';
+import type { QueryQueueOptions } from './QueryQueue';
+import { CacheAndQueryDriverType } from './QueryOrchestrator';
+import { PreAggregationPartitionRangeLoader } from './PreAggregationPartitionRangeLoader';
+import { PreAggregationLoader } from './PreAggregationLoader';
+import { PreAggregationLoadCache } from './PreAggregationLoadCache';
+
+/// Name of the inline table containing the lambda rows.
+export const LAMBDA_TABLE_PREFIX = 'lambda';
+
+function encodeTimeStamp(time: number) {
+  return Math.floor(time / 1000).toString(32);
+}
+
+function decodeTimeStamp(time: string) {
+  return parseInt(time, 32) * 1000;
+}
+
+export function version(cacheKey: unknown) {
+  let result = '';
+
+  const hashCharset = 'abcdefghijklmnopqrstuvwxyz012345';
+  const digestBuffer = crypto.createHash('md5').update(JSON.stringify(cacheKey)).digest();
+
+  let residue = 0;
+  let shiftCounter = 0;
+
+  for (let i = 0; i < 5; i++) {
+    const byte = digestBuffer.readUInt8(i);
+    shiftCounter += 8;
+    // eslint-disable-next-line operator-assignment,no-bitwise
+    // Use >>> 0 to ensure unsigned 32-bit integer after the OR operation,
+    // preventing negative values when high bits are set (byte >= 128 with shift >= 24)
+    // eslint-disable-next-line operator-assignment,no-bitwise
+    residue = ((byte << (shiftCounter - 8)) | residue) >>> 0;
+    // eslint-disable-next-line no-bitwise
+    // Use >>> (unsigned right shift) to ensure proper comparison and shifting
+    // of unsigned values, preventing infinite loops with negative residues
+    // eslint-disable-next-line operator-assignment,no-bitwise
+    while (residue >>> 5) {
+      result += hashCharset.charAt(residue % 32);
+      shiftCounter -= 5;
+      // eslint-disable-next-line operator-assignment,no-bitwise
+      residue = residue >>> 5;
+    }
+  }
+
+  result += hashCharset.charAt(residue % 32);
+
+  return result;
+}
+
+// Returns the oldest timestamp, if any.
+export function getLastUpdatedAtTimestamp(
+  timestamps: (number | undefined)[]
+): number | undefined {
+  timestamps = timestamps.filter(t => t !== undefined);
+  if (timestamps.length === 0) {
+    return undefined;
+  } else {
+    return Math.min(...timestamps);
+  }
+}
+
+export function getStructureVersion(
+  preAggregation: Pick<PreAggregationDescription, 'structureVersionLoadSql' | 'loadSql' | 'indexesSql' | 'streamOffset' | 'outputColumnTypes'>
+) {
+  const versionArray: unknown[] = [preAggregation.structureVersionLoadSql || preAggregation.loadSql];
+  if (preAggregation.indexesSql?.length) {
+    versionArray.push(preAggregation.indexesSql);
+  }
+  if (preAggregation.streamOffset) {
+    versionArray.push(preAggregation.streamOffset);
+  }
+  if (preAggregation.outputColumnTypes) {
+    versionArray.push(preAggregation.outputColumnTypes);
+  }
+
+  return version(versionArray.length === 1 ? versionArray[0] : versionArray);
+}
+
+export type VersionEntry = {
+  table_name: string,
+  content_version: string,
+  structure_version: string,
+  last_updated_at: number,
+  build_range_end?: string,
+  naming_version?: number
+};
+
+/** Matches every build of a table: `'*'` stands for any version and build time. */
+type VersionEntryPattern = Omit<VersionEntry, 'last_updated_at'> & { last_updated_at: '*' };
+
+export type VersionEntriesObj = {
+  versionEntries: VersionEntry[],
+  byStructure: { [key: string]: VersionEntry },
+  byContent: { [key: string]: VersionEntry },
+  byTableName: { [key: string]: VersionEntry },
+};
+
+export type InvalidationKeys = unknown[];
+
+export type TableCacheEntry = {
+  // eslint-disable-next-line camelcase
+  table_name?: string;
+  TABLE_NAME?: string;
+  // eslint-disable-next-line camelcase
+  build_range_end?: string;
+};
+
+export type QueryDateRange = [string, string];
+
+export type PartitionRanges = {
+  buildRange: QueryDateRange,
+  partitionRanges: QueryDateRange[],
+};
+
+export type IndexDescription = {
+  sql: QueryWithParams;
+  indexName: string;
+};
+
+export type PreAggregationQueryKey =
+  | [QueryWithParams, IndexDescription[], InvalidationKeys]
+  | [QueryWithParams, InvalidationKeys];
+
+type PreAggJob = {
+  request: string,
+  context: { securityContext: unknown },
+  preagg: string,
+  table: string,
+  target: string,
+  structure: string,
+  content: string,
+  updated: string,
+  key: PreAggregationQueryKey,
+  status: string;
+  timezone: string,
+  dataSource: string,
+};
+
+/**
+ * Types a pre-aggregation description can have by the time it reaches the
+ * orchestrator. Narrower than the same-named type in `@cubejs-backend/client-core`,
+ * which also lists `rollupJoin` and `rollupLambda`: the schema compiler expands
+ * those into the rollups they reference (`preAggregationDescriptionsFor`), so no
+ * description with either type is ever built or reported here.
+ */
+export type PreAggregationType = 'rollup' | 'originalSql';
+
+/**
+ * State of a build for a particular versioned partition table. The table becomes
+ * visible to `getTablesQuery` as soon as it is created, long before the rows are
+ * imported into it, so a finished build is recorded by the absence of a record
+ * rather than by a status of its own.
+ */
+export type PreAggregationBuildStatus = {
+  status: 'building' | 'failure',
+  error?: string,
+  startedAt?: number,
+};
+
+const PRE_AGG_BUILD_STATUS_PERSIST_TIME = 86400;
+
+/**
+ * How much longer than the queue execution timeout a build is still believed
+ * to be running. The slack covers the queue writing the timeout failure down,
+ * and the clock difference between the instance that started the build and the
+ * one reading its status.
+ */
+const ABANDONED_BUILD_TIMEOUT_FACTOR = 2;
+
+export type PreAggregationVersionStatus = 'done' | 'outdated' | 'missing_partition';
+
+export type LoadPreAggregationResult = {
+  targetTableName: string;
+  refreshKeyValues: unknown[];
+  lastUpdatedAt: number;
+  buildRangeEnd: string;
+  /**
+   * Identity of the pre-aggregation this table belongs to, stamped by
+   * `loadAllPreAggregationsIfNeeded` from the query's pre-aggregation
+   * description rather than by the loaders. Reported to clients as part of
+   * `usedPreAggregations` so they can match a result to a build.
+   */
+  preAggregationId?: string;
+  type?: PreAggregationType;
+  /**
+   * Set by a dry-run build job only: whether the partition already has the
+   * version its current refresh keys call for (`done`), only an older version
+   * of the same structure (`outdated`), or nothing built (`missing_partition`).
+   */
+  versionStatus?: PreAggregationVersionStatus;
+  lambdaTable?: InlineTable;
+  queryKey?: PreAggregationQueryKey;
+  rollupLambdaId?: string;
+  partitionRange?: QueryDateRange;
+  isMultiTableUnion?: boolean;
+  usageTargetTableNames?: Record<string, string>;
+  dataSource?: string;
+  timezone?: string;
+};
+
+export type PreAggregationTableToTempTable = [string, LoadPreAggregationResult];
+
+export type LambdaOptions = {
+  maxSourceRows: number
+};
+
+export type LambdaQuery = {
+  sqlAndParams: QueryWithParams,
+  cacheKeyQueries: QueryWithParams[],
+  /** Bounds the source query on both ends; undefined when it's unbounded. */
+  sourceDateRange?: QueryDateRange,
+};
+
+export type PreAggregationDescription = {
+  preAggregationsSchema: string;
+  type: PreAggregationType;
+  preAggregationId: string;
+  priority: number;
+  dataSource: string;
+  external: boolean;
+  previewSql: QueryWithParams;
+  timezone: string;
+  indexesSql: IndexDescription[];
+  invalidateKeyQueries: QueryWithParams[];
+  partitionInvalidateKeyQueries: QueryWithParams[];
+  structureVersionLoadSql: QueryWithParams;
+  sql: QueryWithParams;
+  loadSql: QueryWithParams;
+  tableName: string;
+  matchedTimeDimensionDateRange: QueryDateRange;
+  granularity: string;
+  partitionGranularity: string;
+  preAggregationStartEndQueries: [QueryWithParams, QueryWithParams];
+  timestampFormat: string;
+  timestampPrecision: number;
+  expandedPartition: boolean;
+  unionWithSourceData: boolean;
+  buildRangeStart?: string;
+  buildRangeEnd?: string;
+  updateWindowSeconds?: number;
+  sealAt?: string;
+  rollupLambdaId?: string;
+  lastRollupLambda?: boolean;
+  usageMapping?: Record<string, { dateRange?: QueryDateRange }>;
+  readOnly?: boolean;
+  streamOffset?: string;
+  uniqueKeyColumns?: string[] | null;
+  aggregationsColumns?: string[];
+  createTableIndexes?: CreateTableIndex[];
+  outputColumnTypes?: TableColumn[] | null;
+};
+
+export const tablesToVersionEntries = (schema: string, tables: TableCacheEntry[]): VersionEntry[] => R.sortBy(
+  table => -table.last_updated_at,
+  tables.map(table => {
+    const match = (table.table_name || table.TABLE_NAME).match(/(.+)_(.+)_(.+)_(.+)/);
+
+    if (!match) {
+      return null;
+    }
+
+    const entity: any = {
+      table_name: `${schema}.${match[1]}`,
+      content_version: match[2],
+      structure_version: match[3],
+    };
+
+    if (match[4].length < 13) {
+      entity.last_updated_at = decodeTimeStamp(match[4]);
+      entity.naming_version = 2;
+    } else {
+      entity.last_updated_at = parseInt(match[4], 10);
+    }
+
+    if (table.build_range_end) {
+      entity.build_range_end = table.build_range_end;
+    }
+
+    return entity;
+  }).filter(R.identity)
+);
+
+// The refresh scheduler runs every few seconds, the active mark lives for the touch timeout
+const REFRESH_ACTIVE_MARK_INTERVAL = 60 * 1000;
+
+export type PreAggregationsOptions = {
+  maxPartitions?: number;
+  maxSourceRowLimit?: number;
+  preAggregationsSchemaCacheExpire?: number;
+  loadCacheQueueOptions?: Partial<Omit<QueryQueueOptions, 'queryHandlers' | 'cancelHandlers'>>;
+  queueOptions?: (dataSource: string) => DataSourceQueueOptions | Promise<DataSourceQueueOptions>;
+  cubeStoreDriverFactory?: () => Promise<CubeStoreDriver>;
+  continueWaitTimeout?: number;
+  cacheAndQueueDriver?: CacheAndQueryDriverType;
+  skipExternalCacheAndQueue?: boolean;
+  externalDriverFactory?: DriverFactory;
+  structureVersionPersistTime?: number;
+  touchTablePersistTime?: number;
+  preAggBackoffMaxTime?: number;
+  dropPreAggregationsWithoutTouch?: boolean;
+  usedTablePersistTime?: number;
+  externalRefresh?: boolean;
+  /**
+   * Set by `QueryOrchestrator` when other orchestrators share this pre-aggregation cache.
+   * Each keeps its own refresh end, and drop without touch waits for every one refreshing.
+   */
+  sharedCacheOrchestratorId?: string;
+};
+
+export class PreAggregations {
+  public readonly options: PreAggregationsOptions;
+
+  public readonly externalDriverFactory: DriverFactory;
+
+  public readonly structureVersionPersistTime: number;
+
+  private readonly touchTablePersistTime: number;
+
+  private readonly preAggBackoffMaxTime: number;
+
+  public readonly dropPreAggregationsWithoutTouch: boolean;
+
+  private readonly usedTablePersistTime: number;
+
+  private readonly externalRefresh: boolean;
+
+  private readonly loadCacheQueue: Record<string, QueryQueue> = {};
+
+  private readonly queue: Record<string, QueryQueue> = {};
+
+  private readonly usedCache: LRUCache<string, true>;
+
+  private readonly touchCache: LRUCache<string, true>;
+
+  protected refreshActiveMarkedAt: number = 0;
+
+  public constructor(
+    private readonly redisPrefix: string,
+    private readonly driverFactory: DriverFactoryByDataSource,
+    private readonly logger: LoggerFn,
+    private readonly queryCache: QueryCache,
+    options: PreAggregationsOptions,
+  ) {
+    this.options = options;
+
+    this.externalDriverFactory = options.externalDriverFactory;
+    this.structureVersionPersistTime = options.structureVersionPersistTime || 60 * 60 * 24 * 30;
+    this.touchTablePersistTime = options.touchTablePersistTime || getEnv('touchPreAggregationTimeout');
+    this.preAggBackoffMaxTime = options.preAggBackoffMaxTime || getEnv('preAggBackoffMaxTime');
+    this.dropPreAggregationsWithoutTouch = options.dropPreAggregationsWithoutTouch || getEnv('dropPreAggregationsWithoutTouch');
+    this.usedTablePersistTime = options.usedTablePersistTime || getEnv('dbQueryTimeout');
+    this.externalRefresh = options.externalRefresh;
+
+    /**
+     * Comment for both caches: used and touch:
+     *
+     * Memory usage: By default, it defines max as 8096 keys,
+     * let's assume that avg key size is 64 symbols, it's around 100 bytes
+     * with V8's internal stuff:
+     *
+     * 100 x 8096 = 809 bytes, max 1Mb in memory.
+     *
+     * However, this is a theoretical limit. In practice, even a couple of thousand
+     * is a very large number
+     */
+    this.usedCache = new LRUCache({
+      max: getEnv('usedPreAggregationCacheMaxCount'),
+      ttl: Math.round(this.usedTablePersistTime / 2) * 1000,
+      allowStale: false,
+      updateAgeOnGet: false
+    });
+    this.touchCache = new LRUCache({
+      max: getEnv('touchPreAggregationCacheMaxCount'),
+      ttl: getEnv('touchPreAggregationCacheMaxAge') * 1000,
+      allowStale: false,
+      updateAgeOnGet: false
+    });
+  }
+
+  protected tablesUsedRedisKey(tableName: string): string {
+    // TODO add dataSource?
+    return this.queryCache.getKey('SQL_PRE_AGGREGATIONS_TABLES_USED', tableName);
+  }
+
+  protected tablesTouchRedisKey(tableName: string): string {
+    // TODO add dataSource?
+    return this.queryCache.getKey('SQL_PRE_AGGREGATIONS_TABLES_TOUCH', tableName);
+  }
+
+  protected preAggBackoffRedisKey(tableName: string): string {
+    // TODO add dataSource?
+    return this.queryCache.getKey('SQL_PRE_AGGREGATIONS_BACKOFF', tableName);
+  }
+
+  protected refreshEndReachedKey(orchestratorId: string = this.options.sharedCacheOrchestratorId || '') {
+    // TODO add dataSource?
+    return this.queryCache.getKey('SQL_PRE_AGGREGATIONS_REFRESH_END_REACHED', encodeURIComponent(orchestratorId));
+  }
+
+  // Encoded, as Cube Store lists keys by the part before their last `:`
+  protected refreshActiveKey(orchestratorId: string) {
+    return this.queryCache.getKey('SQL_PRE_AGGREGATIONS_REFRESH_ACTIVE', encodeURIComponent(orchestratorId));
+  }
+
+  protected preAggBuildStatusRedisKey(tableName: string): string {
+    // TODO add dataSource?
+    return this.queryCache.getKey('SQL_PRE_AGGREGATIONS_BUILD_STATUS', tableName);
+  }
+
+  public async setPreAggregationBuildStatus(tableName: string, status: PreAggregationBuildStatus): Promise<void> {
+    await this.queryCache.getCacheDriver().set(
+      this.preAggBuildStatusRedisKey(tableName),
+      status,
+      PRE_AGG_BUILD_STATUS_PERSIST_TIME
+    );
+  }
+
+  public async getPreAggregationBuildStatus(tableName: string): Promise<PreAggregationBuildStatus | null> {
+    return await this.queryCache.getCacheDriver().get(this.preAggBuildStatusRedisKey(tableName)) || null;
+  }
+
+  public async removePreAggregationBuildStatus(tableName: string): Promise<void> {
+    await this.queryCache.getCacheDriver().remove(this.preAggBuildStatusRedisKey(tableName));
+  }
+
+  /**
+   * The queue times a build out on its own and records the failure, so a build
+   * that is still marked as running long past that timeout is one whose process
+   * is gone and will never report an outcome.
+   */
+  protected async isBuildAbandoned(dataSource: string, buildStatus: PreAggregationBuildStatus): Promise<boolean> {
+    if (!buildStatus.startedAt) {
+      return false;
+    }
+
+    const { executionTimeout } = await this.options.queueOptions?.(dataSource) || {};
+    const limit = (executionTimeout || getEnv('dbQueryTimeout')) * 1000 * ABANDONED_BUILD_TIMEOUT_FACTOR;
+
+    return new Date().getTime() - buildStatus.startedAt > limit;
+  }
+
+  /**
+   * The table's last build failed or was abandoned, so the table may hold
+   * partial data. A build that is still running doesn't count.
+   */
+  public async isBuildFailed(dataSource: string, tableName: string): Promise<boolean> {
+    const buildStatus = await this.getPreAggregationBuildStatus(tableName);
+    if (buildStatus?.status === 'failure') {
+      return true;
+    }
+
+    return buildStatus?.status === 'building' && this.isBuildAbandoned(dataSource, buildStatus);
+  }
+
+  public async addTableUsed(tableName: string): Promise<void> {
+    if (this.usedCache.has(tableName)) {
+      return;
+    }
+
+    try {
+      this.usedCache.set(tableName, true);
+
+      await this.queryCache.getCacheDriver().set(
+        this.tablesUsedRedisKey(tableName),
+        true,
+        this.usedTablePersistTime
+      );
+    } catch (e: unknown) {
+      this.usedCache.delete(tableName);
+
+      throw e;
+    }
+  }
+
+  public async tablesUsed() {
+    return (await this.queryCache.getCacheDriver().keysStartingWith(this.tablesUsedRedisKey('')))
+      .map(k => k.replace(this.tablesUsedRedisKey(''), ''));
+  }
+
+  public async removeTableUsed(tableName: string): Promise<void> {
+    this.usedCache.delete(tableName);
+
+    await this.queryCache.getCacheDriver().remove(this.tablesUsedRedisKey(tableName));
+  }
+
+  public async updateLastTouch(tableName: string): Promise<void> {
+    if (this.touchCache.has(tableName)) {
+      return;
+    }
+
+    try {
+      this.touchCache.set(tableName, true);
+
+      await this.queryCache.getCacheDriver().set(
+        this.tablesTouchRedisKey(tableName),
+        new Date().getTime(),
+        this.touchTablePersistTime
+      );
+    } catch (e: unknown) {
+      this.touchCache.delete(tableName);
+
+      throw e;
+    }
+  }
+
+  public async tablesTouched() {
+    return (await this.queryCache.getCacheDriver().keysStartingWith(this.tablesTouchRedisKey('')))
+      .map(k => k.replace(this.tablesTouchRedisKey(''), ''));
+  }
+
+  public async removeTableTouched(tableName: string): Promise<void> {
+    this.touchCache.delete(tableName);
+
+    await this.queryCache.getCacheDriver().remove(this.tablesTouchRedisKey(tableName));
+  }
+
+  public async updatePreAggBackoff(tableName: string, backoffData: { backoffMultiplier: number, nextTimestamp: Date }): Promise<void> {
+    await this.queryCache.getCacheDriver().set(
+      this.preAggBackoffRedisKey(tableName),
+      JSON.stringify(backoffData),
+      this.preAggBackoffMaxTime
+    );
+  }
+
+  public async removePreAggBackoff(tableName: string): Promise<void> {
+    await this.queryCache.getCacheDriver().remove(this.preAggBackoffRedisKey(tableName));
+  }
+
+  public getPreAggBackoffMaxTime(): number {
+    return this.preAggBackoffMaxTime;
+  }
+
+  public async getPreAggBackoff(tableName: string): Promise<{ backoffMultiplier: number, nextTimestamp: Date } | null> {
+    const res = await this.queryCache.getCacheDriver().get(this.preAggBackoffRedisKey(tableName));
+
+    if (!res) {
+      return null;
+    }
+
+    const parsed = JSON.parse(res);
+    return {
+      backoffMultiplier: parsed.backoffMultiplier,
+      nextTimestamp: new Date(parsed.nextTimestamp),
+    };
+  }
+
+  public async updateRefreshEndReached() {
+    return this.queryCache.getCacheDriver().set(this.refreshEndReachedKey(), new Date().getTime(), this.touchTablePersistTime);
+  }
+
+  /**
+   * Records that this orchestrator refreshes pre-aggregations, so the others that share its
+   * cache wait for its refresh end before they drop tables without touch.
+   */
+  public async markRefreshActive(): Promise<void> {
+    const { sharedCacheOrchestratorId } = this.options;
+
+    // Rewritten before it expires, even with a touch timeout shorter than the interval
+    const markInterval = Math.min(REFRESH_ACTIVE_MARK_INTERVAL, this.touchTablePersistTime * 1000 / 2);
+
+    if (!sharedCacheOrchestratorId || Date.now() - this.refreshActiveMarkedAt < markInterval) {
+      return;
+    }
+
+    await this.queryCache.getCacheDriver().set(
+      this.refreshActiveKey(sharedCacheOrchestratorId),
+      new Date().getTime(),
+      this.touchTablePersistTime
+    );
+    this.refreshActiveMarkedAt = Date.now();
+  }
+
+  public async getRefreshEndReached(): Promise<number | null> {
+    const cacheDriver = this.queryCache.getCacheDriver();
+    const refreshEndReached: number = await cacheDriver.get(this.refreshEndReachedKey());
+
+    if (!refreshEndReached || !this.options.sharedCacheOrchestratorId) {
+      return refreshEndReached;
+    }
+
+    // Tables of an orchestrator whose refresh hasn't ended may not be touched yet
+    const activePrefix = this.refreshActiveKey('');
+    const activeOrchestratorIds = (await cacheDriver.keysStartingWith(activePrefix))
+      .map(key => decodeURIComponent(key.replace(activePrefix, '')));
+    const refreshEnds = await Promise.all(
+      activeOrchestratorIds.map(orchestratorId => cacheDriver.get(this.refreshEndReachedKey(orchestratorId)))
+    );
+
+    return refreshEnds.every(Boolean) ? refreshEndReached : null;
+  }
+
+  /**
+   * Determines whether the partition table already exists or not.
+   */
+  public async isPartitionExist(
+    request: string,
+    external: boolean,
+    dataSource = 'default',
+    schema: string,
+    table: string,
+    key: any,
+    token: string,
+  ): Promise<[boolean, string]> {
+    // fetching tables
+    const loadCache = new PreAggregationLoadCache(
+      () => this.driverFactory(dataSource, true),
+      this.queryCache,
+      this,
+      {
+        requestId: request,
+        dataSource,
+        tablePrefixes: external ? null : [schema],
+      }
+    );
+    let tables: TableQueryResult[] = await loadCache.fetchTables(<PreAggregationDescription>{
+      external,
+      preAggregationsSchema: schema,
+    });
+    tables = tables.filter(row => `${schema}.${row.table_name}` === table);
+
+    // fetching query result
+    const queue = await this.getQueue(dataSource);
+    const conn = await queue.getQueueDriver().createConnection();
+    const result = await conn.getResult(key);
+    queue.getQueueDriver().release(conn);
+
+    // fetching the state of the build. The queue result is readable only once,
+    // so this record is the durable source of truth here.
+    const buildStatus = await this.getPreAggregationBuildStatus(table);
+
+    // A build record outranks the table: the table is there from the moment the
+    // build starts and is left behind when it fails or is killed.
+    let status: string;
+    if (buildStatus?.status === 'failure') {
+      status = `failure: ${buildStatus.error}`;
+    } else if (buildStatus?.status === 'building') {
+      status = await this.isBuildAbandoned(dataSource, buildStatus)
+        ? 'failure: the build has not completed'
+        : 'processing';
+    } else if (tables.length === 1) {
+      status = 'done';
+    } else if (result?.error) {
+      status = `failure: ${result.error}`;
+    } else {
+      status = 'missing_partition';
+    }
+
+    // updating jobs cache if needed
+    const preAggJob: PreAggJob = await this
+      .queryCache
+      .getCacheDriver()
+      .get(`PRE_AGG_JOB_${token}`);
+
+    // clients poll in a loop, so rewriting an unchanged status would both add a
+    // write per token per poll and keep pushing the record's expiry forward
+    if (preAggJob && preAggJob.status !== status) {
+      await this
+        .queryCache
+        .getCacheDriver()
+        .set(
+          `PRE_AGG_JOB_${token}`,
+          {
+            ...preAggJob,
+            status,
+          },
+          86400,
+        );
+    }
+
+    // returning response
+    return [true, status];
+  }
+
+  public async loadAllPreAggregationsIfNeeded(
+    queryBody: QueryBody,
+  ): Promise<{
+    preAggregationsTablesToTempTables: PreAggTableToTempTable[],
+    values: null | string[],
+  }> {
+    const preAggregations = queryBody.preAggregations || [];
+
+    const loadCacheByDataSource = queryBody.preAggregationsLoadCacheByDataSource || {};
+
+    const getLoadCacheByDataSource = (
+      dataSource = 'default',
+      preAggregationSchema: string,
+    ) => {
+      if (!loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`]) {
+        loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`] =
+          new PreAggregationLoadCache(
+            () => this.driverFactory(dataSource, true),
+            this.queryCache,
+            this,
+            {
+              requestId: queryBody.requestId,
+              dataSource,
+              tablePrefixes:
+                // Can't reuse tablePrefixes for shared refresh scheduler cache
+                !queryBody.preAggregationsLoadCacheByDataSource ?
+                  preAggregations
+                    .filter(p => (p.dataSource || 'default') === dataSource)
+                    .map(p => p.tableName.split('.')[1]) : null
+            }
+          );
+      }
+      return loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`];
+    };
+
+    let queryParamsReplacement: string[] | null = null;
+
+    const preAggregationsTablesToTempTablesPromise =
+      preAggregations.map((p: PreAggregationDescription, i) => (preAggregationsTablesToTempTables: PreAggregationTableToTempTable[]) => {
+        const loader = new PreAggregationPartitionRangeLoader(
+          () => this.driverFactory(p.dataSource || 'default', true),
+          this.logger,
+          this.queryCache,
+          this,
+          p,
+          preAggregationsTablesToTempTables,
+          getLoadCacheByDataSource(p.dataSource, p.preAggregationsSchema),
+          {
+            maxPartitions: this.options.maxPartitions,
+            maxSourceRowLimit: this.options.maxSourceRowLimit,
+            isJob: queryBody.isJob,
+            dryRun: queryBody.dryRun,
+            // Dependencies (rollupJoin, rollupLambda) come first, the job's target last
+            buildsJobTarget: i === preAggregations.length - 1,
+            waitForRenew: queryBody.cacheMode === 'must-revalidate',
+            // TODO workaround to avoid continuous waiting on building pre-aggregation dependencies
+            forceBuild: i === preAggregations.length - 1 ? queryBody.forceBuildPreAggregations : false,
+            requestId: queryBody.requestId,
+            metadata: queryBody.metadata,
+            orphanedTimeout: queryBody.orphanedTimeout,
+            lambdaQuery: (queryBody.lambdaQueries ?? {})[p.preAggregationId],
+            externalRefresh: this.externalRefresh
+          },
+        );
+
+        const preAggregationPromise = async () => {
+          const loadResult = await loader.loadPreAggregations();
+          const usedPreAggregation = {
+            ...loadResult,
+            preAggregationId: p.preAggregationId,
+            type: p.type,
+            dataSource: p.dataSource || 'default',
+            timezone: p.timezone,
+          };
+          // A dry run touches nothing, and its unbuilt tables are placeholders
+          if (!usedPreAggregation.isMultiTableUnion && !queryBody.dryRun) {
+            await this.addTableUsed(usedPreAggregation.targetTableName);
+          }
+
+          if (i === preAggregations.length - 1 && queryBody.values) {
+            queryParamsReplacement = await loader.replaceQueryBuildRangeParams(
+              queryBody.values,
+            );
+          }
+
+          return [p.tableName, usedPreAggregation] as PreAggregationTableToTempTable;
+        };
+
+        return preAggregationPromise().then(([tableName, result]) => {
+          const { usageTargetTableNames } = result;
+          if (usageTargetTableNames && Object.keys(usageTargetTableNames).length > 0) {
+            const entries = Object.entries(usageTargetTableNames).map<PreAggregationTableToTempTable>(
+              ([suffix, usageTarget]) => [
+                `${tableName}${suffix}`,
+                { ...result, targetTableName: usageTarget, usageTargetTableNames: undefined },
+              ]
+            );
+            return preAggregationsTablesToTempTables.concat(entries);
+          }
+          return preAggregationsTablesToTempTables.concat([[tableName, result]]);
+        });
+      }).reduce((promise, fn) => promise.then(fn), Promise.resolve<PreAggregationTableToTempTable[]>([]));
+
+    return preAggregationsTablesToTempTablesPromise.then(preAggregationsTablesToTempTables => ({
+      preAggregationsTablesToTempTables,
+      values: queryParamsReplacement
+    }));
+  }
+
+  /**
+   * Determines whether range queries for the preAggregations from the
+   * queryBody were cached or not.
+   */
+  public async checkPartitionsBuildRangeCache(queryBody: QueryBody) {
+    const preAggregations = queryBody.preAggregations || [];
+    return Promise.all(
+      preAggregations.map(async (preAggregation) => {
+        const { preAggregationStartEndQueries } = preAggregation;
+        const isCached = preAggregation.partitionGranularity
+          ? (
+            await Promise.all(
+              preAggregationStartEndQueries.map(([query, values]) => (
+                this.queryCache.resultFromCacheIfExists({
+                  query,
+                  values,
+                  invalidate: QueryCache.buildRangeInvalidateKey(preAggregation),
+                })
+              ))
+            )
+          ).every((res) => res?.data)
+          : true;
+        return {
+          preAggregation,
+          isCached,
+        };
+      })
+    );
+  }
+
+  public async expandPartitionsInPreAggregations(queryBody: Query): Promise<Query> {
+    const preAggregations = queryBody.preAggregations || [];
+
+    const loadCacheByDataSource = queryBody.preAggregationsLoadCacheByDataSource || {};
+
+    const getLoadCacheByDataSource = (dataSource = 'default', preAggregationSchema: string) => {
+      if (!loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`]) {
+        loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`] =
+          new PreAggregationLoadCache(
+            () => this.driverFactory(dataSource, true),
+            this.queryCache,
+            this,
+            {
+              requestId: queryBody.requestId,
+              dataSource,
+            }
+          );
+      }
+
+      return loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`];
+    };
+
+    const expandedPreAggregations: PreAggregationDescription[][] = await Promise.all(preAggregations.map(p => {
+      const loader = new PreAggregationPartitionRangeLoader(
+        () => this.driverFactory(p.dataSource || 'default', true),
+        this.logger,
+        this.queryCache,
+        this,
+        p,
+        [],
+        getLoadCacheByDataSource(p.dataSource, p.preAggregationsSchema),
+        {
+          maxPartitions: this.options.maxPartitions,
+          maxSourceRowLimit: this.options.maxSourceRowLimit,
+          waitForRenew: queryBody.cacheMode === 'must-revalidate',
+          requestId: queryBody.requestId,
+          externalRefresh: this.externalRefresh,
+          compilerCacheFn: queryBody.compilerCacheFn,
+        },
+      );
+
+      return loader.partitionPreAggregations();
+    }));
+
+    expandedPreAggregations.forEach((preAggs) => preAggs.forEach(p => {
+      p.expandedPartition = true;
+    }));
+
+    return {
+      ...queryBody,
+      preAggregations: expandedPreAggregations.flat(),
+      groupedPartitionPreAggregations: expandedPreAggregations
+    };
+  }
+
+  public async getQueue(dataSource: string = 'default') {
+    if (!this.queue[dataSource]) {
+      const queueOptions = await this.options.queueOptions(dataSource);
+      if (!this.queue[dataSource]) {
+        this.queue[dataSource] = QueryCache.createQueue(
+          `SQL_PRE_AGGREGATIONS_${this.redisPrefix}_${dataSource}`,
+          () => this.driverFactory(dataSource, true),
+          (client, q: {
+            preAggregation: PreAggregationDescription,
+            preAggregationsTablesToTempTables: PreAggregationTableToTempTable[],
+            newVersionEntry: VersionEntry,
+            requestId: string,
+            invalidationKeys: InvalidationKeys,
+            buildRangeEnd?: string,
+          }) => {
+            const {
+              preAggregation, preAggregationsTablesToTempTables, newVersionEntry, requestId, invalidationKeys, buildRangeEnd
+            } = q;
+            const loader = new PreAggregationLoader(
+              () => this.driverFactory(dataSource, true),
+              this.logger,
+              this.queryCache,
+              this,
+              preAggregation,
+              preAggregationsTablesToTempTables,
+              new PreAggregationLoadCache(
+                () => this.driverFactory(dataSource, true),
+                this.queryCache,
+                this,
+                {
+                  requestId,
+                  dataSource,
+                },
+              ),
+              { requestId, externalRefresh: this.externalRefresh, buildRangeEnd }
+            );
+            return loader.refresh(newVersionEntry, invalidationKeys, client);
+          },
+          {
+            concurrency: 1,
+            logger: this.logger,
+            cacheAndQueueDriver: this.options.cacheAndQueueDriver,
+            cubeStoreDriverFactory: this.options.cubeStoreDriverFactory,
+            // Centralized continueWaitTimeout that can be overridden in queueOptions
+            continueWaitTimeout: this.options.continueWaitTimeout,
+            ...queueOptions,
+          }
+        );
+      }
+    }
+    return this.queue[dataSource];
+  }
+
+  /**
+   * Returns registered queries queues hash table.
+   */
+  public getQueues(): { [dataSource: string]: QueryQueue } {
+    return this.queue;
+  }
+
+  public getLoadCacheQueue(dataSource: string = 'default') {
+    if (!this.loadCacheQueue[dataSource]) {
+      this.loadCacheQueue[dataSource] = QueryCache.createQueue(
+        `SQL_PRE_AGGREGATIONS_CACHE_${this.redisPrefix}_${dataSource}`,
+        // eslint-disable-next-line @typescript-eslint/no-empty-function
+        () => <BaseDriver> {},
+        (_, q: { preAggregation: PreAggregationDescription, requestId: string }) => {
+          const {
+            preAggregation,
+            requestId
+          } = q;
+          const loadCache = new PreAggregationLoadCache(
+            () => this.driverFactory(dataSource, true),
+            this.queryCache,
+            this,
+            {
+              requestId,
+              dataSource,
+            }
+          );
+          return loadCache.fetchTables(preAggregation);
+        },
+        {
+          concurrency: 4,
+          logger: this.logger,
+          cacheAndQueueDriver: this.options.cacheAndQueueDriver,
+          cubeStoreDriverFactory: this.options.cubeStoreDriverFactory,
+          ...this.options.loadCacheQueueOptions
+        }
+      );
+    }
+    return this.loadCacheQueue[dataSource];
+  }
+
+  public static preAggregationQueryCacheKey(preAggregation: PreAggregationDescription) {
+    return preAggregation.tableName;
+  }
+
+  public static targetTableName(versionEntry: VersionEntry | VersionEntryPattern): string {
+    if (versionEntry.naming_version === 2) {
+      return `${versionEntry.table_name}_${versionEntry.content_version}_${versionEntry.structure_version}_${versionEntry.last_updated_at === '*' ? versionEntry.last_updated_at : encodeTimeStamp(versionEntry.last_updated_at)}`;
+    }
+
+    return `${versionEntry.table_name}_${versionEntry.content_version}_${versionEntry.structure_version}_${versionEntry.last_updated_at}`;
+  }
+
+  public static noPreAggregationPartitionsBuiltMessage(preAggregations: PreAggregationDescription[]): string {
+    const expectedTableNames = preAggregations.map(p => PreAggregations.targetTableName({
+      table_name: p.tableName,
+      structure_version: getStructureVersion(p),
+      content_version: '*',
+      last_updated_at: '*',
+      naming_version: 2,
+    }));
+    return 'No pre-aggregation partitions were built yet for the pre-aggregation serving this query and ' +
+      'this API instance wasn\'t set up to build pre-aggregations. ' +
+      'Please make sure your refresh worker is configured correctly, running, pre-aggregation tables are built and ' +
+      'all pre-aggregation refresh settings like timezone match. ' +
+      `Expected table name patterns: ${expectedTableNames.join(', ')}`;
+  }
+
+  public static structureVersion(preAggregation: PreAggregationDescription) {
+    return getStructureVersion(preAggregation);
+  }
+
+  public async getVersionEntries(preAggregations: PreAggregationDescription[], requestId: string): Promise<VersionEntry[][]> {
+    const loadCacheByDataSource: Record<string, PreAggregationLoadCache> = {};
+
+    const getLoadCacheByDataSource = (preAggregationSchema: string, dataSource = 'default') => {
+      if (!loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`]) {
+        loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`] =
+          new PreAggregationLoadCache(
+            () => this.driverFactory(dataSource, true),
+            this.queryCache,
+            this,
+            {
+              requestId,
+              dataSource,
+            }
+          );
+      }
+
+      return loadCacheByDataSource[`${dataSource}_${preAggregationSchema}`];
+    };
+
+    const firstByCacheKey: Record<string, Promise<VersionEntriesObj>> = {};
+    const data: VersionEntry[][] = await Promise.all(
+      preAggregations.map(
+        async preAggregation => {
+          const { dataSource, preAggregationsSchema } = preAggregation;
+          const cacheKey = getLoadCacheByDataSource(preAggregationsSchema, dataSource).tablesCachePrefixKey(preAggregation);
+          if (!firstByCacheKey[cacheKey]) {
+            firstByCacheKey[cacheKey] = getLoadCacheByDataSource(preAggregationsSchema, dataSource).getVersionEntries(preAggregation);
+            const res = await firstByCacheKey[cacheKey];
+            return res.versionEntries;
+          }
+
+          return null;
+        }
+      )
+    );
+    return data.filter(res => res);
+  }
+
+  public async getQueueState(dataSource: string) {
+    const queue = await this.getQueue(dataSource);
+    return queue.getQueries();
+  }
+
+  public async cancelQueriesFromQueue(queryKeys: string[], dataSource: string) {
+    const queue = await this.getQueue(dataSource);
+    return Promise.all(queryKeys.map(queryKey => queue.cancelQuery(queryKey as QueryKeyHash, null)));
+  }
+}

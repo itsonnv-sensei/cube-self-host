@@ -1,0 +1,154 @@
+use crate::physical_plan::cube_ref_evaluator::CubeRefEvaluator;
+use crate::physical_plan::sql_nodes::{SqlNode, SqlNodesFactory};
+use crate::physical_plan::sql_visitor::SqlEvaluatorVisitor;
+use crate::planner::filter::Filter;
+use crate::planner::planners::multi_stage::FilterParamsTimeShifts;
+use crate::planner::query_tools::QueryTools;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::FiltersContext;
+use crate::planner::{CubeId, MemberSymbol, SqlCall};
+use cubenativeutils::CubeError;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+pub struct VisitorContext {
+    query_tools: Rc<QueryTools>,
+    node_processor: Rc<dyn SqlNode>,
+    cube_ref_evaluator: Rc<CubeRefEvaluator>,
+    all_filters: Option<Filter>, //To pass to FILTER_PARAMS and FILTER_GROUP
+    // To pick, and shift, the FILTER_PARAMS binding a time-shifted CTE renders.
+    filter_params_time_shifts: FilterParamsTimeShifts,
+    filters_context: FiltersContext,
+    join_condition_factory: Option<Rc<SqlNodesFactory>>,
+}
+
+impl VisitorContext {
+    pub fn new(
+        query_tools: Rc<QueryTools>,
+        nodes_factory: &SqlNodesFactory,
+        all_filters: Option<Filter>,
+    ) -> Self {
+        let join_condition_factory = nodes_factory.join_condition_factory().map(Rc::new);
+        Self::with_join_condition_factory(
+            query_tools,
+            nodes_factory,
+            all_filters,
+            join_condition_factory,
+        )
+    }
+
+    fn with_join_condition_factory(
+        query_tools: Rc<QueryTools>,
+        nodes_factory: &SqlNodesFactory,
+        all_filters: Option<Filter>,
+        join_condition_factory: Option<Rc<SqlNodesFactory>>,
+    ) -> Self {
+        let filters_context = FiltersContext {
+            use_local_tz: nodes_factory.use_local_tz_in_date_range(),
+            filter_params_columns: HashMap::new(),
+            reading_pre_aggregation: nodes_factory.reading_pre_aggregation(),
+            pre_aggregation_columns: nodes_factory
+                .pre_aggregation_dimensions_references()
+                .clone(),
+        };
+        let node_processor = nodes_factory.default_node_processor(&query_tools);
+        Self {
+            query_tools,
+            node_processor,
+            cube_ref_evaluator: Rc::new(nodes_factory.cube_ref_evaluator()),
+            all_filters,
+            filter_params_time_shifts: nodes_factory.filter_params_time_shifts().clone(),
+            filters_context,
+            join_condition_factory,
+        }
+    }
+
+    pub fn new_for_filter_params(
+        query_tools: Rc<QueryTools>,
+        nodes_factory: &SqlNodesFactory,
+        filter_params_columns: HashMap<
+            String,
+            Vec<crate::planner::sql_call::SqlCallFilterParamsItem>,
+        >,
+        filter_params_time_shifts: FilterParamsTimeShifts,
+    ) -> Self {
+        let filters_context = FiltersContext {
+            use_local_tz: nodes_factory.use_local_tz_in_date_range(),
+            filter_params_columns,
+            reading_pre_aggregation: nodes_factory.reading_pre_aggregation(),
+            pre_aggregation_columns: nodes_factory
+                .pre_aggregation_dimensions_references()
+                .clone(),
+        };
+        let node_processor = nodes_factory.default_node_processor(&query_tools);
+        Self {
+            query_tools,
+            node_processor,
+            cube_ref_evaluator: Rc::new(nodes_factory.cube_ref_evaluator()),
+            all_filters: None,
+            filter_params_time_shifts,
+            filters_context,
+            join_condition_factory: None,
+        }
+    }
+
+    /// The context the condition of a join bringing in `joined_cube` renders
+    /// under; a join that brings in no cube reads members as the select does.
+    pub fn join_condition_context(self: &Rc<Self>, joined_cube: Option<&CubeId>) -> Rc<Self> {
+        let (Some(factory), Some(joined_cube)) = (&self.join_condition_factory, joined_cube) else {
+            return self.clone();
+        };
+        let factory = factory
+            .as_ref()
+            .clone()
+            .with_joined_cube(joined_cube.clone());
+        Rc::new(Self::with_join_condition_factory(
+            self.query_tools.clone(),
+            &factory,
+            self.all_filters.clone(),
+            None,
+        ))
+    }
+
+    pub fn make_visitor(&self, query_tools: Rc<QueryTools>) -> SqlEvaluatorVisitor {
+        SqlEvaluatorVisitor::new(
+            query_tools,
+            self.cube_ref_evaluator.clone(),
+            self.all_filters.clone(),
+        )
+        .with_filter_params_time_shifts(self.filter_params_time_shifts.clone())
+    }
+
+    pub fn node_processor(&self) -> Rc<dyn SqlNode> {
+        self.node_processor.clone()
+    }
+
+    pub fn filters_context(&self) -> &FiltersContext {
+        &self.filters_context
+    }
+
+    pub fn query_tools(&self) -> Rc<QueryTools> {
+        self.query_tools.clone()
+    }
+}
+
+pub fn evaluate_with_context(
+    node: &Rc<MemberSymbol>,
+    context: Rc<VisitorContext>,
+    templates: &PlanSqlTemplates,
+) -> Result<String, CubeError> {
+    let visitor = context.make_visitor(context.query_tools());
+    let node_processor = context.node_processor();
+
+    visitor.apply(node, node_processor, templates)
+}
+
+pub fn evaluate_sql_call_with_context(
+    sql_call: &Rc<SqlCall>,
+    context: Rc<VisitorContext>,
+    templates: &PlanSqlTemplates,
+) -> Result<String, CubeError> {
+    let visitor = context.make_visitor(context.query_tools());
+    let node_processor = context.node_processor();
+    sql_call.eval(&visitor, node_processor, context.query_tools(), templates)
+}

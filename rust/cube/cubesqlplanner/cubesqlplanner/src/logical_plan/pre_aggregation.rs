@@ -1,0 +1,312 @@
+use super::*;
+use crate::{
+    physical_plan::QualifiedColumnName,
+    planner::{time_dimension::Granularity, MemberSymbol},
+};
+use cubenativeutils::CubeError;
+use itertools::Itertools;
+use std::{
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
+use typed_builder::TypedBuilder;
+
+/// A matched pre-aggregation usable as a query source — its table
+/// (or rollup join / union), the members it exposes and its
+/// granularity. The physical builder reads members through the
+/// `*_refererences` helpers.
+#[derive(TypedBuilder)]
+pub struct PreAggregation {
+    name: String,
+    schema: Rc<LogicalSchema>,
+    #[builder(default)]
+    measures: Vec<Rc<MemberSymbol>>,
+    #[builder(default)]
+    dimensions: Vec<Rc<MemberSymbol>>,
+    #[builder(default)]
+    time_dimensions: Vec<Rc<MemberSymbol>>,
+    #[builder(default)]
+    segments: Vec<Rc<MemberSymbol>>,
+    external: bool,
+    #[builder(default)]
+    granularity: Option<String>,
+    source: Rc<PreAggregationSource>,
+    cube_name: String,
+    #[builder(default)]
+    usage_index: Option<usize>,
+}
+
+impl PreAggregation {
+    pub fn name(&self) -> &String {
+        &self.name
+    }
+
+    pub fn schema(&self) -> &Rc<LogicalSchema> {
+        &self.schema
+    }
+
+    pub fn measures(&self) -> &Vec<Rc<MemberSymbol>> {
+        &self.measures
+    }
+
+    pub fn dimensions(&self) -> &Vec<Rc<MemberSymbol>> {
+        &self.dimensions
+    }
+
+    pub fn time_dimensions(&self) -> &Vec<Rc<MemberSymbol>> {
+        &self.time_dimensions
+    }
+
+    pub fn segments(&self) -> &Vec<Rc<MemberSymbol>> {
+        &self.segments
+    }
+
+    pub fn external(&self) -> bool {
+        self.external
+    }
+
+    pub fn granularity(&self) -> &Option<String> {
+        &self.granularity
+    }
+
+    pub fn source(&self) -> &Rc<PreAggregationSource> {
+        &self.source
+    }
+
+    pub fn cube_name(&self) -> &String {
+        &self.cube_name
+    }
+
+    pub fn usage_index(&self) -> Option<usize> {
+        self.usage_index
+    }
+
+    /// The same usage of the rollup, reading `measures` from it.
+    pub fn with_measures(
+        &self,
+        measures: Vec<Rc<MemberSymbol>>,
+        schema: Rc<LogicalSchema>,
+    ) -> Self {
+        Self {
+            name: self.name.clone(),
+            schema,
+            measures,
+            dimensions: self.dimensions.clone(),
+            time_dimensions: self.time_dimensions.clone(),
+            segments: self.segments.clone(),
+            external: self.external,
+            granularity: self.granularity.clone(),
+            source: self.source.clone(),
+            cube_name: self.cube_name.clone(),
+            usage_index: self.usage_index,
+        }
+    }
+}
+
+impl LogicalNode for PreAggregation {
+    fn as_plan_node(self: &Rc<Self>) -> PlanNode {
+        PlanNode::PreAggregation(self.clone())
+    }
+
+    fn inputs(&self) -> Vec<PlanNode> {
+        vec![] // PreAggregation has no inputs
+    }
+
+    fn with_inputs(self: Rc<Self>, inputs: Vec<PlanNode>) -> Result<Rc<Self>, CubeError> {
+        check_inputs_len(&inputs, 0, self.node_name())?;
+        Ok(self)
+    }
+
+    fn node_name(&self) -> &'static str {
+        "PreAggregation"
+    }
+    fn try_from_plan_node(plan_node: PlanNode) -> Result<Rc<Self>, CubeError> {
+        if let PlanNode::PreAggregation(item) = plan_node {
+            Ok(item)
+        } else {
+            Err(cast_error(&plan_node, "PreAggregation"))
+        }
+    }
+}
+
+// Stored columns are named after the members the rollup lists, and keyed by
+// the member a listed view member references, which is what queries render.
+impl PreAggregation {
+    pub fn all_dimensions_refererences(&self) -> HashMap<String, QualifiedColumnName> {
+        let mut res = HashMap::new();
+
+        for dim in self.dimensions().iter() {
+            let alias = dim.canonical_alias();
+            res.insert(
+                dim.peel_refs().full_name(),
+                QualifiedColumnName::new(None, alias),
+            );
+        }
+
+        for segment in self.segments().iter() {
+            let alias = segment.alias();
+            res.insert(segment.full_name(), QualifiedColumnName::new(None, alias));
+        }
+
+        // A join key is read from the legs' column, which is a grain column
+        // when the key is stored truncated.
+        if let PreAggregationSource::Join(join) = self.source().as_ref() {
+            let truncated = join.truncated_keys();
+            for member in join.key_members() {
+                let key = member.symbol.peel_refs();
+                if truncated.contains(key.id()) {
+                    res.remove(&key.full_name());
+                } else if member.granularity.is_none() {
+                    res.insert(
+                        key.full_name(),
+                        QualifiedColumnName::new(None, member.column.clone()),
+                    );
+                }
+            }
+        }
+
+        // The select reads a calc group from its stored proxy's column.
+        // FIXME: these keys follow only view references while `FromSchema`
+        // follows every reference; render through `FromSchema` instead.
+        for dim in self.dimensions().iter() {
+            let target = dim.clone().resolve_reference_chain();
+            if target.as_dimension().is_ok_and(|d| d.is_calc_group()) {
+                res.entry(target.full_name())
+                    .or_insert_with(|| QualifiedColumnName::new(None, dim.canonical_alias()));
+            }
+        }
+
+        res
+    }
+
+    /// The grain column of each stored time dimension, with its granularity
+    /// where one is known, in declaration order, then the columns of a
+    /// rollupJoin's truncated keys.
+    pub fn time_dimensions_references(
+        &self,
+    ) -> Vec<(String, QualifiedColumnName, Option<Granularity>)> {
+        let join_keys = match self.source().as_ref() {
+            PreAggregationSource::Join(join) => join
+                .key_members()
+                .map(|member| member.symbol.peel_refs().id().clone())
+                .collect(),
+            _ => HashSet::new(),
+        };
+        let mut res = Vec::new();
+        for dim in self.time_dimensions().iter() {
+            let (base_symbol, granularity, granularity_obj) =
+                if let Ok(td) = dim.as_time_dimension() {
+                    (
+                        td.base_symbol().clone(),
+                        td.granularity().clone(),
+                        td.granularity_obj().clone(),
+                    )
+                } else {
+                    (dim.clone(), None, None)
+                };
+            // The legs store a key in a column of their own, added below.
+            if join_keys.contains(base_symbol.peel_refs().id()) {
+                continue;
+            }
+            let suffix = if let Some(granularity) = &granularity {
+                format!("_{}", granularity.clone())
+            } else {
+                "".to_string()
+            };
+            let alias = format!("{}{}", base_symbol.canonical_alias(), suffix);
+            res.push((
+                base_symbol.peel_refs().full_name(),
+                QualifiedColumnName::new(None, alias),
+                granularity_obj,
+            ));
+        }
+        // A key the legs store truncated is read from their grain column; one
+        // they store raw stays a raw column, in the database timezone.
+        if let PreAggregationSource::Join(join) = self.source().as_ref() {
+            let truncated = join.truncated_keys();
+            for member in join.key_members() {
+                let key = member.symbol.peel_refs();
+                if truncated.contains(key.id()) {
+                    res.push((
+                        key.full_name(),
+                        QualifiedColumnName::new(None, member.column.clone()),
+                        None,
+                    ));
+                }
+            }
+        }
+        res
+    }
+
+    pub fn all_measures_refererences(&self) -> HashMap<String, QualifiedColumnName> {
+        self.measures()
+            .iter()
+            .map(|measure| {
+                let alias = measure.canonical_alias();
+                (
+                    measure.peel_refs().full_name(),
+                    QualifiedColumnName::new(None, alias),
+                )
+            })
+            .collect()
+    }
+}
+
+impl PrettyPrint for PreAggregation {
+    fn pretty_print(&self, result: &mut PrettyPrintResult, state: &PrettyPrintState) {
+        result.println("PreAggregation: ", state);
+        let state = state.new_level();
+        result.println(&format!("name: {}", self.name()), &state);
+        result.println(&format!("cube_name: {}", self.cube_name()), &state);
+        result.println(&format!("source:"), &state);
+        match self.source().as_ref() {
+            PreAggregationSource::Single(table) => {
+                let state = state.new_level();
+                result.println(
+                    &format!("table: {}.{}", table.cube_name, table.name),
+                    &state,
+                );
+            }
+            PreAggregationSource::Join(_) => {
+                let state = state.new_level();
+                result.println(&format!("rollup join"), &state);
+            }
+            PreAggregationSource::Union(union) => {
+                result.println("Union:", &state);
+                let state = state.new_level();
+                for item in union.items.iter() {
+                    result.println(
+                        &format!("-{}.{}", item.table.cube_name, item.table.name),
+                        &state,
+                    );
+                }
+            }
+        }
+        result.println(&format!("external: {}", self.external()), &state);
+        result.println(
+            &format!(
+                "granularity: {}",
+                self.granularity().clone().unwrap_or("None".to_string())
+            ),
+            &state,
+        );
+        result.println(
+            &format!(
+                "-time_dimensions: {}",
+                self.time_dimensions()
+                    .iter()
+                    .map(|d| d.full_name())
+                    .join(", ")
+            ),
+            &state,
+        );
+        result.println(
+            &format!("-dimensions: {}", print_symbols(self.dimensions())),
+            &state,
+        );
+        result.println(
+            &format!("-measures: {}", print_symbols(self.measures())),
+            &state,
+        );
+    }
+}

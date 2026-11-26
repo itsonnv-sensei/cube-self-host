@@ -1,0 +1,55 @@
+use super::SqlNode;
+use crate::physical_plan::SqlEvaluatorVisitor;
+use crate::planner::query_tools::QueryTools;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::MemberSymbol;
+use cubenativeutils::CubeError;
+use std::any::Any;
+use std::rc::Rc;
+
+/// Renders measures for ungrouped contexts (an ungrouped measure
+/// member-level flag) — leaves the inner SQL unwrapped instead of
+/// applying the usual aggregation.
+pub struct UngroupedMeasureSqlNode {
+    input: Rc<dyn SqlNode>,
+}
+
+impl UngroupedMeasureSqlNode {
+    pub fn new(input: Rc<dyn SqlNode>) -> Rc<Self> {
+        Rc::new(Self { input })
+    }
+
+    pub fn input(&self) -> &Rc<dyn SqlNode> {
+        &self.input
+    }
+}
+
+impl SqlNode for UngroupedMeasureSqlNode {
+    fn to_sql(
+        &self,
+        visitor: &SqlEvaluatorVisitor,
+        node: &Rc<MemberSymbol>,
+        query_tools: Rc<QueryTools>,
+        node_processor: Rc<dyn SqlNode>,
+        templates: &PlanSqlTemplates,
+    ) -> Result<String, CubeError> {
+        node.as_measure()?;
+        let input = self.input.to_sql(
+            visitor,
+            node,
+            query_tools.clone(),
+            node_processor.clone(),
+            templates,
+        )?;
+
+        Ok(if input == "*" { "1".to_string() } else { input })
+    }
+
+    fn as_any(self: Rc<Self>) -> Rc<dyn Any> {
+        self.clone()
+    }
+
+    fn childs(&self) -> Vec<Rc<dyn SqlNode>> {
+        vec![self.input.clone()]
+    }
+}

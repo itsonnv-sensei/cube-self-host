@@ -1,0 +1,984 @@
+use crate::app_metrics;
+use crate::di_service;
+use crate::remotefs::ExtendedRemoteFs;
+use crate::remotefs::{
+    join_remote_path, CommonRemoteFsUtils, LocalDirRemoteFs, RemoteFile, RemoteFs,
+};
+use crate::util::lock::acquire_lock;
+use crate::CubeError;
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use datafusion::cube_ext;
+use futures::stream::BoxStream;
+use log::{debug, info};
+use regex::{NoExpand, Regex};
+use s3::creds::Credentials;
+use s3::{Bucket, Region};
+use std::env;
+use std::fmt;
+use std::fmt::Formatter;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+use tempfile::{NamedTempFile, PathPersistError};
+use tokio::fs;
+use tokio::fs::File;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
+
+pub struct S3RemoteFs {
+    dir: PathBuf,
+    bucket: arc_swap::ArcSwap<Bucket>,
+    sub_path: Option<String>,
+    delete_mut: Mutex<()>,
+    /// When set, the refresh loop watches this file for changes and calls
+    /// STS AssumeRoleWithWebIdentity with the JWT inside it.
+    web_identity_token_file: Option<String>,
+    web_identity_role_arn: Option<String>,
+    /// When set, object-storing requests (PutObject / multipart initiation)
+    /// carry `x-amz-server-side-encryption` with this value. Some AWS
+    /// Organizations SCPs deny `s3:PutObject` unless the header is present,
+    /// even when the bucket has default encryption. Never sent on read/list
+    /// operations — S3 rejects it there.
+    server_side_encryption: Option<String>,
+}
+
+impl fmt::Debug for S3RemoteFs {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        let mut s = f.debug_struct("S3RemoteFs");
+        s.field("dir", &self.dir).field("sub_path", &self.sub_path);
+        let bucket = self.bucket.load();
+        // Do not expose AWS credentials.
+        s.field("bucket_name", &bucket.name)
+            .field("bucket_region", &bucket.region);
+        s.finish_non_exhaustive()
+    }
+}
+
+impl S3RemoteFs {
+    pub fn new(
+        dir: PathBuf,
+        region: String,
+        bucket_name: String,
+        sub_path: Option<String>,
+    ) -> Result<Arc<Self>, CubeError> {
+        let access_key = env::var("CUBESTORE_AWS_ACCESS_KEY_ID").ok();
+        let secret_key = env::var("CUBESTORE_AWS_SECRET_ACCESS_KEY").ok();
+        let token_file = env::var("CUBESTORE_AWS_WEB_IDENTITY_TOKEN_FILE").ok();
+        let role_arn = env::var("CUBESTORE_AWS_ROLE_ARN").ok();
+
+        let credentials = if let (Some(ref tf), Some(ref arn)) = (&token_file, &role_arn) {
+            // Web identity mode: read JWT from file and exchange via STS.
+            let jwt = std::fs::read_to_string(tf).map_err(|e| {
+                CubeError::internal(format!(
+                    "Failed to read web identity token file '{}': {}",
+                    tf, e
+                ))
+            })?;
+            info!(
+                "Using web identity token file for S3 credentials (role={})",
+                arn
+            );
+            Credentials::from_sts(arn, "cubestore", &jwt).map_err(|e| {
+                CubeError::internal(format!("STS AssumeRoleWithWebIdentity failed: {}", e))
+            })?
+        } else {
+            // Static credentials mode (or credential chain fallback).
+            Credentials::new(
+                access_key.as_deref(),
+                secret_key.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| CubeError::internal(format!("Failed to create S3 credentials: {}", e)))?
+        };
+
+        let initial_expiration = credentials_expiration(&credentials);
+
+        let region = region.parse::<Region>().map_err(|e| {
+            CubeError::internal(format!("Failed to parse Region '{}': {}", region, e))
+        })?;
+        let server_side_encryption = server_side_encryption_from_env()?;
+        let bucket = new_bucket(
+            &bucket_name,
+            region.clone(),
+            credentials,
+            &server_side_encryption,
+        )?;
+        let fs = Arc::new(Self {
+            dir,
+            bucket: arc_swap::ArcSwap::new(Arc::new(bucket)),
+            sub_path,
+            delete_mut: Mutex::new(()),
+            web_identity_token_file: token_file,
+            web_identity_role_arn: role_arn,
+            server_side_encryption,
+        });
+        spawn_creds_refresh_loop(
+            access_key,
+            secret_key,
+            bucket_name,
+            region,
+            initial_expiration,
+            &fs,
+        );
+
+        Ok(fs)
+    }
+}
+
+/// Values S3 accepts in `x-amz-server-side-encryption`.
+const ALLOWED_SSE_VALUES: &[&str] = &["AES256", "aws:kms", "aws:kms:dsse"];
+
+fn server_side_encryption_from_env() -> Result<Option<String>, CubeError> {
+    parse_sse_value(env::var("CUBESTORE_S3_SSE").ok())
+}
+
+fn parse_sse_value(value: Option<String>) -> Result<Option<String>, CubeError> {
+    match value {
+        None => Ok(None),
+        Some(v) if v.is_empty() => Ok(None),
+        Some(v) if ALLOWED_SSE_VALUES.contains(&v.as_str()) => Ok(Some(v)),
+        Some(v) => Err(CubeError::user(format!(
+            "Invalid CUBESTORE_S3_SSE value '{}'. Expected one of: {}",
+            v,
+            ALLOWED_SSE_VALUES.join(", ")
+        ))),
+    }
+}
+
+fn new_bucket(
+    bucket_name: &str,
+    region: Region,
+    credentials: Credentials,
+    server_side_encryption: &Option<String>,
+) -> Result<Bucket, CubeError> {
+    let mut bucket = Bucket::new(bucket_name, region, credentials)?;
+    // Applied per-operation by rust-s3 (PutObject / multipart initiation only)
+    // — S3 rejects the header on read/list operations.
+    bucket.set_server_side_encryption(server_side_encryption.clone());
+    Ok(bucket)
+}
+
+const WEB_IDENTITY_EXPIRY_HEADROOM: Duration = Duration::from_secs(5 * 60);
+
+/// The next wake-up is the last chance to react, so one poll plus the headroom.
+fn web_identity_expiry_margin(refresh_every: Duration) -> Duration {
+    refresh_every + WEB_IDENTITY_EXPIRY_HEADROOM
+}
+
+fn credentials_expiration(credentials: &Credentials) -> Option<SystemTime> {
+    let unix_seconds = credentials.expiration.as_ref()?.unix_timestamp();
+    if unix_seconds < 0 {
+        return None;
+    }
+    Some(SystemTime::UNIX_EPOCH + Duration::from_secs(unix_seconds as u64))
+}
+
+/// `token_file_modified` and `expiration` are committed only after the rebuilt
+/// bucket is live, so a failed exchange retries. `last_attempted` moves either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WebIdentityCredsState {
+    token_file_modified: Option<SystemTime>,
+    expiration: Option<SystemTime>,
+    last_attempted: SystemTime,
+}
+
+impl WebIdentityCredsState {
+    fn record_attempt(&mut self, now: SystemTime) {
+        self.last_attempted = now;
+    }
+
+    fn commit(&mut self, token_file_modified: Option<SystemTime>, expiration: Option<SystemTime>) {
+        self.token_file_modified = token_file_modified;
+        self.expiration = expiration;
+    }
+}
+
+/// The mtime alone is not sufficient: Kubernetes rotates the projected token on a
+/// schedule unrelated to the STS session TTL, and some projected volumes keep the
+/// mtime while rewriting the contents.
+fn web_identity_refresh_reason(
+    state: &WebIdentityCredsState,
+    token_file_modified: Option<SystemTime>,
+    now: SystemTime,
+    expiry_margin: Duration,
+) -> Option<&'static str> {
+    if token_file_modified != state.token_file_modified {
+        return Some("web identity token file changed");
+    }
+    match state.expiration {
+        // Speculative, so throttled by attempt rather than by success.
+        None if now >= state.last_attempted + expiry_margin => {
+            Some("credentials expiration is unknown")
+        }
+        None => None,
+        Some(expiration) if now + expiry_margin >= expiration => {
+            Some("credentials are about to expire")
+        }
+        Some(_) => None,
+    }
+}
+
+fn spawn_creds_refresh_loop(
+    access_key: Option<String>,
+    secret_key: Option<String>,
+    bucket_name: String,
+    region: Region,
+    initial_expiration: Option<SystemTime>,
+    fs: &Arc<S3RemoteFs>,
+) {
+    let token_file = fs.web_identity_token_file.clone();
+    let role_arn = fs.web_identity_role_arn.clone();
+    let server_side_encryption = fs.server_side_encryption.clone();
+    let is_web_identity = token_file.is_some() && role_arn.is_some();
+
+    let refresh_every = creds_refresh_interval(refresh_interval_from_env(), is_web_identity);
+
+    if refresh_every.as_secs() == 0 {
+        return;
+    }
+
+    let expiry_margin = web_identity_expiry_margin(refresh_every);
+
+    let fs = Arc::downgrade(fs);
+    let mut state = WebIdentityCredsState {
+        token_file_modified: token_file
+            .as_ref()
+            .and_then(|f| std::fs::metadata(f).ok()?.modified().ok()),
+        expiration: initial_expiration,
+        last_attempted: SystemTime::now(),
+    };
+
+    std::thread::spawn(move || {
+        log::debug!(
+            "Started S3 credentials refresh loop (web_identity={})",
+            is_web_identity
+        );
+        loop {
+            std::thread::sleep(refresh_every);
+            let fs = match fs.upgrade() {
+                None => {
+                    log::debug!("Stopping S3 credentials refresh loop");
+                    return;
+                }
+                Some(fs) => fs,
+            };
+
+            let mut observed_token_file_modified = None;
+            if let (Some(ref file), Some(_)) = (&token_file, &role_arn) {
+                let token_file_modified =
+                    std::fs::metadata(file).ok().and_then(|m| m.modified().ok());
+                match web_identity_refresh_reason(
+                    &state,
+                    token_file_modified,
+                    SystemTime::now(),
+                    expiry_margin,
+                ) {
+                    None => continue,
+                    Some(reason) => {
+                        info!("Refreshing S3 credentials: {}", reason);
+                        observed_token_file_modified = token_file_modified;
+                        state.record_attempt(SystemTime::now());
+                    }
+                }
+            }
+
+            let c = if let (Some(ref file), Some(ref arn)) = (&token_file, &role_arn) {
+                match std::fs::read_to_string(file) {
+                    Ok(jwt) => Credentials::from_sts(arn, "cubestore", &jwt),
+                    Err(e) => {
+                        log::error!("Failed to read web identity token file: {}", e);
+                        continue;
+                    }
+                }
+            } else {
+                Credentials::new(
+                    access_key.as_deref(),
+                    secret_key.as_deref(),
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+            let c = match c {
+                Ok(c) => c,
+                Err(e) => {
+                    log::error!("Failed to refresh S3 credentials: {}", e);
+                    continue;
+                }
+            };
+            let expiration = credentials_expiration(&c);
+            let b = match new_bucket(&bucket_name, region.clone(), c, &server_side_encryption) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::error!("Failed to refresh S3 credentials: {}", e);
+                    continue;
+                }
+            };
+            fs.bucket.swap(Arc::new(b));
+            if is_web_identity {
+                state.commit(observed_token_file_modified, expiration);
+            }
+            log::debug!("Successfully refreshed S3 credentials")
+        }
+    });
+}
+
+const DEFAULT_CREDS_REFRESH_INTERVAL: Duration = Duration::from_secs(60 * 180);
+const WEB_IDENTITY_DEFAULT_POLL: Duration = Duration::from_secs(30);
+/// An STS session can be as short as 15 min; a longer poll would sleep through it.
+const WEB_IDENTITY_MAX_POLL: Duration = Duration::from_secs(5 * 60);
+
+/// Zero still disables the loop. The default and any override are sized to the
+/// STS session in web identity mode; static credentials keep the configured value.
+fn creds_refresh_interval(configured: Duration, is_web_identity: bool) -> Duration {
+    if !is_web_identity || configured.is_zero() {
+        configured
+    } else if configured == DEFAULT_CREDS_REFRESH_INTERVAL {
+        WEB_IDENTITY_DEFAULT_POLL
+    } else {
+        configured.min(WEB_IDENTITY_MAX_POLL)
+    }
+}
+
+fn refresh_interval_from_env() -> Duration {
+    let mut mins = DEFAULT_CREDS_REFRESH_INTERVAL.as_secs() / 60;
+    if let Ok(s) = std::env::var("CUBESTORE_AWS_CREDS_REFRESH_EVERY_MINS") {
+        match s.parse::<u64>() {
+            Ok(i) => mins = i,
+            Err(e) => log::error!("Could not parse CUBESTORE_AWS_CREDS_REFRESH_EVERY_MINS. Refreshing every {} minutes. Error: {}", mins, e),
+        };
+    };
+    Duration::from_secs(60 * mins)
+}
+
+di_service!(S3RemoteFs, [RemoteFs, ExtendedRemoteFs]);
+
+#[async_trait]
+impl RemoteFs for S3RemoteFs {
+    async fn temp_upload_path(&self, remote_path: String) -> Result<String, CubeError> {
+        CommonRemoteFsUtils::temp_upload_path(self, remote_path).await
+    }
+
+    async fn uploads_dir(&self) -> Result<String, CubeError> {
+        CommonRemoteFsUtils::uploads_dir(self).await
+    }
+
+    async fn check_upload_file(
+        &self,
+        remote_path: String,
+        expected_size: u64,
+    ) -> Result<(), CubeError> {
+        CommonRemoteFsUtils::check_upload_file(self, remote_path, expected_size).await
+    }
+
+    async fn upload_file(
+        &self,
+        temp_upload_path: String,
+        remote_path: String,
+    ) -> Result<u64, CubeError> {
+        let local_path = join_remote_path(&self.dir, &remote_path)?;
+        {
+            app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
+                1,
+                Some(&vec![
+                    "operation:upload_file".to_string(),
+                    "driver:s3".to_string(),
+                ]),
+            );
+
+            let time = SystemTime::now();
+            debug!("Uploading {}", remote_path);
+            let path = self.s3_path(&remote_path);
+            let bucket = self.bucket.load();
+            let mut temp_upload_file = File::open(&temp_upload_path).await?;
+
+            let status_code = bucket
+                .put_object_stream(&mut temp_upload_file, path)
+                .await?;
+            if status_code != 200 {
+                return Err(CubeError::user(format!(
+                    "S3 upload returned non OK status: {}",
+                    status_code
+                )));
+            }
+
+            info!("Uploaded {} ({:?})", remote_path, time.elapsed()?);
+        }
+        let size = fs::metadata(&temp_upload_path).await?.len();
+        self.check_upload_file(remote_path.clone(), size).await?;
+
+        if Path::new(&temp_upload_path) != local_path {
+            fs::create_dir_all(local_path.parent().unwrap())
+                .await
+                .map_err(|e| {
+                    CubeError::internal(format!(
+                        "Create dir {}: {}",
+                        local_path.parent().as_ref().unwrap().to_string_lossy(),
+                        e
+                    ))
+                })?;
+            fs::rename(&temp_upload_path, local_path.clone()).await?;
+        }
+        Ok(fs::metadata(local_path).await?.len())
+    }
+
+    async fn download_file(
+        &self,
+        remote_path: String,
+        _expected_file_size: Option<u64>,
+    ) -> Result<String, CubeError> {
+        let local_file = join_remote_path(&self.dir, &remote_path)?;
+        let local_dir = local_file.parent().unwrap();
+        let downloads_dir = local_dir.join("downloads");
+
+        let local_file_str = local_file.to_str().unwrap().to_string(); // return value.
+
+        fs::create_dir_all(&downloads_dir).await?;
+        if !local_file.exists() {
+            app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
+                1,
+                Some(&vec![
+                    "operation:download_file".to_string(),
+                    "driver:s3".to_string(),
+                ]),
+            );
+            let time = SystemTime::now();
+            debug!("Downloading {}", remote_path);
+            let path = self.s3_path(&remote_path);
+            let bucket = self.bucket.load();
+
+            let (temp_file, temp_path) =
+                cube_ext::spawn_blocking(move || NamedTempFile::new_in(&downloads_dir))
+                    .await??
+                    .into_parts();
+
+            let mut writter = File::from_std(temp_file);
+            let status_code = bucket
+                .get_object_stream(path.as_str(), &mut writter)
+                .await?;
+            if status_code != 200 {
+                return Err(CubeError::user(format!(
+                    "S3 download returned non OK status: {}",
+                    status_code
+                )));
+            }
+
+            writter.flush().await?;
+
+            cube_ext::spawn_blocking(move || -> Result<(), PathPersistError> {
+                temp_path.persist(&local_file)
+            })
+            .await??;
+
+            info!("Downloaded {} ({:?})", remote_path, time.elapsed()?);
+        }
+
+        Ok(local_file_str)
+    }
+
+    async fn delete_file(&self, remote_path: String) -> Result<(), CubeError> {
+        let local = join_remote_path(&self.dir, &remote_path)?;
+        app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
+            1,
+            Some(&vec![
+                "operation:delete_file".to_string(),
+                "driver:s3".to_string(),
+            ]),
+        );
+        let time = SystemTime::now();
+        debug!("Deleting {}", remote_path);
+        let path = self.s3_path(&remote_path);
+        let bucket = self.bucket.load();
+
+        let res = bucket.delete_object(path).await?;
+        if res.status_code() != 204 {
+            return Err(CubeError::user(format!(
+                "S3 delete returned non OK status: {}",
+                res.status_code()
+            )));
+        }
+
+        let _guard = acquire_lock("delete file", self.delete_mut.lock()).await?;
+        if fs::metadata(local.clone()).await.is_ok() {
+            fs::remove_file(local.clone()).await?;
+            LocalDirRemoteFs::remove_empty_paths(self.dir.as_path().to_path_buf(), local.clone())
+                .await?;
+        }
+
+        info!("Deleted {} ({:?})", remote_path, time.elapsed()?);
+        Ok(())
+    }
+
+    async fn list(&self, remote_prefix: String) -> Result<Vec<String>, CubeError> {
+        let leading_subpath = self.leading_subpath_regex();
+        self.list_objects_and_map(remote_prefix, |o: s3::serde_types::Object| {
+            Ok(Self::object_key_to_remote_path(&leading_subpath, &o.key))
+        })
+        .await
+    }
+
+    async fn list_with_metadata(
+        &self,
+        remote_prefix: String,
+    ) -> Result<Vec<RemoteFile>, CubeError> {
+        let leading_subpath = self.leading_subpath_regex();
+        self.list_objects_and_map(remote_prefix, |o: s3::serde_types::Object| {
+            Ok(RemoteFile {
+                remote_path: Self::object_key_to_remote_path(&leading_subpath, &o.key),
+                updated: DateTime::parse_from_rfc3339(&o.last_modified)?.with_timezone(&Utc),
+                file_size: o.size,
+            })
+        })
+        .await
+    }
+
+    async fn local_path(&self) -> Result<String, CubeError> {
+        Ok(self.dir.to_str().unwrap().to_owned())
+    }
+
+    async fn local_file(&self, remote_path: String) -> Result<String, CubeError> {
+        let buf = join_remote_path(&self.dir, &remote_path)?;
+        fs::create_dir_all(buf.parent().unwrap()).await?;
+        Ok(buf.to_str().unwrap().to_string())
+    }
+}
+
+#[async_trait]
+impl ExtendedRemoteFs for S3RemoteFs {
+    async fn list_by_page(
+        &self,
+        remote_prefix: String,
+    ) -> Result<BoxStream<'static, Result<Vec<String>, CubeError>>, CubeError> {
+        let path = self.s3_path(&remote_prefix);
+        let bucket = self.bucket.load();
+        let leading_subpath = self.leading_subpath_regex();
+
+        let stream = async_stream::stream! {
+            let mut continuation_token = None;
+            let mut pages_count: i64 = 0;
+
+            loop {
+                let (result, _) = bucket
+                    .list_page(path.clone(), None, continuation_token, None, None)
+                    .await?;
+
+                pages_count += 1;
+
+                let page: Vec<String> = result.contents.into_iter().map(|obj| Self::object_key_to_remote_path(&leading_subpath, &obj.key)).collect();
+                continuation_token = result.next_continuation_token;
+
+                yield Ok(page);
+
+                if continuation_token.is_none() {
+                    break;
+                }
+            }
+
+            Self::pages_count_app_metrics_and_logging(pages_count, "streaming");
+        };
+
+        Ok(Box::pin(stream))
+    }
+}
+
+struct LeadingSubpath(Regex);
+
+impl S3RemoteFs {
+    fn leading_subpath_regex(&self) -> LeadingSubpath {
+        LeadingSubpath(Regex::new(format!("^{}", self.s3_path("")).as_str()).unwrap())
+    }
+
+    fn object_key_to_remote_path(leading_subpath: &LeadingSubpath, o_key: &String) -> String {
+        leading_subpath.0.replace(o_key, NoExpand("")).to_string()
+    }
+
+    async fn list_objects_and_map<T, F>(
+        &self,
+        remote_prefix: String,
+        mut f: F,
+    ) -> Result<Vec<T>, CubeError>
+    where
+        F: FnMut(s3::serde_types::Object) -> Result<T, CubeError> + Copy,
+    {
+        let path = self.s3_path(&remote_prefix);
+        let bucket = self.bucket.load();
+        let mut mapped_results = Vec::new();
+        let mut continuation_token = None;
+        let mut pages_count: i64 = 0;
+
+        loop {
+            let (result, _) = bucket
+                .list_page(path.clone(), None, continuation_token, None, None)
+                .await?;
+
+            pages_count += 1;
+
+            for obj in result.contents.into_iter() {
+                mapped_results.push(f(obj)?);
+            }
+
+            continuation_token = result.next_continuation_token;
+            if continuation_token.is_none() {
+                break;
+            }
+        }
+
+        Self::pages_count_app_metrics_and_logging(pages_count, "non-streaming");
+
+        Ok(mapped_results)
+    }
+
+    fn pages_count_app_metrics_and_logging(pages_count: i64, log_op: &str) {
+        app_metrics::REMOTE_FS_OPERATION_CORE.add_with_tags(
+            pages_count as i64,
+            Some(&vec!["operation:list".to_string(), "driver:s3".to_string()]),
+        );
+        if pages_count > 100 {
+            // Probably only "S3 list (non-streaming)" messages are of concern, not "S3 list (streaming)".
+            log::warn!(
+                "S3 list ({}) returned more than 100 pages: {}",
+                log_op,
+                pages_count
+            );
+        }
+    }
+
+    fn s3_path(&self, remote_path: &str) -> String {
+        format!(
+            "{}{}",
+            self.sub_path
+                .as_ref()
+                .map(|p| format!("{}/", p.to_string()))
+                .unwrap_or_else(|| "".to_string()),
+            remote_path
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: Duration = Duration::from_secs(1_800_000_000);
+    const TOKEN_FILE_MTIME: Duration = Duration::from_secs(1_000);
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + NOW
+    }
+
+    // Exchanged just now, expiring in a full STS session.
+    fn fresh_state() -> WebIdentityCredsState {
+        WebIdentityCredsState {
+            token_file_modified: Some(SystemTime::UNIX_EPOCH + TOKEN_FILE_MTIME),
+            expiration: Some(now() + Duration::from_secs(60 * 60)),
+            last_attempted: now(),
+        }
+    }
+
+    #[test]
+    fn refresh_not_needed_while_credentials_are_fresh() {
+        let state = fresh_state();
+        assert_eq!(
+            web_identity_refresh_reason(
+                &state,
+                state.token_file_modified,
+                now(),
+                WEB_IDENTITY_EXPIRY_HEADROOM
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_needed_when_token_file_changed() {
+        let state = fresh_state();
+        let touched = Some(SystemTime::UNIX_EPOCH + TOKEN_FILE_MTIME + Duration::from_secs(1));
+        assert!(
+            web_identity_refresh_reason(&state, touched, now(), WEB_IDENTITY_EXPIRY_HEADROOM)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn refresh_needed_near_expiry_with_unchanged_token_file() {
+        let state = WebIdentityCredsState {
+            expiration: Some(now() + Duration::from_secs(60)),
+            ..fresh_state()
+        };
+        assert!(web_identity_refresh_reason(
+            &state,
+            state.token_file_modified,
+            now(),
+            WEB_IDENTITY_EXPIRY_HEADROOM
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn refresh_needed_after_expiry_with_unchanged_token_file() {
+        let state = WebIdentityCredsState {
+            expiration: Some(now() - Duration::from_secs(60)),
+            ..fresh_state()
+        };
+        assert!(web_identity_refresh_reason(
+            &state,
+            state.token_file_modified,
+            now(),
+            WEB_IDENTITY_EXPIRY_HEADROOM
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn refresh_needed_when_expiry_is_unknown() {
+        let state = WebIdentityCredsState {
+            expiration: None,
+            last_attempted: now() - WEB_IDENTITY_EXPIRY_HEADROOM,
+            ..fresh_state()
+        };
+        assert!(web_identity_refresh_reason(
+            &state,
+            state.token_file_modified,
+            now(),
+            WEB_IDENTITY_EXPIRY_HEADROOM
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn unknown_expiry_does_not_re_exchange_on_every_poll() {
+        let state = WebIdentityCredsState {
+            expiration: None,
+            last_attempted: now() - Duration::from_secs(30),
+            ..fresh_state()
+        };
+        assert_eq!(
+            web_identity_refresh_reason(
+                &state,
+                state.token_file_modified,
+                now(),
+                WEB_IDENTITY_EXPIRY_HEADROOM
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_expiry_throttle_survives_failed_exchanges() {
+        // The loop records the attempt and, on failure, never reaches commit.
+        let margin = web_identity_expiry_margin(Duration::from_secs(30));
+        let mut state = WebIdentityCredsState {
+            expiration: None,
+            last_attempted: now() - margin,
+            ..fresh_state()
+        };
+        let mtime = state.token_file_modified;
+        assert!(web_identity_refresh_reason(&state, mtime, now(), margin).is_some());
+        state.record_attempt(now());
+
+        let next_poll = now() + Duration::from_secs(30);
+        assert_eq!(
+            web_identity_refresh_reason(&state, mtime, next_poll, margin),
+            None
+        );
+        assert!(web_identity_refresh_reason(&state, mtime, now() + margin, margin).is_some());
+    }
+
+    #[test]
+    fn failed_exchange_near_expiry_retries_on_next_poll() {
+        let margin = web_identity_expiry_margin(Duration::from_secs(30));
+        let mut state = WebIdentityCredsState {
+            expiration: Some(now() + Duration::from_secs(60)),
+            ..fresh_state()
+        };
+        let mtime = state.token_file_modified;
+        state.record_attempt(now());
+
+        let next_poll = now() + Duration::from_secs(30);
+        assert!(web_identity_refresh_reason(&state, mtime, next_poll, margin).is_some());
+    }
+
+    #[test]
+    fn committed_exchange_stops_the_refresh() {
+        let margin = web_identity_expiry_margin(Duration::from_secs(30));
+        let mut state = WebIdentityCredsState {
+            expiration: Some(now() + Duration::from_secs(60)),
+            ..fresh_state()
+        };
+        let mtime = state.token_file_modified;
+        state.record_attempt(now());
+        state.commit(mtime, Some(now() + Duration::from_secs(60 * 60)));
+
+        let next_poll = now() + Duration::from_secs(30);
+        assert_eq!(
+            web_identity_refresh_reason(&state, mtime, next_poll, margin),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_needed_when_token_file_disappeared() {
+        // An unreadable token file reads as "no mtime", not as "unchanged".
+        let state = fresh_state();
+        assert!(
+            web_identity_refresh_reason(&state, None, now(), WEB_IDENTITY_EXPIRY_HEADROOM)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn refresh_not_needed_just_outside_the_margin() {
+        let margin = Duration::from_secs(5 * 60);
+        let state = WebIdentityCredsState {
+            expiration: Some(now() + margin + Duration::from_secs(1)),
+            ..fresh_state()
+        };
+        assert_eq!(
+            web_identity_refresh_reason(&state, state.token_file_modified, now(), margin),
+            None
+        );
+    }
+
+    #[test]
+    fn refresh_needed_just_inside_the_margin() {
+        let margin = Duration::from_secs(5 * 60);
+        let state = WebIdentityCredsState {
+            expiration: Some(now() + margin),
+            ..fresh_state()
+        };
+        assert!(
+            web_identity_refresh_reason(&state, state.token_file_modified, now(), margin).is_some()
+        );
+    }
+
+    #[test]
+    fn margin_keeps_full_headroom_on_top_of_a_poll_interval() {
+        // The margin must not collapse to the poll interval.
+        let poll_every = WEB_IDENTITY_EXPIRY_HEADROOM;
+        let margin = web_identity_expiry_margin(poll_every);
+        let state = WebIdentityCredsState {
+            expiration: Some(now() + poll_every + WEB_IDENTITY_EXPIRY_HEADROOM),
+            ..fresh_state()
+        };
+        assert!(
+            web_identity_refresh_reason(&state, state.token_file_modified, now(), margin).is_some()
+        );
+    }
+
+    #[test]
+    fn expiry_margin_scales_with_a_long_poll_interval() {
+        // Refresh on the current wake-up, not on the next one.
+        let poll_every = Duration::from_secs(60 * 60);
+        let state = WebIdentityCredsState {
+            expiration: Some(now() + Duration::from_secs(30 * 60)),
+            ..fresh_state()
+        };
+        let margin = web_identity_expiry_margin(poll_every);
+        assert!(
+            web_identity_refresh_reason(&state, state.token_file_modified, now(), margin).is_some()
+        );
+    }
+
+    #[test]
+    fn web_identity_poll_is_capped_inside_the_sts_session() {
+        let two_hours = Duration::from_secs(120 * 60);
+        assert_eq!(
+            creds_refresh_interval(two_hours, true),
+            WEB_IDENTITY_MAX_POLL
+        );
+        let margin = web_identity_expiry_margin(creds_refresh_interval(two_hours, true));
+        assert!(margin < Duration::from_secs(15 * 60));
+    }
+
+    #[test]
+    fn web_identity_poll_defaults_to_seconds_and_keeps_short_overrides() {
+        assert_eq!(
+            creds_refresh_interval(DEFAULT_CREDS_REFRESH_INTERVAL, true),
+            WEB_IDENTITY_DEFAULT_POLL
+        );
+        let one_min = Duration::from_secs(60);
+        assert_eq!(creds_refresh_interval(one_min, true), one_min);
+        assert_eq!(creds_refresh_interval(Duration::ZERO, true), Duration::ZERO);
+    }
+
+    #[test]
+    fn static_credentials_keep_the_configured_interval() {
+        let two_hours = Duration::from_secs(120 * 60);
+        assert_eq!(creds_refresh_interval(two_hours, false), two_hours);
+        assert_eq!(
+            creds_refresh_interval(DEFAULT_CREDS_REFRESH_INTERVAL, false),
+            DEFAULT_CREDS_REFRESH_INTERVAL
+        );
+    }
+
+    #[test]
+    fn credentials_expiration_is_none_for_static_credentials() {
+        let credentials = Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap();
+        assert_eq!(credentials_expiration(&credentials), None);
+    }
+
+    #[test]
+    fn parse_sse_value_accepts_allowed_values() {
+        assert_eq!(parse_sse_value(None).unwrap(), None);
+        assert_eq!(parse_sse_value(Some("".to_string())).unwrap(), None);
+        assert_eq!(
+            parse_sse_value(Some("AES256".to_string())).unwrap(),
+            Some("AES256".to_string())
+        );
+        assert_eq!(
+            parse_sse_value(Some("aws:kms".to_string())).unwrap(),
+            Some("aws:kms".to_string())
+        );
+        assert_eq!(
+            parse_sse_value(Some("aws:kms:dsse".to_string())).unwrap(),
+            Some("aws:kms:dsse".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_sse_value_rejects_unknown_values() {
+        assert!(parse_sse_value(Some("aes256".to_string())).is_err());
+        assert!(parse_sse_value(Some("true".to_string())).is_err());
+    }
+
+    #[test]
+    fn new_bucket_configures_per_operation_sse() {
+        let credentials = Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap();
+        let bucket = new_bucket(
+            "test-bucket",
+            "us-east-1".parse().unwrap(),
+            credentials,
+            &Some("AES256".to_string()),
+        )
+        .unwrap();
+        assert_eq!(bucket.server_side_encryption(), Some("AES256"));
+        // The header must NOT be bucket-wide: S3 rejects it on read/list
+        // operations. rust-s3 applies it per-operation (PutObject /
+        // InitiateMultipartUpload only).
+        assert!(bucket
+            .extra_headers()
+            .get("x-amz-server-side-encryption")
+            .is_none());
+    }
+
+    #[test]
+    fn new_bucket_without_sse_has_no_header() {
+        let credentials = Credentials::new(Some("key"), Some("secret"), None, None, None).unwrap();
+        let bucket = new_bucket(
+            "test-bucket",
+            "us-east-1".parse().unwrap(),
+            credentials,
+            &None,
+        )
+        .unwrap();
+        assert_eq!(bucket.server_side_encryption(), None);
+        assert!(bucket
+            .extra_headers()
+            .get("x-amz-server-side-encryption")
+            .is_none());
+    }
+}

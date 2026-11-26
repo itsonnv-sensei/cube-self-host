@@ -1,0 +1,595 @@
+# Deprecation
+
+This page provides an overview of features that are deprecated in Cube.
+Changes in packaging, and supported (Linux) distributions are not included. To
+learn about end of support for Linux distributions, refer to the
+[changelog](CHANGELOG.md).
+
+## Feature Deprecation Policy
+
+As changes are made to Cube, there may be times when existing features need
+to be removed or replaced with newer features. Before an existing feature is
+removed it is marked as "deprecated" within the documentation and remains in
+Cube for at least one stable release unless specified explicitly otherwise.
+After that time it may be removed.
+
+Users are expected to take note of the list of deprecated features each release
+and plan their migration away from those features, and (if applicable) towards
+the replacement features as soon as possible.
+
+## Deprecated Features
+
+The table below provides an overview of the current status of deprecated
+features:
+
+- **Deprecated**: the feature is marked "deprecated" and should no longer be
+  used. The feature may be removed, disabled, or change behavior in a future
+  release. The _"Deprecated"_ column contains the release in which the feature
+  was marked deprecated, whereas the _"Remove"_ column contains a tentative
+  release in which the feature is to be removed.
+- **Removed**: the feature was removed, disabled, or hidden. Refer to the linked
+  section for details. Some features are "soft" deprecated, which means that
+  they remain functional for backward compatibility, and to allow users to
+  migrate to alternatives. In such cases, a warning may be printed, and users
+  should not rely on this feature.
+
+| Status     | Feature                                                                                                                           | Deprecated | Removed   |
+|------------|-----------------------------------------------------------------------------------------------------------------------------------|------------|-----------|
+| Removed    | [Node.js 8](#nodejs-8)                                                                                                            | v0.22.4    | v0.26.0   |
+| Removed    | [`hearBeatInterval`](#hearbeatinterval)                                                                                           | v0.23.8    | June 2021 |
+| Removed    | [`CUBEJS_ENABLE_TLS`](#cubejs_enable_tls)                                                                                         | v0.23.11   | v0.26.0   |
+| Removed    | [Embedding Cube within Express](#embedding-cube-within-express)                                                                   | v0.24.0    | June 2021 |
+| Removed    | [Absolute import for `@cubejs-backend/query-orchestrator`](#absolute-import-for-@cubejs-backendquery-orchestrator)                | v0.24.2    | v0.32.0   |
+| Removed    | [`contextToDataSourceId`](#contexttodatasourceid)                                                                                 | v0.25.0    | v0.25.0   |
+| Removed    | [Absolute import for `@cubejs-backend/server-core`](#absolute-import-for-@cubejs-backendserver-core)                              | v0.25.4    | v0.32.0   |
+| Removed    | [Absolute import for `@cubejs-backend/schema-compiler`](#absolute-import-for-@cubejs-backendschema-compiler)                      | v0.25.21   | v0.32.0   |
+| Removed    | [`checkAuthMiddleware`](#checkauthmiddleware)                                                                                     | v0.26.0    | v0.36.0   |
+| Removed    | [Node.js 10](#nodejs-10)                                                                                                          | v0.26.0    | v0.29.0   |
+| Removed    | [Node.js 15](#nodejs-15)                                                                                                          | v0.26.0    | v0.32.0   |
+| Removed    | [`USER_CONTEXT`](#user_context)                                                                                                   | v0.26.0    | v0.36.0   |
+| Deprecated | [`authInfo`](#authinfo)                                                                                                           | v0.26.0    |           |
+| Removed    | [Prefix Redis environment variables with `CUBEJS_`](#prefix-redis-environment-variables-with-cubejs_)                             | v0.27.0    | v0.36.0   |
+| Removed    | [Node.js 12](#nodejs-12)                                                                                                          | v0.29.0    | v0.32.0   |
+| Deprecated | [`CUBEJS_EXTERNAL_DEFAULT` and `CUBEJS_SCHEDULED_REFRESH_DEFAULT`](#cubejs_external_default-and-cubejs_scheduled_refresh_default) | v0.30.0    |           |
+| Deprecated | [Using external databases for pre-aggregations](#using-external-databases-for-pre-aggregations)                                   | v0.30.0    |           |
+| Removed    | [`dbType`](#dbtype)                                                                                                               | v0.30.30   | v1.7.0    |
+| Removed    | [Serverless Deployments](#serverless-deployments)                                                                                 | v0.31.64   | v0.35.0   |
+| Removed    | [Node.js 14](#nodejs-14)                                                                                                          | v0.32.0    | v0.35.0   |
+| Removed    | [Using Redis for in-memory cache and queue](#using-redis-for-in-memory-cache-and-queue)                                           | v0.32.0    | v0.36.0   |
+| Deprecated | [`SECURITY_CONTEXT`](#security_context)                                                                                           | v0.33.0    |           |
+| Removed    | [`running_total` measure type](#running_total-measure-type)                                                                       | v0.33.39   | v1.7.0    |
+| Removed    | [Top-level `includes` parameter in views](#top-level-includes-parameter-in-views)                                                 | v0.34.34   | v1.3.0    |
+| Removed    | [Node.js 16](#nodejs-16)                                                                                                          | v0.35.0    | v0.36.0   |
+| Removed    | [MySQL-based SQL API](#mysql-based-sql-api)                                                                                       | v0.35.0    | v0.35.0   |
+| Removed    | [`initApp` hook](#initapp-hook)                                                                                                   | v0.35.0    | v0.35.0   |
+| Removed    | [`/v1/run-scheduled-refresh` REST API endpoint](#v1run-scheduled-refresh-rest-api-endpoint)                                       | v0.35.0    | v0.36.0   |
+| Removed    | [Node.js 18](#nodejs-18)                                                                                                          | v0.36.0    | v1.3.0    |
+| Removed    | [`CUBEJS_SCHEDULED_REFRESH_CONCURRENCY`](#cubejs_scheduled_refresh_concurrency)                                                   | v1.2.7     | v1.7.0    |
+| Removed    | [Node.js 20](#nodejs-20)                                                                                                          | v1.3.0    | v1.7.0    |
+| Removed    | [`renewQuery` parameter of the `/v1/load` endpoint](#renewquery-parameter-of-the-v1load-endpoint)                                 | v1.3.73   | v1.7.0    |
+| Removed    | [Elasticsearch driver](#elasticsearch-driver)                                                                                     | v1.6.0     | v1.7.0    |
+| Removed    | [`context_to_roles`](#context-to-roles)                                                                                           | v1.6.4     | v1.7.0    |
+| Deprecated | [Node.js 22](#nodejs-22)                                                                                                          | v1.7.0     |           |
+| Deprecated | [Hive driver](#hive-driver)                                                                                                       | v1.7.25    |           |
+| Removed    | [`cube.ts` configuration file](#cubets-configuration-file)                                                                        | v1.7.34    | v1.7.34   |
+| Deprecated | [Legacy `cubejs` CLI](#legacy-cubejs-cli)                                                                                         | v1.7.45    |           |
+| Removed    | [`NODE_ENV` as a development mode switch](#node_env-as-a-development-mode-switch)                                                  | v1.7.47    | v1.7.47   |
+
+### Node.js 8
+
+**Removed in Release: v0.26.0**
+
+Node.js 8 reached [End of Life on December 31, 2019][link-nodejs-eol]. This
+means no more updates. Please upgrade to Node.js 10 or higher.
+
+### `hearBeatInterval`
+
+**Deprecated in Release: v0.23.8**
+
+This option for [`@cubejs-client/ws-transport`][link-hearbeatinterval] has been
+replaced by `heartBeatInterval`.
+
+[link-hearbeatinterval]:
+  https://docs.cube.dev/reference/javascript-sdk/reference/cubejs-client-ws-transport#hearbeatinterval
+
+### `CUBEJS_ENABLE_TLS`
+
+**Removed in Release: v0.26.0**
+
+We no longer recommend setting TLS options via Cube. Developers should set up
+TLS on a load balancer or reverse proxy instead. [Read more
+here][link-enable-https].
+
+[link-enable-https]:
+  https://docs.cube.dev/admin/deployment/core#set-up-reverse-proxy
+
+### Embedding Cube within Express
+
+**Deprecated in Release: v0.24.0**
+
+Embedding Cube into Express applications is deprecated due to performance and
+reliability considerations. [Read more about this change
+here][link-cube-docker].
+
+Developers are encouraged to [migrate to the new `cube.js` configuration
+file][link-migration] and deploy Cube as a microservice (or multiple
+microservices, if necessary).
+
+[link-cube-docker]: https://cube.dev/blog/cubejs-loves-docker
+[link-migration]:
+  https://docs.cube.dev/admin/deployment/core
+
+### Absolute import for `@cubejs-backend/query-orchestrator`
+
+**Removed in Release: v0.32.0**
+
+Absolute imports are highly dependent on a path, and all API becomes public. We
+now provide a public API from the package directly.
+
+Deprecated:
+
+```javascript
+const BaseDriver = require("@cubejs-backend/query-orchestrator/driver/BaseDriver");
+```
+
+You should use:
+
+```javascript
+const { BaseDriver } = require("@cubejs-backend/query-orchestrator");
+```
+
+### `contextToDataSourceId`
+
+**Removed in Release: v0.25.0**
+
+The `contextToDataSourceId` option in the `cube.js` configuration file has been
+replaced by [`contextToOrchestratorId`][link-contexttoorchestratorid]. Prior to
+this change, multi-tenant setups were forced to share a Query Orchestrator
+instance. Now orchestrator instances can be shared by Cube instances and
+across different tenants, if need be. Single-tenant setups should consider
+removing the `contextToDataSourceId` property completely.
+
+[link-contexttoorchestratorid]:
+  https://docs.cube.dev/reference/configuration/config#context_to_orchestrator_id
+
+### Absolute import for `@cubejs-backend/server-core`
+
+**Removed in Release: v0.32.0**
+
+Absolute imports are highly dependent on a path, and all API becomes public. We
+now provide a public API from the package directly.
+
+Deprecated:
+
+```javascript
+const CubejsServerCore = require("@cubejs-backend/server-core");
+```
+
+You should use:
+
+```javascript
+const { CubejsServerCore } = require("@cubejs-backend/server-core");
+```
+
+### Absolute import for `@cubejs-backend/schema-compiler`
+
+**Removed in Release: v0.32.0**
+
+Absolute imports are highly dependent on a path, and all API becomes public. We
+now provide a public API from the package directly.
+
+Deprecated:
+
+```javascript
+const BaseQuery = require("@cubejs-backend/schema-compiler/adapter/BaseQuery");
+```
+
+You should use:
+
+```javascript
+const { BaseQuery } = require("@cubejs-backend/schema-compiler");
+```
+
+### `checkAuthMiddleware`
+
+**Removed in Release: v0.36.0**
+
+The `checkAuthMiddleware` option was tightly bound to Express,
+[which has been deprecated](#embedding-cube-within-express). Since Cube
+supports HTTP **and** WebSockets as transports, we want our authentication API
+to not rely on transport-specific details. We now recommend using
+[`checkAuth`][ref-checkauth] as a transport-agnostic method of authentication.
+This means the same authentication logic can be reused for both HTTP and
+WebSockets transports.
+
+If you are using custom authorization, please take a [look at the
+documentation][link-custom-auth]
+
+[link-custom-auth]: https://docs.cube.dev/docs/data-modeling/access-control#authentication
+[ref-checkauth]: https://docs.cube.dev/reference/configuration/config#check_auth
+
+### Node.js 10
+
+**Removed in Release: v0.29.0**
+
+Node.js 10 reached [End of Life on April 30, 2021][link-nodejs-eol]. This means
+no more updates. Please upgrade to Node.js 12 or higher.
+
+### `USER_CONTEXT`
+
+**Removed in Release: v0.36.0**
+
+`USER_CONTEXT` has been renamed to `SECURITY_CONTEXT`.
+
+You should use:
+
+```js
+cube(`visitors`, {
+  sql: `select * from visitors WHERE ${SECURITY_CONTEXT.source.filter(
+    "source"
+  )}`,
+});
+```
+
+### `authInfo`
+
+**Deprecated in Release: v0.26.0**
+
+The `authInfo` parameter to `checkAuth` no longer wraps the decoded JWT under
+the `u` property. It has also been renamed to
+[`securityContext`][ref-security-context]. Additionally, the security context
+claims are now populated from the root payload instead of the `u` property.
+
+Old shape of `authInfo`:
+
+```json
+{
+  "sub": "1234567890",
+  "u": { "user_id": 131 }
+}
+```
+
+New shape of `authInfo`:
+
+```json
+{
+  "sub": "1234567890",
+  "user_id": 131
+}
+```
+
+[ref-security-context]: https://docs.cube.dev/docs/data-modeling/access-control/context
+
+Deprecated:
+
+```js
+const server = new CubejsServer({
+ checkAuth: async (req, auth) => { // Notice how we're using the `u` property in `jwt.verify()` and assigning the result to `req.authInfo` req.authInfo = jwt.verify({ u: auth }, pem); }, contextToAppId: ({ authInfo }) => `APP_${authInfo.userId}`, preAggregationsSchema: ({ authInfo }) => `pre_aggregations_${authInfo.userId}`,});
+```
+
+You should use:
+
+```js
+const server = new CubejsServer({
+ checkAuth: async (req, auth) => { // We're now using directly assigning the result of `jet.verify()` to the `securityContext` property req.securityContext = jwt.verify(auth, pem); }, // And here we're now using the `securityContext` parameter contextToAppId: ({ securityContext }) => `APP_${securityContext.userId}`, // And the same here preAggregationsSchema: ({ securityContext }) => `pre_aggregations_${securityContext.userId}`,});
+```
+
+### Prefix Redis environment variables with `CUBEJS_`
+
+**Removed in Release: v0.36.0**
+
+### Node.js 15
+
+**Removed in Release: v0.29.0**
+
+### Node.js 12
+
+**Removed in Release: v0.32.0**
+
+### Using non-Cube Store databases as external database
+
+**Deprecated in Release: v0.29.0**
+
+Cube no longer supports using databases such as MySQL and Postgres as external
+databases. [Please switch to using Cube Store][link-running-in-prod] as it is a
+more robust and reliable solution.
+
+[link-running-in-prod]: https://docs.cube.dev/cube-core/running-in-production
+
+### `CUBEJS_EXTERNAL_DEFAULT` and `CUBEJS_SCHEDULED_REFRESH_DEFAULT`
+
+**Deprecated in Release: v0.30.0**
+
+The `CUBEJS_EXTERNAL_DEFAULT` and `CUBEJS_SCHEDULED_REFRESH_DEFAULT` environment
+variables are now marked as deprecated; they were introduced to smooth the
+migration to Cube Store and are no longer necessary.
+
+### Using external databases for pre-aggregations
+
+**Deprecated in Release: v0.30.0**
+
+Using external databases for pre-aggregations is now deprecated, and we strongly
+recommend [using Cube Store as a solution][ref-caching-in-prod].
+
+[ref-caching-in-prod]: https://docs.cube.dev/cube-core/running-in-production
+
+### `dbType`
+
+**Deprecated in Release: v0.30.30**
+
+**Removed in Release: v1.7.0**
+
+`dbType` has been removed. Passing `CreateOptions.dbType` now throws an error.
+Use [`driverFactory`][self-driver-factory] to return a `DriverConfig` object
+(`{ type, ... }`) instead, or set the `CUBEJS_DB_TYPE` environment variable.
+
+### Serverless Deployments
+
+**Removed in Release: v0.35.0**
+
+Using Serverless deployments with the `@cubejs-backend/serverless` package is
+now deprecated; we **strongly** recommend using Docker-based deployments
+instead.
+
+### Node.js 14
+
+**Removed in Release: v0.35.0**
+
+### Using Redis for in-memory cache and queue
+
+**Removed in Release: v0.36.0**
+
+Cube Store is now the default cache and queue engine, [replacing
+Redis](https://cube.dev/blog/replacing-redis-with-cube-store). Please migrate to
+[Cube Store](https://cube.dev/blog/how-you-win-by-using-cube-store-part-1).
+
+### `SECURITY_CONTEXT`
+
+**Deprecated in Release: v0.33.0**
+
+The `SECURITY_CONTEXT` context variable is deprecated. Use
+[`query_rewrite`](https://docs.cube.dev/reference/configuration/config#query_rewrite)
+instead.
+
+### `running_total` measure type
+
+**Deprecated in Release: v0.33.39**
+
+**Removed in Release: v1.7.0**
+
+The `running_total` measure type has been removed. Use a
+[`rolling_window`](https://docs.cube.dev/reference/data-modeling/measures#rolling_window)
+with an `unbounded` trailing window to calculate running totals instead.
+
+### Top-level `includes` parameter in views
+
+**Removed in Release: v1.3.0**
+
+The top-level `includes` parameter is now removed. Please always use the
+`includes` parameter within [`cubes` and `join_path`
+parameters](https://docs.cube.dev/reference/data-modeling/view#cubes) so you can
+explicitly control the join path.
+
+### Node.js 16
+
+**Removed in Release: v0.36.0**
+
+[link-nodejs-eol]: https://github.com/nodejs/Release#end-of-life-releases
+
+### MySQL-based SQL API
+
+**Removed in release: v0.35.0**
+
+Early prototype of the MySQL-based SQL API is removed in favor of the Postgres-compatible
+[SQL API](https://docs.cube.dev/reference/core-data-apis/sql-api), together with the
+`CUBEJS_SQL_PORT` environment variable.
+
+### `initApp` hook
+
+**Removed in release: v0.35.0**
+
+The `initApp` hook is removed as it's not relevant anymore for Docker-based architecture.
+
+### `/v1/run-scheduled-refresh` REST API endpoint
+
+**Removed in release: v0.36.0**
+
+The `/v1/run-scheduled-refresh` REST API endpoint is deprecated as it's not
+relevant anymore for Docker-based architecture. Use the [Orchestration
+API](https://docs.cube.dev/reference/orchestration-api) and
+`/v1/pre-aggregations/jobs` endpoint instead.
+
+### Node.js 18
+
+**Deprecated in Release: v0.36.0**
+
+Node.js 18 reaches [End of Life on April 30, 2025][link-nodejs-eol]. This means
+no more updates. Please upgrade to Node.js 20 or higher.
+
+### `CUBEJS_SCHEDULED_REFRESH_CONCURRENCY`
+
+**Deprecated in Release: v1.2.7**
+
+**Removed in Release: v1.7.0**
+
+This environment variable was renamed to [`CUBEJS_SCHEDULED_REFRESH_QUERIES_PER_APP_ID`](https://docs.cube.dev/reference/configuration/environment-variables#cubejs_scheduled_refresh_queries_per_app_id). Please use the new name.
+
+### Node.js 18
+
+**Removed in Release: v1.3.0**
+
+[link-nodejs-eol]: https://github.com/nodejs/Release#end-of-life-releases
+
+### Node.js 20
+
+**Removed in Release: v1.7.0**
+
+Node.js 20 reached [End of Life on April 30, 2026][link-nodejs-eol]. This means
+no more updates. Please upgrade to Node.js 22 or higher.
+
+### `renewQuery` parameter of the `/v1/load` endpoint
+
+**Deprecated in Release: v1.3.73**
+
+**Removed in Release: v1.7.0**
+
+This parameter has been removed. See [cache control](https://docs.cube.dev/reference/core-data-apis/rest-api#cache-control)
+options and use the `cache` parameter of the `/v1/load` endpoint instead.
+
+### Elasticsearch driver
+
+**Deprecated in Release: v1.6.0**
+
+**Removed in Release: v1.7.0**
+
+The Elasticsearch driver has been removed.
+
+### `context_to_roles`
+
+**Deprecated in Release: v1.6.4**
+
+**Removed in Release: v1.7.0**
+
+The `context_to_roles` configuration option has been removed. Please use `context_to_groups` instead.
+
+### Node.js 22
+
+**Deprecated in Release: v1.7.0**
+
+Node.js 22 is in maintenance mode from [October 21, 2025][link-nodejs-eol]. This means
+no more new features, only security updates. Please upgrade to Node.js 24 or higher.
+
+### Hive driver
+
+**Deprecated in Release: v1.7.25**
+
+The Hive / SparkSQL driver (`@cubejs-backend/hive-driver`) is deprecated and will be
+removed in a future release. It is community-supported and is not maintained by Cube or
+the database vendor. There is no drop-in replacement; `@cubejs-backend/jdbc-driver`
+ships Hive/SparkSQL connection settings that can be used through a custom
+[`driverFactory`](https://docs.cube.dev/reference/configuration/config#driver_factory).
+
+### `cube.ts` configuration file
+
+**Deprecated in Release: v1.7.34**
+
+**Removed in Release: v1.7.34**
+
+A `cube.ts` configuration file is no longer supported. Please use `cube.js` or
+`cube.py` instead. A server that finds only `cube.ts` fails to start with the
+`Configuration in cube.ts is no longer supported` error.
+
+### Legacy `cubejs` CLI
+
+**Deprecated in Release: v1.7.45**
+
+The legacy `cubejs` CLI (the `cubejs-cli` npm package) is deprecated and will stop
+receiving updates. Please use the native
+[Cube CLI](https://docs.cube.dev/reference/cli) (`cube`) instead: use `cube login`
+instead of `cubejs auth` and `cube deploy <deployment-id>` instead of `cubejs deploy`.
+The `cubejs` CLI prints a deprecation warning to stderr for these commands and when it
+runs with no command or with `--help` or `-h`. Set `CUBEJS_CLI_NO_DEPRECATION_WARNING=true` to
+hide the warning. Other commands, such as `cubejs server`, print no warning.
+
+### `NODE_ENV` as a development mode switch
+
+**Deprecated in Release: v1.7.47**
+
+**Removed in Release: v1.7.47**
+
+Development mode used to be on whenever `NODE_ENV` was anything but `production`,
+which put an instance with no `NODE_ENV` set at all into development mode — an
+authentication bypass — without anyone asking for it. `NODE_ENV` is no longer taken
+into account: development mode is off by default and is enabled by
+[`CUBEJS_DEV_MODE=true`](https://docs.cube.dev/reference/configuration/environment-variables#cubejs_dev_mode),
+or by the `devServer` option when embedding `@cubejs-backend/server-core` directly.
+
+Cube prints a warning when it sees a non-production `NODE_ENV` with `CUBEJS_DEV_MODE`
+unset. If you relied on `NODE_ENV` to get development mode, set `CUBEJS_DEV_MODE=true`
+instead. The dev server commands — `cubejs dev-server` and the `cubejs-dev-server` bin —
+keep the behaviour they had: they ask for development mode directly, without
+`CUBEJS_DEV_MODE`, so the SQL API keeps the generated password it has always had there.
+An explicit `CUBEJS_DEV_MODE=false` now wins over them, so either command starts a
+non-development server and requires `CUBEJS_DB_TYPE` or a `driverFactory` like
+`cubejs server` does.
+
+An instance that was implicitly in development mode also changes the pre-aggregation
+schema it writes to, from `dev_pre_aggregations` to `prod_pre_aggregations`, unless
+[`CUBEJS_PRE_AGGREGATIONS_SCHEMA`](https://docs.cube.dev/reference/configuration/environment-variables#cubejs_pre_aggregations_schema)
+pins it. Every pre-aggregation is rebuilt in the new schema on first use, and the
+tables left behind in `dev_pre_aggregations` are no longer tracked by the refresh
+worker, so nothing drops them for you — remove them by hand once the rebuild has
+finished. To keep the old schema instead, either set `CUBEJS_DEV_MODE=true` (if the
+instance really was meant to be a dev server) or set
+`CUBEJS_PRE_AGGREGATIONS_SCHEMA=dev_pre_aggregations` explicitly.
+
+Log output changes format with it. Development mode selects the human-readable logger;
+outside it Cube emits one structured JSON object per line, on both the Node and the SQL
+API side. An instance that was implicitly in development mode therefore switches to JSON
+on upgrade, so anything that greps or line-parses Cube's stdout stops matching. Set
+`CUBEJS_DEV_MODE=true` if the instance was meant to be a dev server, or update whatever
+parses the text format.
+
+The bundled Cube Store goes with it. Development mode is what defaults the external
+database to Cube Store and starts the bundled instance; outside it, Cube Store has to
+be configured explicitly. An instance that was implicitly in development mode and has
+no `CUBEJS_CUBESTORE_*` or `CUBEJS_EXT_DB_*` variables set therefore has no external
+database after the upgrade, and building a pre-aggregation fails with
+`externalDriverFactory is not provided`. Configure a
+[Cube Store connection](https://docs.cube.dev/cube-core/deployment#set-up-cube-store) for such
+an instance, or set `CUBEJS_DEV_MODE=true` if it was meant to be a dev server.
+
+`CreateOptions.devServer` is now what decides development mode for code that embeds
+`@cubejs-backend/server-core` directly, and **this can switch authentication off where
+it used to be on**. An embedder that passed `devServer: true` under `NODE_ENV=production`
+with `CUBEJS_DEV_MODE` unset used to mount the Playground routes while the data APIs
+stayed in production mode: JWT verification was enforced on the REST (JSON) and GraphQL
+APIs, the SQL API generated a password, log redaction was on, and pre-aggregations went
+to `prod_pre_aggregations`. Development mode now follows the option, so the same code
+serves those APIs with no token required, returns GraphiQL, stack traces and the
+transformed query to unauthenticated callers, stops redacting logs, and writes to
+`dev_pre_aggregations`. Nothing in the environment has to change for this to happen, and
+no warning is printed. If you passed `devServer: true` only to get the Playground on an
+otherwise production instance, stop passing it — or accept that the instance is now an
+[authentication bypass](https://docs.cube.dev/reference/configuration/environment-variables#cubejs_dev_mode)
+and keep it off the network.
+
+A driver cannot see `CreateOptions.devServer`, so Cube now writes the pre-aggregation
+schema it resolved into `CUBEJS_PRE_AGGREGATIONS_SCHEMA` when you have not set the
+variable yourself. This keeps drivers that read it in step with the rest of the instance
+whichever way `devServer` points — on Databricks with a `catalog` configured, a
+disagreement would leave the catalog prefix off the statement and queries failing with
+`TABLE_OR_VIEW_NOT_FOUND`, while `dropTable` qualifies unconditionally and drops from
+the other catalog. An explicit `CUBEJS_PRE_AGGREGATIONS_SCHEMA` is never overwritten,
+and the value Cube writes is the one that instance uses, `preAggregationsSchema` from
+`CreateOptions` included. A per-tenant `preAggregationsSchema` function has no single
+schema to write, so it is left alone and such a driver still resolves its own.
+
+Authentication can also flip without the `devServer` option. An embedder that set
+`CUBEJS_DEV_MODE=true` alongside an explicit
+`NODE_ENV=production` used to get Playground with JWT verification
+still enforced on the REST (JSON) and GraphQL APIs, because enforcement keyed on
+`NODE_ENV` rather than on development mode. It now follows development mode, so those
+APIs accept requests with no token. Drop `CUBEJS_DEV_MODE=true` if the instance was not
+meant to be a dev server. `cubejs server`, `cubejs dev-server` and the official Docker
+images are unaffected: they sync `NODE_ENV` to `development` whenever development mode
+resolves true, so that contradictory pair never reached them. The `cubejs-dev-server`
+bin does not sync it, so that pair does reach an instance started that way.
+
+The mirror case loses Cube Store instead. An embedder that passed `devServer: false`
+with `CUBEJS_DEV_MODE=true` used to be in development mode anyway, so it got
+`externalDbType: 'cubestore'` and the bundled Cube Store. It is now out of development
+mode, gets neither, and the first pre-aggregation build fails with
+`externalDriverFactory is not provided`; its pre-aggregations also move from
+`dev_pre_aggregations` to `prod_pre_aggregations`. Drop the `devServer: false`, or
+configure a [Cube Store connection](https://docs.cube.dev/cube-core/deployment#set-up-cube-store)
+as the paragraphs above describe.
+
+**The SQL API does not follow `devServer: false`.** It keys off `CUBEJS_DEV_MODE`
+alone, so with that pair the Postgres-wire endpoint still comes up on port `15432` and
+still accepts any credentials, while the REST (JSON) and GraphQL APIs now enforce JWT.
+Before this change the whole instance was in development mode and the open SQL API
+matched an equally open HTTP API; now the instance presents as authenticated while that
+port is not. Set
+[`CUBEJS_SQL_PASSWORD`](https://cube.dev/docs/reference/configuration/environment-variables#cubejs_sql_password),
+or `CUBEJS_PG_SQL_PORT=false` to not serve it at all.

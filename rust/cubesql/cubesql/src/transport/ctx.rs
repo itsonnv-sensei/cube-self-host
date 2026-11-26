@@ -1,0 +1,612 @@
+use datafusion::{arrow::datatypes::DataType, logical_plan::Column};
+use std::{
+    collections::{HashMap, HashSet},
+    ops::RangeFrom,
+    sync::Arc,
+};
+use uuid::Uuid;
+
+use crate::{sql::ColumnType, transport::SqlGenerator};
+
+use super::{CubeMeta, CubeMetaDimension, CubeMetaMeasure, V1CubeMetaExt};
+
+/// The data source name under which the SQL generator for Cube Store is registered.
+/// Cube Store is not a data source of the model, so the name is reserved: SQL pushed
+/// down over a Cube Store pre-aggregation is rendered with these templates.
+pub const CUBE_STORE_DATA_SOURCE: &str = "$cubestore";
+
+#[derive(Debug)]
+pub struct MetaContext {
+    pub cubes: Vec<CubeMeta>,
+    pub tables: Vec<CubeMetaTable>,
+    pub member_to_data_source: HashMap<String, String>,
+    pub data_source_to_sql_generator: HashMap<String, Arc<dyn SqlGenerator + Send + Sync>>,
+    /// The members of every external pre-aggregation, one set per rollup (views get a set
+    /// in their own names). A scan may read a rollup only when its members fit one set
+    pub external_pre_aggregation_members: Vec<HashSet<String>>,
+    pub compiler_id: Uuid,
+    /// DateTime when MetaContext was created, but it can be used as last schema update when
+    /// CompilerCache is used
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CubeMetaTable {
+    pub oid: u32,
+    pub record_oid: u32,
+    pub array_handler_oid: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub columns: Vec<CubeMetaColumn>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CubeMetaColumn {
+    pub oid: u32,
+    pub name: String,
+    pub description: Option<String>,
+    pub column_type: ColumnType,
+    pub can_be_null: bool,
+}
+
+#[derive(Clone, Debug)]
+pub enum DataSource<'meta> {
+    Unrestricted,
+    Specific(&'meta str),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum DataSourceError {
+    #[error("Multiple data sources found, '{0}' and '{1}'")]
+    Conflict(String, String),
+    #[error("Data source not found for member '{0}'")]
+    Missing(String),
+    #[error("Data source not found for cube '{0}'")]
+    MissingForCube(String),
+    #[error("Data source not found for any of the cubes: {0}")]
+    MissingForEveryCube(String),
+}
+
+impl<'meta> DataSource<'meta> {
+    /// The data source when there is a specific one, `None` when unrestricted.
+    pub fn specific(&self) -> Option<&'meta str> {
+        match self {
+            DataSource::Unrestricted => None,
+            DataSource::Specific(data_source) => Some(data_source),
+        }
+    }
+
+    pub fn specific_or<E>(self, err: E) -> Result<&'meta str, E> {
+        match self {
+            DataSource::Unrestricted => Err(err),
+            DataSource::Specific(data_source) => Ok(data_source),
+        }
+    }
+
+    /// Resolve again with `f` when nothing has restricted the data source yet.
+    pub fn or_else_try<E>(self, f: impl FnOnce() -> Result<Self, E>) -> Result<Self, E> {
+        match self {
+            Self::Unrestricted => f(),
+            specific => Ok(specific),
+        }
+    }
+
+    pub fn merge(&self, other: &Self) -> Result<Self, DataSourceError> {
+        match (self, other) {
+            (Self::Unrestricted, ds) | (ds, Self::Unrestricted) => Ok(ds.clone()),
+            (Self::Specific(s1), Self::Specific(s2)) => {
+                if s1 == s2 {
+                    Ok(self.clone())
+                } else {
+                    Err(DataSourceError::Conflict(s1.to_string(), s2.to_string()))
+                }
+            }
+        }
+    }
+}
+
+impl MetaContext {
+    pub fn new(
+        cubes: Vec<CubeMeta>,
+        member_to_data_source: HashMap<String, String>,
+        data_source_to_sql_generator: HashMap<String, Arc<dyn SqlGenerator + Send + Sync>>,
+        compiler_id: Uuid,
+    ) -> Self {
+        // 18000 - max system table oid
+        let mut oid_iter: RangeFrom<u32> = 18000..;
+        let tables: Vec<CubeMetaTable> = cubes
+            .iter()
+            .map(|cube| CubeMetaTable {
+                oid: oid_iter.next().unwrap_or(0),
+                record_oid: oid_iter.next().unwrap_or(0),
+                array_handler_oid: oid_iter.next().unwrap_or(0),
+                name: cube.name.clone(),
+                description: cube.description.clone(),
+                columns: cube
+                    .get_columns()
+                    .iter()
+                    .map(|column| CubeMetaColumn {
+                        oid: oid_iter.next().unwrap_or(0),
+                        name: column.get_name().clone(),
+                        description: column.get_description().clone(),
+                        column_type: column.get_column_type().clone(),
+                        can_be_null: column.sql_can_be_null(),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        Self {
+            cubes,
+            tables,
+            member_to_data_source,
+            data_source_to_sql_generator,
+            external_pre_aggregation_members: vec![],
+            compiler_id,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    pub fn with_external_pre_aggregation_members(mut self, rollups: Vec<Vec<String>>) -> Self {
+        self.external_pre_aggregation_members = rollups
+            .into_iter()
+            .map(|members| members.into_iter().collect())
+            .collect();
+        self
+    }
+
+    /// Whether some external pre-aggregation may serve every one of `members`: each set
+    /// holds a rollup's members and everything reading them (`externalPreAggregationMembers`
+    /// in server-core). Cube still decides, this only skips scans no rollup can serve
+    pub fn may_match_external_pre_aggregation<'m>(
+        &self,
+        members: impl IntoIterator<Item = &'m str>,
+    ) -> bool {
+        let members = members.into_iter().collect::<Vec<_>>();
+        self.external_pre_aggregation_members
+            .iter()
+            .any(|rollup| members.iter().all(|member| rollup.contains(*member)))
+    }
+
+    pub fn data_source_for_member_name(
+        &self,
+        member: &str,
+    ) -> Result<DataSource<'_>, DataSourceError> {
+        if self.is_synthetic_field(member) {
+            return Ok(DataSource::Unrestricted);
+        }
+
+        match self.member_to_data_source.get(member) {
+            Some(data_source) => Ok(DataSource::Specific(data_source.as_ref())),
+            None => Err(DataSourceError::Missing(member.to_string())),
+        }
+    }
+
+    pub fn data_source_for_member_names<'mem>(
+        &self,
+        members: impl IntoIterator<Item = &'mem str>,
+    ) -> Result<DataSource<'_>, DataSourceError> {
+        members
+            .into_iter()
+            .map(|member| self.data_source_for_member_name(member))
+            .try_fold(DataSource::Unrestricted, |l, r| l.merge(&r?))
+    }
+
+    /// Every data source reached by `members`, sorted and without duplicates. Unlike
+    /// [`Self::data_source_for_member_names`] this does not treat several data sources as
+    /// a conflict: members of a view can come from different data sources, and a caller
+    /// that does not know yet which of them a query will use keeps them all as the bound.
+    /// Synthetic fields reach no data source of their own and add nothing.
+    pub fn data_sources_for_member_names<'mem>(
+        &self,
+        members: impl IntoIterator<Item = &'mem str>,
+    ) -> Result<Vec<&str>, DataSourceError> {
+        // This runs inside rewrite transforms, so it stays a single allocation
+        let mut data_sources: Vec<&str> = Vec::new();
+        for member in members {
+            if let DataSource::Specific(data_source) = self.data_source_for_member_name(member)? {
+                data_sources.push(data_source);
+            }
+        }
+        data_sources.sort_unstable();
+        data_sources.dedup();
+        Ok(data_sources)
+    }
+
+    /// Data source for a cube or a view as a whole.
+    /// A query can reference a cube without referencing any of its members,
+    /// like when it selects only synthetic fields (`__user`, `__cubeJoinField`).
+    /// Members of a single view can come from different data sources,
+    /// so the first member with a known data source wins.
+    pub fn data_source_for_cube_name(
+        &self,
+        cube_name: &str,
+    ) -> Result<DataSource<'_>, DataSourceError> {
+        let cube = self
+            .find_cube_with_name(cube_name)
+            .ok_or_else(|| DataSourceError::MissingForCube(cube_name.to_string()))?;
+
+        cube.dimensions
+            .iter()
+            .map(|dimension| &dimension.name)
+            .chain(cube.measures.iter().map(|measure| &measure.name))
+            .chain(cube.segments.iter().map(|segment| &segment.name))
+            .find_map(|member| self.member_to_data_source.get(member))
+            .map(|data_source| DataSource::Specific(data_source.as_ref()))
+            .ok_or_else(|| DataSourceError::MissingForCube(cube_name.to_string()))
+    }
+
+    /// Data source shared by `cube_names`, as a fallback for a query that
+    /// references no members at all. Cubes without a data source of their own are
+    /// skipped, so that one unresolvable cube does not mask a resolvable one; the
+    /// rest are merged, which reports two different data sources as a conflict
+    /// like every other resolution path here. An empty `cube_names` is
+    /// `Unrestricted`; `cube_names` where nothing at all resolves names them all,
+    /// since the caller has no other way to tell what was tried.
+    pub fn data_source_for_cube_names<'names>(
+        &self,
+        cube_names: impl IntoIterator<Item = &'names str>,
+    ) -> Result<DataSource<'_>, DataSourceError> {
+        let mut tried = Vec::new();
+        let data_source = cube_names
+            .into_iter()
+            .filter_map(|cube_name| {
+                tried.push(cube_name);
+                self.data_source_for_cube_name(cube_name).ok()
+            })
+            .try_fold(DataSource::Unrestricted, |l, r| l.merge(&r))?;
+
+        match data_source {
+            DataSource::Unrestricted if !tried.is_empty() => {
+                Err(DataSourceError::MissingForEveryCube(tried.join(", ")))
+            }
+            data_source => Ok(data_source),
+        }
+    }
+
+    pub fn find_cube_with_name(&self, name: &str) -> Option<&CubeMeta> {
+        self.cubes.iter().find(|&cube| cube.name == name)
+    }
+
+    pub fn find_cube_by_column<'meta, 'alias>(
+        &'meta self,
+        alias_to_cube: &'alias Vec<(String, String)>,
+        column: &Column,
+    ) -> Option<(&'alias str, &'meta CubeMeta)> {
+        (if let Some(rel) = column.relation.as_ref() {
+            alias_to_cube.iter().find(|(a, _)| a == rel)
+        } else {
+            alias_to_cube.iter().find(|(_, c)| {
+                if let Some(cube) = self.find_cube_with_name(c) {
+                    // TODO replace cube.contains_member(&cube.member_name(...)) with searching by prepared column names
+                    cube.contains_member(&cube.member_name(&column.name))
+                } else {
+                    false
+                }
+            })
+        })
+        .and_then(|(a, c)| self.find_cube_with_name(c).map(|cube| (a.as_str(), cube)))
+    }
+
+    pub fn find_cube_by_column_for_replacer<'alias>(
+        &self,
+        alias_to_cube: &'alias Vec<((String, String), String)>,
+        column: &Column,
+    ) -> Vec<((&'alias str, &'alias str), &CubeMeta)> {
+        if let Some(rel) = column.relation.as_ref() {
+            alias_to_cube
+                .iter()
+                .filter_map(|((old, new), c)| {
+                    if old == rel {
+                        self.find_cube_with_name(c)
+                            .map(|cube| ((old.as_str(), new.as_str()), cube))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            alias_to_cube
+                .iter()
+                .filter_map(|((old, new), c)| {
+                    if let Some(cube) = self.find_cube_with_name(c) {
+                        // TODO replace cube.contains_member(&cube.member_name(...)) with searching by prepared column names
+                        if cube.contains_member(&cube.member_name(&column.name)) {
+                            return Some(((old.as_str(), new.as_str()), cube));
+                        }
+                    }
+
+                    None
+                })
+                .collect()
+        }
+    }
+
+    pub fn find_measure_with_name(&self, name: &str) -> Option<&CubeMetaMeasure> {
+        let mut cube_and_member_name = name.split(".");
+        let cube_name = cube_and_member_name.next()?;
+        let member_name = cube_and_member_name.next()?;
+        let cube = self.find_cube_with_name(cube_name)?;
+        cube.lookup_measure(member_name)
+    }
+
+    pub fn find_dimension_with_name(&self, name: &str) -> Option<&CubeMetaDimension> {
+        let mut cube_and_member_name = name.split(".");
+        let cube_name = cube_and_member_name.next()?;
+        let member_name = cube_and_member_name.next()?;
+        let cube = self.find_cube_with_name(cube_name)?;
+        cube.lookup_dimension(member_name)
+    }
+
+    pub fn is_synthetic_field(&self, name: &str) -> bool {
+        let mut cube_and_member_name = name.split(".");
+        let Some(cube_name) = cube_and_member_name.next() else {
+            return false;
+        };
+        let Some(member_name) = cube_and_member_name.next() else {
+            return MetaContext::is_synthetic_field_name(cube_name);
+        };
+
+        if self.find_cube_with_name(cube_name).is_some() {
+            MetaContext::is_synthetic_field_name(member_name)
+        } else {
+            false
+        }
+    }
+
+    pub fn is_synthetic_field_name(field_name: &str) -> bool {
+        field_name == "__user" || field_name == "__cubeJoinField"
+    }
+
+    pub fn find_df_data_type(&self, member_name: &str) -> Option<DataType> {
+        let (cube_name, _) = member_name.split_once(".")?;
+
+        self.find_cube_with_name(cube_name)?
+            .df_data_type(member_name)
+    }
+
+    pub fn find_cube_table_with_oid(&self, oid: u32) -> Option<&CubeMetaTable> {
+        self.tables.iter().find(|table| table.oid == oid)
+    }
+
+    pub fn find_cube_table_with_name(&self, name: &str) -> Option<&CubeMetaTable> {
+        self.tables.iter().find(|table| table.name == name)
+    }
+
+    pub fn cube_has_join(&self, cube_name: &str, join_name: &str) -> bool {
+        if let Some(cube) = self.find_cube_with_name(cube_name) {
+            if let Some(joins) = &cube.joins {
+                return joins.iter().any(|j| j.name == join_name);
+            }
+        }
+
+        return false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::CubeMetaType;
+
+    #[test]
+    fn test_find_tables() {
+        let test_cubes = vec![
+            CubeMeta {
+                name: "test1".to_string(),
+                description: None,
+                title: None,
+                r#type: CubeMetaType::Cube,
+                dimensions: vec![],
+                measures: vec![],
+                segments: vec![],
+                joins: None,
+                folders: None,
+                nested_folders: None,
+                hierarchies: None,
+                meta: None,
+            },
+            CubeMeta {
+                name: "test2".to_string(),
+                description: None,
+                title: None,
+                r#type: CubeMetaType::Cube,
+                dimensions: vec![],
+                measures: vec![],
+                segments: vec![],
+                joins: None,
+                folders: None,
+                nested_folders: None,
+                hierarchies: None,
+                meta: None,
+            },
+        ];
+
+        // TODO
+        let test_context =
+            MetaContext::new(test_cubes, HashMap::new(), HashMap::new(), Uuid::new_v4());
+
+        match test_context.find_cube_table_with_oid(18000) {
+            Some(table) => assert_eq!(18000, table.oid),
+            _ => panic!("wrong oid!"),
+        }
+
+        match test_context.find_cube_table_with_name("test2") {
+            Some(table) => assert_eq!(18005, table.oid),
+            _ => panic!("wrong name!"),
+        }
+    }
+
+    fn cube_with_members(name: &str, members: &[&str]) -> CubeMeta {
+        CubeMeta {
+            name: name.to_string(),
+            description: None,
+            title: None,
+            r#type: CubeMetaType::Cube,
+            dimensions: members
+                .iter()
+                .map(|member| CubeMetaDimension::new(member.to_string(), "string".to_string()))
+                .collect(),
+            measures: vec![],
+            segments: vec![],
+            joins: None,
+            folders: None,
+            nested_folders: None,
+            hierarchies: None,
+            meta: None,
+        }
+    }
+
+    /// `orders` resolves through its member, `logs` has a member with no data
+    /// source of its own, and `events` is not in the schema at all.
+    fn data_source_test_context() -> MetaContext {
+        MetaContext::new(
+            vec![
+                cube_with_members("orders", &["orders.status"]),
+                cube_with_members("logs", &["logs.line"]),
+            ],
+            HashMap::from([("orders.status".to_string(), "warehouse".to_string())]),
+            HashMap::new(),
+            Uuid::new_v4(),
+        )
+    }
+
+    #[test]
+    fn test_data_source_for_cube_name() {
+        let ctx = data_source_test_context();
+
+        assert!(matches!(
+            ctx.data_source_for_cube_name("orders"),
+            Ok(DataSource::Specific("warehouse"))
+        ));
+        assert!(matches!(
+            ctx.data_source_for_cube_name("logs"),
+            Err(DataSourceError::MissingForCube(cube)) if cube == "logs"
+        ));
+        assert!(matches!(
+            ctx.data_source_for_cube_name("events"),
+            Err(DataSourceError::MissingForCube(cube)) if cube == "events"
+        ));
+    }
+
+    #[test]
+    fn test_data_source_for_cube_names() {
+        let ctx = data_source_test_context();
+
+        // Nothing to resolve from leaves the data source open, so that the caller
+        // can raise its own error.
+        assert!(matches!(
+            ctx.data_source_for_cube_names(Vec::<&str>::new()),
+            Ok(DataSource::Unrestricted)
+        ));
+        // A cube without a data source of its own does not mask a cube that has
+        // one, whichever order they come in.
+        assert!(matches!(
+            ctx.data_source_for_cube_names(vec!["logs", "orders"]),
+            Ok(DataSource::Specific("warehouse"))
+        ));
+        assert!(matches!(
+            ctx.data_source_for_cube_names(vec!["orders", "logs"]),
+            Ok(DataSource::Specific("warehouse"))
+        ));
+        // When nothing resolves, the error names everything that was tried.
+        let err = ctx
+            .data_source_for_cube_names(vec!["logs", "events"])
+            .expect_err("neither cube has a data source");
+        assert!(
+            matches!(&err, DataSourceError::MissingForEveryCube(cubes) if cubes == "logs, events"),
+            "expected every tried cube to be named, got: {}",
+            err
+        );
+    }
+
+    /// A view can include members from cubes on different data sources. There is
+    /// no single right answer then, and resolving a whole cube is only ever a
+    /// fallback for a query that names no members, so the first member that has a
+    /// data source wins. This pins that choice rather than endorsing it.
+    #[test]
+    fn test_data_source_for_cube_name_of_multi_data_source_view() {
+        let mut view = cube_with_members("everything", &["everything.url", "everything.status"]);
+        view.r#type = CubeMetaType::View;
+
+        let ctx = MetaContext::new(
+            vec![view],
+            HashMap::from([
+                ("everything.url".to_string(), "analytics".to_string()),
+                ("everything.status".to_string(), "warehouse".to_string()),
+            ]),
+            HashMap::new(),
+            Uuid::new_v4(),
+        );
+
+        assert!(matches!(
+            ctx.data_source_for_cube_name("everything"),
+            Ok(DataSource::Specific("analytics"))
+        ));
+    }
+
+    /// Members on several data sources are all kept, once each and in a stable order, so
+    /// that a caller can carry them as a bound; a member without a data source is still
+    /// an error, and synthetic fields add nothing.
+    #[test]
+    fn test_data_sources_for_member_names() {
+        let ctx = MetaContext::new(
+            vec![
+                cube_with_members("orders", &["orders.status"]),
+                cube_with_members("visits", &["visits.url"]),
+                cube_with_members("logs", &["logs.line"]),
+            ],
+            HashMap::from([
+                ("orders.status".to_string(), "warehouse".to_string()),
+                ("visits.url".to_string(), "analytics".to_string()),
+            ]),
+            HashMap::new(),
+            Uuid::new_v4(),
+        );
+
+        assert_eq!(
+            ctx.data_sources_for_member_names(vec![
+                "visits.url",
+                "orders.status",
+                "orders.__user",
+                "visits.url",
+            ])
+            .unwrap(),
+            vec!["analytics", "warehouse"]
+        );
+        assert_eq!(
+            ctx.data_sources_for_member_names(vec!["orders.__user"])
+                .unwrap(),
+            Vec::<&str>::new()
+        );
+        assert!(matches!(
+            ctx.data_sources_for_member_names(vec!["orders.status", "logs.line"]),
+            Err(DataSourceError::Missing(member)) if member == "logs.line"
+        ));
+    }
+
+    #[test]
+    fn test_data_source_for_cube_names_reports_conflict() {
+        let ctx = MetaContext::new(
+            vec![
+                cube_with_members("orders", &["orders.status"]),
+                cube_with_members("visits", &["visits.url"]),
+            ],
+            HashMap::from([
+                ("orders.status".to_string(), "warehouse".to_string()),
+                ("visits.url".to_string(), "analytics".to_string()),
+            ]),
+            HashMap::new(),
+            Uuid::new_v4(),
+        );
+
+        let err = ctx
+            .data_source_for_cube_names(vec!["orders", "visits"])
+            .expect_err("two data sources should conflict");
+        assert!(
+            matches!(&err, DataSourceError::Conflict(..)),
+            "expected a conflict, got: {}",
+            err
+        );
+    }
+}

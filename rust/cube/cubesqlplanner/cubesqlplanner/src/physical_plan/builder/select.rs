@@ -1,0 +1,429 @@
+use crate::physical_plan::{
+    AliasedExpr, Cte, Expr, From, FromSource, MemberExpression, OrderBy, QualifiedColumnName,
+    Schema, SchemaColumn, Select, SingleAliasedSource, SingleSource,
+};
+use crate::planner::filter::Filter;
+use crate::planner::RowLimit;
+
+use crate::physical_plan::expression::FunctionExpression;
+use crate::physical_plan::sql_nodes::SqlNodesFactory;
+use crate::physical_plan::VisitorContext;
+use crate::planner::query_tools::QueryTools;
+use crate::planner::{CubeId, MemberSymbol};
+use cubenativeutils::CubeError;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+pub struct SelectBuilder {
+    projection_columns: Vec<AliasedExpr>,
+    from: Rc<From>,
+    filter: Option<Filter>,
+    binding_filter: Option<Option<Filter>>,
+    filter_params_filters: Option<Filter>,
+    group_by: Vec<Expr>,
+    having: Option<Filter>,
+    order_by: Vec<OrderBy>,
+    ctes: Vec<Rc<Cte>>,
+    is_distinct: bool,
+    limit: Option<RowLimit>,
+    offset: Option<usize>,
+    result_schema: Schema,
+}
+
+impl SelectBuilder {
+    pub fn new(from: Rc<From>) -> Self {
+        Self {
+            projection_columns: vec![],
+            from,
+            filter: None,
+            binding_filter: None,
+            filter_params_filters: None,
+            group_by: vec![],
+            having: None,
+            order_by: vec![],
+            ctes: vec![],
+            is_distinct: false,
+            limit: None,
+            offset: None,
+            result_schema: Schema::empty(),
+        }
+    }
+
+    pub fn add_projection_member(&mut self, member: &Rc<MemberSymbol>, alias: Option<String>) {
+        let alias = if let Some(alias) = alias {
+            alias
+        } else {
+            member.alias()
+        };
+
+        let expr = Expr::Member(MemberExpression::new(member.clone()));
+        let aliased_expr = AliasedExpr {
+            expr,
+            alias: alias.clone(),
+        };
+
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), Some(member.clone())));
+    }
+
+    pub fn add_projection_member_reference(
+        &mut self,
+        member: &Rc<MemberSymbol>,
+        reference: QualifiedColumnName,
+    ) {
+        let alias = reference.name().clone();
+
+        let expr = Expr::Reference(reference);
+        let aliased_expr = AliasedExpr {
+            expr,
+            alias: alias.clone(),
+        };
+
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), Some(member.clone())));
+    }
+
+    pub fn add_projection_group_any_member(
+        &mut self,
+        member: &Rc<MemberSymbol>,
+        reference: QualifiedColumnName,
+    ) {
+        let alias = reference.name().clone();
+
+        let expr = Expr::GroupAny(reference);
+        let aliased_expr = AliasedExpr {
+            expr,
+            alias: alias.clone(),
+        };
+
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), Some(member.clone())));
+    }
+
+    /// Projects `measure` under its own alias, computed as `base`
+    /// aggregated over the rows `condition` keeps.
+    pub fn add_projection_conditional_measure(
+        &mut self,
+        measure: &Rc<MemberSymbol>,
+        base: &Rc<MemberSymbol>,
+        condition: crate::planner::filter::FilterItem,
+    ) {
+        let alias = measure.alias();
+        self.projection_columns.push(AliasedExpr {
+            expr: Expr::ConditionalMeasure(MemberExpression::new(base.clone()), condition),
+            alias: alias.clone(),
+        });
+        self.result_schema
+            .add_column(SchemaColumn::new(alias, Some(measure.clone())));
+    }
+
+    pub fn add_union_padding_null_projection(&mut self, member: &Rc<MemberSymbol>, alias: String) {
+        self.projection_columns.push(AliasedExpr {
+            expr: Expr::UnionPaddingNull,
+            alias: alias.clone(),
+        });
+        self.result_schema
+            .add_column(SchemaColumn::new(alias, Some(member.clone())));
+    }
+
+    pub fn add_count_all(&mut self, alias: String) {
+        let func = Expr::Function(FunctionExpression {
+            function: "COUNT".to_string(),
+            arguments: vec![Expr::Asterisk],
+        });
+        let aliased_expr = AliasedExpr {
+            expr: func,
+            alias: alias.clone(),
+        };
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), None));
+    }
+    pub fn add_projection_function_expression(
+        &mut self,
+        function: &str,
+        args: Vec<Rc<MemberSymbol>>,
+        alias: String,
+    ) {
+        let expr = Expr::Function(FunctionExpression {
+            function: function.to_string(),
+            arguments: args
+                .into_iter()
+                .map(|r| Expr::Member(MemberExpression::new(r.clone())))
+                .collect(),
+        });
+        let aliased_expr = AliasedExpr {
+            expr,
+            alias: alias.clone(),
+        };
+
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), None));
+    }
+    pub fn add_projection_reference_member(
+        &mut self,
+        member: &Rc<MemberSymbol>,
+        reference: QualifiedColumnName,
+        alias: Option<String>,
+    ) {
+        let alias = if let Some(alias) = alias {
+            alias
+        } else {
+            reference.name().clone()
+        };
+
+        let expr = Expr::Reference(reference);
+        let aliased_expr = AliasedExpr {
+            expr,
+            alias: alias.clone(),
+        };
+
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), Some(member.clone())));
+    }
+    pub fn add_projection_coalesce_member(
+        &mut self,
+        member: &Rc<MemberSymbol>,
+        references: Vec<QualifiedColumnName>,
+        alias: Option<String>,
+    ) -> Result<(), CubeError> {
+        let alias = if let Some(alias) = alias {
+            alias
+        } else {
+            member.alias()
+        };
+
+        let expr = if references.len() > 1 {
+            Expr::Function(FunctionExpression {
+                function: "COALESCE".to_string(),
+                arguments: references
+                    .into_iter()
+                    // TODO unwrap
+                    .map(|r| Expr::Reference(r))
+                    .collect(),
+            })
+        } else if references.len() == 1 {
+            Expr::Reference(references[0].clone())
+        } else {
+            return Err(CubeError::internal(
+                "Cannot add coalesce projection without references".to_string(),
+            ));
+        };
+
+        let aliased_expr = AliasedExpr {
+            expr,
+            alias: alias.clone(),
+        };
+
+        self.projection_columns.push(aliased_expr);
+        self.result_schema
+            .add_column(SchemaColumn::new(alias.clone(), Some(member.clone())));
+        Ok(())
+    }
+
+    pub fn set_filter(&mut self, filter: Option<Filter>) {
+        self.filter = filter;
+    }
+
+    /// The WHERE filter before the select's reference substitutions, for the
+    /// `FILTER_PARAMS` bindings: they render inside sources, where those
+    /// references are out of scope. Defaults to the WHERE filter itself.
+    pub fn set_binding_filter(&mut self, filter: Option<Filter>) {
+        self.binding_filter = Some(filter);
+    }
+
+    /// Filters an enclosing construct applies on this select's behalf, for
+    /// the `FILTER_PARAMS` and `FILTER_GROUP` bindings of its sources to
+    /// resolve against. Set it where a select carries no WHERE of its own but
+    /// its sources still have to see the query's filters; it is conjoined
+    /// with the WHERE filter, never substituted for it.
+    pub fn set_filter_params_filters(&mut self, filters: Option<Filter>) {
+        self.filter_params_filters = filters;
+    }
+
+    pub fn set_group_by(&mut self, group_by: Vec<Expr>) {
+        self.group_by = group_by;
+    }
+
+    pub fn set_having(&mut self, having: Option<Filter>) {
+        self.having = having;
+    }
+
+    pub fn set_order_by(&mut self, order_by: Vec<OrderBy>) {
+        self.order_by = order_by;
+    }
+
+    pub fn set_distinct(&mut self) {
+        self.is_distinct = true;
+    }
+
+    pub fn set_limit(&mut self, limit: Option<RowLimit>) {
+        self.limit = limit;
+    }
+
+    pub fn set_offset(&mut self, offset: Option<usize>) {
+        self.offset = offset;
+    }
+
+    pub fn set_ctes(&mut self, ctes: Vec<Rc<Cte>>) {
+        self.ctes = ctes;
+    }
+
+    pub fn from(&self) -> &Rc<From> {
+        &self.from
+    }
+
+    pub fn make_cube_references(from: Rc<From>) -> HashMap<CubeId, String> {
+        let mut refs = HashMap::new();
+        match &from.source {
+            FromSource::Single(source) => Self::add_cube_reference_if_needed(source, &mut refs),
+            FromSource::Join(join) => {
+                Self::add_cube_reference_if_needed(&join.root, &mut refs);
+                for join_item in join.joins.iter() {
+                    Self::add_cube_reference_if_needed(&join_item.from, &mut refs);
+                }
+            }
+            FromSource::Empty => {}
+            FromSource::CalcGroupsJoin(calc_groups) => {
+                refs = Self::make_cube_references(calc_groups.from().clone())
+            }
+        }
+        refs
+    }
+
+    fn add_cube_reference_if_needed(
+        source: &SingleAliasedSource,
+        refs: &mut HashMap<CubeId, String>,
+    ) {
+        if let SingleSource::Cube(cube) = &source.source {
+            refs.insert(cube.cube_id().clone(), source.alias.clone());
+        }
+    }
+
+    fn make_asteriks_schema(from: &Rc<From>) -> Rc<Schema> {
+        let schema = match &from.source {
+            FromSource::Empty => Rc::new(Schema::empty()),
+            FromSource::Single(source) => source.source.schema(),
+            FromSource::Join(join) => {
+                let mut schema = Schema::empty();
+                schema.merge(join.root.source.schema().as_ref());
+                for itm in join.joins.iter() {
+                    schema.merge(itm.from.source.schema().as_ref())
+                }
+                Rc::new(schema)
+            }
+            FromSource::CalcGroupsJoin(calc_groups) => {
+                let mut schema = Self::make_asteriks_schema(calc_groups.from())
+                    .as_ref()
+                    .clone();
+                for itm in calc_groups.calc_groups().iter() {
+                    schema.add_column(SchemaColumn::new(
+                        itm.symbol.alias(),
+                        Some(itm.symbol.clone()),
+                    ));
+                }
+                Rc::new(schema)
+            }
+        };
+        schema
+    }
+
+    /// Everything that constrains the rows this select emits, as one
+    /// conjunction: its own WHERE and whatever an enclosing construct applies
+    /// on its behalf. A binding may push any of it into a source's scan.
+    fn binding_filters(filter: Option<Filter>, from_enclosing: Option<Filter>) -> Option<Filter> {
+        match (filter, from_enclosing) {
+            (Some(filter), Some(from_enclosing)) => Some(Filter {
+                items: filter
+                    .items
+                    .into_iter()
+                    .chain(from_enclosing.items)
+                    .collect(),
+            }),
+            (filter, from_enclosing) => filter.or(from_enclosing),
+        }
+    }
+
+    pub fn build(self, query_tools: Rc<QueryTools>, mut nodes_factory: SqlNodesFactory) -> Select {
+        let cube_references = Self::make_cube_references(self.from.clone());
+        nodes_factory.set_cube_name_references(cube_references);
+        let schema = if self.projection_columns.is_empty() {
+            Self::make_asteriks_schema(&self.from)
+        } else {
+            Rc::new(self.result_schema)
+        };
+        Select {
+            projection_columns: self.projection_columns,
+            from: self.from,
+            filter: self.filter.clone(),
+            group_by: self.group_by,
+            having: self.having,
+            order_by: self.order_by,
+            context: Rc::new(VisitorContext::new(
+                query_tools,
+                &nodes_factory,
+                Self::binding_filters(
+                    self.binding_filter.unwrap_or(self.filter),
+                    self.filter_params_filters,
+                ),
+            )),
+            ctes: self.ctes,
+            is_distinct: self.is_distinct,
+            limit: self.limit,
+            offset: self.offset,
+            schema,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::filter::{FilterGroup, FilterGroupOperator, FilterItem};
+
+    // Two items that compare unequal, so the merged order is observable.
+    fn items() -> (FilterItem, FilterItem) {
+        let inner = FilterItem::Group(Rc::new(FilterGroup::new(FilterGroupOperator::And, vec![])));
+        let outer = FilterItem::Group(Rc::new(FilterGroup::new(
+            FilterGroupOperator::Or,
+            vec![inner.clone()],
+        )));
+        (inner, outer)
+    }
+
+    fn filter(item: &FilterItem) -> Option<Filter> {
+        Some(Filter {
+            items: vec![item.clone()],
+        })
+    }
+
+    #[test]
+    fn binding_filters_conjoins_both_sides_where_first() {
+        let (a, b) = items();
+
+        let merged = SelectBuilder::binding_filters(filter(&a), filter(&b))
+            .expect("a filter when either side is set");
+
+        assert_eq!(merged.items, vec![a, b]);
+    }
+
+    #[test]
+    fn binding_filters_keeps_whichever_side_is_set() {
+        let (a, b) = items();
+
+        assert_eq!(
+            SelectBuilder::binding_filters(filter(&a), None).map(|f| f.items),
+            Some(vec![a])
+        );
+        assert_eq!(
+            SelectBuilder::binding_filters(None, filter(&b)).map(|f| f.items),
+            Some(vec![b])
+        );
+        assert!(SelectBuilder::binding_filters(None, None).is_none());
+    }
+}

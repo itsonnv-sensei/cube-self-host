@@ -1,0 +1,355 @@
+/* eslint-disable no-throw-literal */
+import * as stream from 'stream';
+import pt from 'promise-timeout';
+import {
+  ContinueWaitError,
+  DriverFactoryByDataSource,
+  DriverType,
+  PreAggregationDescription,
+  Query,
+  QueryBody,
+  QueryOrchestrator,
+  QueryOrchestratorOptions,
+} from '@cubejs-backend/query-orchestrator';
+
+import { DatabaseType, LoggerFn, RequestContext } from './types';
+
+export interface OrchestratorApiOptions extends QueryOrchestratorOptions {
+  contextToDbType: (dataSource: string) => Promise<DatabaseType>;
+  contextToExternalDbType: () => DatabaseType;
+  redisPrefix?: string;
+}
+
+/**
+ * The shortest time a connection test gets before it counts as timed out.
+ * BaseDriver's own default (10 s) is too short for warehouses such as BigQuery,
+ * whose metadata calls can take tens of seconds without anything being wrong.
+ * Drivers that ask for longer (JDBC: 60 s) keep their own value.
+ */
+const MIN_TEST_CONNECTION_TIMEOUT = 45000;
+
+export class OrchestratorApi {
+  private seenDataSources: Record<string, boolean> = {};
+
+  protected orchestrator: QueryOrchestrator;
+
+  protected readonly continueWaitTimeout: number;
+
+  public constructor(
+    protected readonly driverFactory: DriverFactoryByDataSource,
+    protected readonly logger: LoggerFn,
+    protected readonly options: OrchestratorApiOptions
+  ) {
+    this.continueWaitTimeout = this.options.continueWaitTimeout || 10;
+
+    this.orchestrator = new QueryOrchestrator(
+      options.redisPrefix || 'STANDALONE',
+      driverFactory,
+      logger,
+      options
+    );
+  }
+
+  /**
+   * Returns QueryOrchestrator instance.
+   */
+  public getQueryOrchestrator(): QueryOrchestrator {
+    return this.orchestrator;
+  }
+
+  /**
+   * Force reconcile queue logic to be executed.
+   */
+  public async forceReconcile(datasource = 'default') {
+    await this.orchestrator.forceReconcile(datasource);
+  }
+
+  /**
+   * Returns stream object which will be used to stream results from
+   * the data source if applicable. Throw otherwise.
+   *
+   * @throw Error
+   */
+  public async streamQuery(query: QueryBody): Promise<stream.Writable> {
+    // TODO merge with fetchQuery
+    return this.orchestrator.streamQuery(query);
+  }
+
+  /**
+   * Push query to the queue, fetch and return result if query takes
+   * less than `continueWaitTimeout` seconds, throw `ContinueWaitError`
+   * error otherwise.
+   */
+  public async executeQuery(query: QueryBody) {
+    const queryForLog = query.query?.replace(/\s+/g, ' ');
+    const startQueryTime = (new Date()).getTime();
+
+    try {
+      this.logger('Query started', {
+        query: queryForLog,
+        params: query.values,
+        requestId: query.requestId
+      });
+
+      let fetchQueryPromise: Promise<any> = query.loadRefreshKeysOnly
+        ? this.orchestrator.loadRefreshKeys(query)
+        : this.orchestrator.fetchQuery(query);
+
+      if (query.isJob) {
+        // We want to immediately resolve and return a jobbed build query result
+        // (initialized by the /cubejs-system/v1/pre-aggregations/jobs endpoint)
+        // because the following stack was optimized for such behavior.
+        const job = await fetchQueryPromise;
+        return job;
+      }
+
+      fetchQueryPromise = pt.timeout(fetchQueryPromise, this.continueWaitTimeout * 1000);
+
+      const data = await fetchQueryPromise;
+
+      this.logger('Query completed', {
+        duration: ((new Date()).getTime() - startQueryTime),
+        query: queryForLog,
+        params: query.values,
+        requestId: query.requestId
+      });
+
+      if (Array.isArray(data)) {
+        const res = await Promise.all(
+          data.map(async (item) => ({
+            ...item,
+            dbType: await this.options.contextToDbType(item.dataSource),
+            extDbType: this.options.contextToExternalDbType(),
+          }))
+        );
+        return res;
+      }
+
+      data.dbType = await this.options.contextToDbType(data.dataSource);
+      data.extDbType = this.options.contextToExternalDbType();
+
+      return data;
+    } catch (err: any) {
+      if (err instanceof pt.TimeoutError || err instanceof ContinueWaitError) {
+        this.logger('Continue wait', {
+          duration: ((new Date()).getTime() - startQueryTime),
+          query: queryForLog,
+          params: query.values,
+          requestId: query.requestId
+        });
+
+        if (query.scheduledRefresh) {
+          throw {
+            error: 'Continue wait',
+            stage: null
+          };
+        }
+
+        const fromCache = await this
+          .orchestrator
+          .resultFromCacheIfExists(query);
+
+        if ((query.cacheMode === 'stale-if-slow' || query.cacheMode === 'stale-while-revalidate') && fromCache) {
+          this.logger('Slow Query Warning', {
+            query: queryForLog,
+            requestId: query.requestId,
+            warning: 'Query is too slow to be renewed during the ' +
+              'user request and was served from the cache. Please ' +
+              'consider using low latency pre-aggregations.'
+          });
+
+          return {
+            ...fromCache,
+            slowQuery: true
+          };
+        }
+
+        throw {
+          error: 'Continue wait',
+          stage: await this.orchestrator.queryStage(query)
+        };
+      }
+
+      this.logger('Error querying db', {
+        query: queryForLog,
+        params: query.values,
+        error: err.stack || err,
+        requestId: query.requestId
+      });
+
+      throw { error: err.toString() };
+    }
+  }
+
+  public async testOrchestratorConnections() {
+    return this.orchestrator.testConnections();
+  }
+
+  /**
+   * Tests worker's connections to the Cubestore and, if not in the rollup only
+   * mode, to the datasources.
+   */
+  public async testConnection() {
+    if (this.options.rollupOnlyMode) {
+      return this.testDriverConnection(this.options.externalDriverFactory, DriverType.External);
+    } else {
+      return Promise.all([
+        ...Object.keys(this.seenDataSources).map(
+          ds => this.testDriverConnection(this.driverFactory, DriverType.Internal, ds),
+        ),
+        this.testDriverConnection(this.options.externalDriverFactory, DriverType.External),
+      ]);
+    }
+  }
+
+  /**
+   * Tests connection to the data source specified by the driver factory
+   * function and data source name. The test is bounded by the driver's
+   * `testConnectionTimeout()`, but never less than 45 s: some drivers' test calls
+   * have no timeout of their own (BigQuery's `getDatasets()`), and the /livez and
+   * /readyz handlers hold a lock while they run, so one hung test would otherwise
+   * hang every probe.
+   */
+  public async testDriverConnection(
+    driverFn?: DriverFactoryByDataSource,
+    driverType?: DriverType,
+    dataSource: string = 'default',
+  ) {
+    if (driverFn) {
+      try {
+        const driver = await driverFn(dataSource);
+        const driverTimeout = typeof driver.testConnectionTimeout === 'function'
+          ? driver.testConnectionTimeout()
+          : 0;
+        const timeout = Math.max(driverTimeout, MIN_TEST_CONNECTION_TIMEOUT);
+
+        try {
+          await pt.timeout(driver.testConnection(), timeout);
+        } catch (e: any) {
+          if (e instanceof pt.TimeoutError) {
+            throw new Error(`Connection test for data source '${dataSource}' timed out after ${timeout}ms`);
+          }
+
+          throw e;
+        }
+
+        this.logger('Connection test completed successfully', {
+          driverType,
+          dataSource,
+        });
+      } catch (e: any) {
+        e.driverType = driverType;
+        throw e;
+      }
+    }
+  }
+
+  /**
+   * Determines whether the partition table already exists or not.
+   */
+  public async isPartitionExist(
+    request: string,
+    external: boolean,
+    dataSource = 'default',
+    schema: string,
+    table: string,
+    key: any,
+    token: string,
+  ): Promise<[boolean, string]> {
+    return this.orchestrator.isPartitionExist(
+      request,
+      external,
+      dataSource,
+      schema,
+      table,
+      key,
+      token,
+    );
+  }
+
+  public async release() {
+    try {
+      return await Promise.all([
+        ...Object.keys(this.seenDataSources).map(ds => this.releaseDriver(this.driverFactory, ds)),
+        this.releaseDriver(this.options.externalDriverFactory),
+        this.orchestrator.cleanup()
+      ]);
+    } catch (error) {
+      // `OrchestratorStorage` swallows this so that one orchestrator failing to
+      // close cannot fail shutdown, which leaves this as the only place an
+      // operator learns that a connection was not closed after all.
+      this.logger('Orchestrator Release Error', {
+        orchestratorId: this.options.redisPrefix,
+        error: (error as Error).stack || String(error),
+      });
+
+      throw error;
+    }
+  }
+
+  protected async releaseDriver(driverFn?: DriverFactoryByDataSource, dataSource: string = 'default') {
+    if (driverFn) {
+      const driver = await driverFn(dataSource);
+      if (driver.release) {
+        await driver.release();
+      }
+    }
+  }
+
+  public addDataSeenSource(dataSource: string) {
+    this.seenDataSources[dataSource] = true;
+  }
+
+  public getPreAggregationVersionEntries(
+    context: RequestContext,
+    preAggregations: Parameters<QueryOrchestrator['getPreAggregationVersionEntries']>[0],
+    preAggregationsSchema: string,
+  ): Promise<any> {
+    return this.orchestrator.getPreAggregationVersionEntries(
+      preAggregations,
+      preAggregationsSchema,
+      context.requestId
+    );
+  }
+
+  public getPreAggregationPreview(context: RequestContext, preAggregation: PreAggregationDescription) {
+    return this.orchestrator.getPreAggregationPreview(context.requestId, preAggregation);
+  }
+
+  public async expandPartitionsInPreAggregations(queryBody: Query) {
+    try {
+      return await this.orchestrator.expandPartitionsInPreAggregations(queryBody);
+    } catch (err) {
+      if (err instanceof ContinueWaitError) {
+        throw {
+          error: 'Continue wait'
+        };
+      }
+      throw err;
+    }
+  }
+
+  public async checkPartitionsBuildRangeCache(queryBody: QueryBody) {
+    return this.orchestrator.checkPartitionsBuildRangeCache(queryBody);
+  }
+
+  public async getPreAggregationQueueStates(dataSource?: string) {
+    return this.orchestrator.getPreAggregationQueueStates(dataSource);
+  }
+
+  public async cancelPreAggregationQueriesFromQueue(queryKeys: string[], dataSource: string) {
+    return this.orchestrator.cancelPreAggregationQueriesFromQueue(queryKeys, dataSource);
+  }
+
+  public async cancelQueryByRequestId(requestId: string) {
+    return this.orchestrator.cancelQueryByRequestId(requestId);
+  }
+
+  public async updateRefreshEndReached() {
+    return this.orchestrator.updateRefreshEndReached();
+  }
+
+  public async markRefreshActive() {
+    return this.orchestrator.markRefreshActive();
+  }
+}

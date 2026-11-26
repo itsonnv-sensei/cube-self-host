@@ -1,0 +1,661 @@
+import crypto from 'crypto';
+import cloneDeep from 'lodash.clonedeep';
+import { BaseDriver } from '@cubejs-backend/query-orchestrator';
+import {
+  getEnv,
+  assertDataSource,
+  isDockerImage,
+  displayCLIWarning,
+  userPreAggregationsSchema,
+} from '@cubejs-backend/shared';
+import {
+  isCubeStoreSupported,
+  CubeStoreHandler,
+  CubeStoreDevDriver
+} from '@cubejs-backend/cubestore-driver';
+
+import {
+  CreateOptions,
+  SystemOptions,
+  DriverDecoratedOptions,
+  ServerCoreInitializedOptions,
+  RequestContext,
+  DriverContext,
+  DbTypeInternalFn,
+  DriverFactoryInternalFn,
+  DatabaseType,
+  DriverConfig,
+  OrchestratorOptions,
+  OrchestratorInitedOptions,
+  QueueOptions,
+  QueueInitedOptions,
+  AggsInitedOptions,
+} from './types';
+import { lookupDriverClass, isDriver } from './DriverResolvers';
+import type { CubejsServerCore } from './server';
+import { validateOptions } from './optionsValidate';
+
+const { version } = require('../../../package.json');
+
+export class OptsHandler {
+  public constructor(
+    private core: CubejsServerCore,
+    private createOptions: CreateOptions,
+    private systemOptions?: SystemOptions,
+  ) {
+    const options = this.sanitizeOptions(cloneDeep(this.createOptions));
+    const driverFactory = this.getDriverFactory(options);
+    this.initializedOptions = this.initializeCoreOptions({
+      ...options,
+      driverFactory,
+      dbType: this.getDbType(driverFactory),
+    });
+  }
+
+  private decoratedFactory = false;
+
+  public isCustomDriverFactory(): boolean {
+    return !this.decoratedFactory;
+  }
+
+  /**
+   * driverFactory function result type.
+   */
+  private driverFactoryType: undefined | 'BaseDriver' | 'DriverConfig';
+
+  private initializedOptions: ServerCoreInitializedOptions;
+
+  private sanitizeOptions<T extends CreateOptions>(opts: T): T {
+    if ((opts as any).dbType) {
+      throw new Error(
+        'CreateOptions.dbType was removed in v1.7.0. ' +
+        'Use driverFactory instead (return a DriverConfig `{ type, ... }`), ' +
+        'or set the CUBEJS_DB_TYPE environment variable. ' +
+        'See https://github.com/cube-js/cube/blob/master/DEPRECATION.md#dbtype'
+      );
+    }
+
+    const validated = validateOptions(opts);
+
+    // Probed for its throw: the only consumer is per-request code (normalizeQuery)
+    getEnv('defaultTimezone');
+
+    if (
+      !this.isDevMode() &&
+      !process.env.CUBEJS_DB_TYPE &&
+      !opts.driverFactory
+    ) {
+      throw new Error(
+        'Either CUBEJS_DB_TYPE or CreateOptions.driverFactory must be specified'
+      );
+    }
+
+    return validated;
+  }
+
+  /**
+   * Assert value returned from the driver factory.
+   */
+  private assertDriverFactoryResult(
+    val: DriverConfig | BaseDriver,
+  ) {
+    if (isDriver(val)) {
+      if (!this.driverFactoryType) {
+        this.driverFactoryType = 'BaseDriver';
+      } else if (this.driverFactoryType !== 'BaseDriver') {
+        throw new Error(
+          'CreateOptions.driverFactory function must return either ' +
+          'BaseDriver or DriverConfig.'
+        );
+      }
+      return <BaseDriver>val;
+    } else if (
+      val && (<DriverConfig>val).type && typeof (<DriverConfig>val).type === 'string'
+    ) {
+      if (!this.driverFactoryType) {
+        this.driverFactoryType = 'DriverConfig';
+      } else if (this.driverFactoryType !== 'DriverConfig') {
+        throw new Error(
+          'CreateOptions.driverFactory function must return either ' +
+          'BaseDriver or DriverConfig.'
+        );
+      }
+      return <DriverConfig>val;
+    } else {
+      throw new Error(
+        'Unexpected CreateOptions.driverFactory result value. Must be either ' +
+        `DriverConfig or driver instance: <${
+          typeof val
+        }>${
+          JSON.stringify(val, undefined, 2)
+        }`
+      );
+    }
+  }
+
+  /**
+   * Assert orchestration options.
+   */
+  private asserOrchestratorOptions(opts: OrchestratorOptions) {
+    if (
+      opts.rollupOnlyMode &&
+      this.isApiWorker() &&
+      getEnv('preAggregationsBuilder')
+    ) {
+      throw new Error(
+        'CreateOptions.orchestratorOptions.rollupOnlyMode cannot be trusly ' +
+        'for API instance if CUBEJS_PRE_AGGREGATIONS_BUILDER is set to true'
+      );
+    }
+  }
+
+  /**
+   * Default database factory function.
+   */
+  private defaultDriverFactory(ctx: DriverContext): DriverConfig {
+    const type = <DatabaseType>getEnv('dbType', {
+      dataSource: assertDataSource(ctx.dataSource),
+      preAggregations: ctx.preAggregations,
+    });
+
+    return { type };
+  }
+
+  private getDriverFactory(opts: CreateOptions): DriverFactoryInternalFn {
+    const { driverFactory } = opts;
+    this.decoratedFactory = !driverFactory;
+
+    return async (ctx: DriverContext) => {
+      if (!driverFactory) {
+        if (!this.driverFactoryType) {
+          this.driverFactoryType = 'DriverConfig';
+        } else if (this.driverFactoryType !== 'DriverConfig') {
+          throw new Error(
+            'CreateOptions.driverFactory function must return either ' +
+            'BaseDriver or DriverConfig.'
+          );
+        }
+
+        // TODO (buntarb): wrapping this call with assertDriverFactoryResult
+        // change assertions sequence and cause a fail of few tests. Review it.
+        return this.defaultDriverFactory(ctx);
+      } else {
+        return this.assertDriverFactoryResult(
+          await driverFactory(ctx),
+        );
+      }
+    };
+  }
+
+  private getDbType(
+    driverFactory: DriverFactoryInternalFn,
+  ): DbTypeInternalFn {
+    return async (ctx: DriverContext) => {
+      let val: undefined | BaseDriver | DriverConfig;
+      let type: DatabaseType;
+
+      if (!this.driverFactoryType) {
+        val = await driverFactory(ctx);
+      }
+
+      if (
+        this.driverFactoryType === 'BaseDriver' &&
+        process.env.CUBEJS_DB_TYPE
+      ) {
+        type = <DatabaseType>process.env.CUBEJS_DB_TYPE;
+      } else if (this.driverFactoryType === 'DriverConfig') {
+        type = (<DriverConfig>(val || await driverFactory(ctx))).type;
+      }
+
+      return type;
+    };
+  }
+
+  /**
+   * Returns default driver concurrency if specified.
+   */
+  private async getDriverConcurrency(
+    ctx: DriverContext
+  ): Promise<undefined | number> {
+    const type = await this
+      .getCoreInitializedOptions()
+      .dbType(ctx);
+    const DriverConstructor = lookupDriverClass(type);
+    if (
+      DriverConstructor &&
+      DriverConstructor.getDefaultConcurrency
+    ) {
+      return DriverConstructor.getDefaultConcurrency();
+    }
+    return undefined;
+  }
+
+  /**
+   * Wrap queueOptions into a function which evaluate concurrency on the fly.
+   */
+  private queueOptionsWrapper(
+    context: RequestContext,
+    queueOptions: QueueOptions | ((dataSource: string) => QueueOptions) | undefined,
+    queueType: 'query' | 'pre-aggs',
+  ): (dataSource?: string) => Promise<QueueInitedOptions> {
+    return async (dataSource = 'default') => {
+      const options = (
+        typeof queueOptions === 'function'
+          ? queueOptions(dataSource)
+          : queueOptions
+      ) || {};
+      if (options.concurrency) {
+        // concurrency specified in cube.js
+        return { ...options, concurrency: options.concurrency };
+      } else {
+        const workerConcurrency = getEnv('refreshWorkerConcurrency');
+        if (queueType === 'pre-aggs' && workerConcurrency) {
+          return {
+            ...options,
+            concurrency: workerConcurrency,
+          };
+        }
+
+        const envConcurrency: number = getEnv('concurrency', { dataSource });
+        if (envConcurrency) {
+          // concurrency specified in CUBEJS_CONCURRENCY
+          return {
+            ...options,
+            concurrency: envConcurrency,
+          };
+        } else {
+          const defConcurrency = await this.getDriverConcurrency({
+            ...context,
+            dataSource,
+          });
+          if (defConcurrency) {
+            // concurrency specified in driver
+            return {
+              ...options,
+              concurrency: defConcurrency,
+            };
+          }
+          // no specified concurrency
+          return {
+            ...options,
+            concurrency: 5,
+          };
+        }
+      }
+    };
+  }
+
+  /**
+   * Initialize core options.
+   */
+  private initializeCoreOptions(
+    opts: DriverDecoratedOptions
+  ): ServerCoreInitializedOptions {
+    // Not getEnv: a schema this process pinned is not a user's choice, so a second
+    // instance resolves its own default rather than inheriting the first's
+    const preAggregationsSchema =
+      userPreAggregationsSchema() ||
+      (this.isDevMode()
+        ? 'dev_pre_aggregations'
+        : 'prod_pre_aggregations');
+
+    const skipOnEnv = [
+      // Default EXT_DB variables
+      'CUBEJS_EXT_DB_URL',
+      'CUBEJS_EXT_DB_HOST',
+      'CUBEJS_EXT_DB_NAME',
+      'CUBEJS_EXT_DB_PORT',
+      'CUBEJS_EXT_DB_USER',
+      'CUBEJS_EXT_DB_PASS',
+      // Cube Store variables
+      'CUBEJS_CUBESTORE_HOST',
+      'CUBEJS_CUBESTORE_PORT',
+      'CUBEJS_CUBESTORE_USER',
+      'CUBEJS_CUBESTORE_PASS',
+    ];
+
+    const definedExtDBVariables =
+      skipOnEnv.filter((field) => process.env[field] !== undefined);
+
+    const externalDbType =
+      opts.externalDbType ||
+      <DatabaseType | undefined>process.env.CUBEJS_EXT_DB_TYPE ||
+      (this.isDevMode() || definedExtDBVariables.length > 0) && 'cubestore' ||
+      undefined;
+
+    let externalDriverFactory =
+      typeof externalDbType === 'string' &&
+      (
+        () => new (lookupDriverClass(externalDbType))({
+          url: process.env.CUBEJS_EXT_DB_URL,
+          host: process.env.CUBEJS_EXT_DB_HOST,
+          database: process.env.CUBEJS_EXT_DB_NAME,
+          port: process.env.CUBEJS_EXT_DB_PORT,
+          user: process.env.CUBEJS_EXT_DB_USER,
+          password: process.env.CUBEJS_EXT_DB_PASS,
+        })
+      );
+
+    const externalDialectFactory = () => (
+      typeof externalDbType === 'string' &&
+      lookupDriverClass(externalDbType).dialectClass &&
+      lookupDriverClass(externalDbType).dialectClass()
+    );
+
+    if (!this.isDevMode() && getEnv('externalDefault') && !externalDbType) {
+      displayCLIWarning(
+        'Cube Store is not found. Please follow this documentation ' +
+        'to configure Cube Store ' +
+        'https://docs.cube.dev/cube-core/running-in-production'
+      );
+    }
+
+    if (this.isDevMode() && externalDbType !== 'cubestore') {
+      displayCLIWarning(
+        `Using ${externalDbType} as an external database is deprecated. ` +
+        'Please use Cube Store instead: ' +
+        'https://docs.cube.dev/cube-core/running-in-production'
+      );
+    }
+
+    if (externalDbType === 'cubestore' && this.isDevMode() && !opts.serverless) {
+      if (!definedExtDBVariables.length) {
+        if (isCubeStoreSupported()) {
+          const cubeStoreHandler = new CubeStoreHandler({
+            stdout: (data) => {
+              console.log(data.toString().trim());
+            },
+            stderr: (data) => {
+              console.log(data.toString().trim());
+            },
+            onRestart: (code) => this.core.logger('Cube Store Restarting', {
+              warning: `Instance exit with ${code}, restarting`,
+            }),
+          });
+
+          console.log(`🔥 Cube Store (${version}) is assigned to 3030 port.`);
+
+          // Start Cube Store on startup in official docker images
+          if (isDockerImage()) {
+            cubeStoreHandler.acquire().catch(
+              (e) => this.core.logger('Cube Store Start Error', {
+                error: e.message,
+              })
+            );
+          }
+
+          // Lazy loading for Cube Store
+          externalDriverFactory =
+            () => new CubeStoreDevDriver(cubeStoreHandler);
+        } else {
+          this.core.logger('Cube Store is not supported on your system', {
+            warning: (
+              `You are using ${
+                process.platform
+              } platform with ${
+                process.arch
+              } architecture, which is not supported by Cube Store.`
+            ),
+          });
+        }
+      }
+    }
+
+    const options: ServerCoreInitializedOptions = {
+      devServer: this.isDevMode(),
+      dialectFactory: (ctx) => (
+        lookupDriverClass(ctx.dbType).dialectClass &&
+        lookupDriverClass(ctx.dbType).dialectClass()
+      ),
+      externalDbType,
+      externalDriverFactory,
+      externalDialectFactory,
+      apiSecret: getEnv('apiSecret'),
+      apiSecrets: getEnv('apiSecrets'),
+      telemetry: getEnv('telemetry'),
+      scheduledRefreshTimeZones: getEnv('scheduledRefreshTimezones'),
+      scheduledRefreshContexts: async () => [null],
+      basePath: '/cubejs-api',
+      dashboardAppPath: 'dashboard-app',
+      dashboardAppPort: 3000,
+      scheduledRefreshConcurrency: getEnv('scheduledRefreshQueriesPerAppId'),
+      scheduledRefreshBatchSize: getEnv('scheduledRefreshBatchSize'),
+      compilerCacheSize: getEnv('compilerCacheSize'),
+      maxCompiledMembers: getEnv('maxCompiledMembers'),
+      preAggregationsSchema,
+      schemaPath: getEnv('schemaPath'),
+      scheduledRefreshTimer: getEnv('refreshWorkerMode'),
+      sqlCache: true,
+      livePreview: getEnv('livePreview'),
+      ...opts,
+      jwt: {
+        key: getEnv('jwtKey'),
+        algorithms: getEnv('jwtAlgorithms'),
+        issuer: getEnv('jwtIssuer'),
+        audience: getEnv('jwtAudience'),
+        subject: getEnv('jwtSubject'),
+        jwkUrl: getEnv('jwkUrl'),
+        claimsNamespace: getEnv('jwtClaimsNamespace'),
+        ...opts.jwt,
+      },
+      fastReload: getEnv('fastReload'),
+    };
+
+    if (
+      typeof options.scheduledRefreshTimer === 'number' &&
+      getEnv('scheduledRefreshTimerIntervalOnly') &&
+      !getEnv('refreshWorkerModeExplicit')
+    ) {
+      // The number is only an interval here: this instance runs the refresh
+      // worker only when CUBEJS_REFRESH_WORKER (or a deprecated alias) says so,
+      // not on the NODE_ENV-based default
+      options.scheduledRefreshTimer = false;
+    }
+
+    if (opts.contextToAppId && !opts.scheduledRefreshContexts) {
+      this.core.logger('Multitenancy Without ScheduledRefreshContexts', {
+        warning: (
+          'You are using multitenancy without configuring scheduledRefreshContexts, ' +
+          'which can lead to issues where the security context will be undefined ' +
+          'while Cube will do background refreshing: ' +
+          'https://docs.cube.dev/reference/configuration/config#scheduled_refresh_contexts'
+        ),
+      });
+    }
+
+    if (options.devServer && !options.apiSecret) {
+      options.apiSecret = crypto.randomBytes(16).toString('hex');
+      displayCLIWarning(
+        `Option apiSecret is required in dev mode. Cube has generated it as ${
+          options.apiSecret
+        }`
+      );
+    }
+
+    if (!options.devServer || this.configuredForQueryProcessing()) {
+      const fieldsForValidation: (keyof ServerCoreInitializedOptions)[] = [
+        'driverFactory',
+        'dbType'
+      ];
+
+      if (!options.jwt?.jwkUrl) {
+        // apiSecret is required only for auth by JWT, for JWK it's not needed
+        fieldsForValidation.push('apiSecret');
+      }
+
+      const invalidFields =
+        fieldsForValidation.filter((field) => options[field] === undefined);
+      if (invalidFields.length) {
+        throw new Error(
+          `${
+            invalidFields.join(', ')
+          } ${
+            invalidFields.length === 1 ? 'is' : 'are'
+          } required option(s)`
+        );
+      }
+    }
+
+    return options;
+  }
+
+  /**
+   * Determines whether current instance should be bootstraped in the
+   * dev mode or not. CreateOptions.devServer if the embedder set it, otherwise
+   * CUBEJS_DEV_MODE; off by default, and NODE_ENV has no say in it.
+   */
+  private isDevMode(): boolean {
+    return this.createOptions.devServer ?? getEnv('devMode');
+  }
+
+  /**
+   * Determines whether the current instance is configured as a refresh worker
+   * or not. It always returns false in the dev mode.
+   */
+  private isRefreshWorker(): boolean {
+    return (
+      !this.isDevMode() &&
+      this.configuredForScheduledRefresh()
+    );
+  }
+
+  /**
+   * Determines whether the current instance is configured as an api worker or
+   * not. It always returns false in the dev mode.
+   */
+  private isApiWorker(): boolean {
+    return (
+      !this.isDevMode() &&
+      !this.configuredForScheduledRefresh()
+    );
+  }
+
+  /**
+   * Determines whether the current instance is configured as pre-aggs builder
+   * or not.
+   */
+  private isPreAggsBuilder(): boolean {
+    return (
+      this.isDevMode() ||
+      this.isRefreshWorker() ||
+      this.isApiWorker() && getEnv('preAggregationsBuilder')
+    );
+  }
+
+  /**
+   * Returns server core initialized options object.
+   */
+  public getCoreInitializedOptions(): ServerCoreInitializedOptions {
+    return this.initializedOptions;
+  }
+
+  /**
+   * Determines whether the current configuration is set to process queries.
+   */
+  public configuredForQueryProcessing(): boolean {
+    const hasDbCredentials =
+      Object.keys(process.env).filter(
+        (key) => (
+          key.startsWith('CUBEJS_DB') && key !== 'CUBEJS_DB_TYPE' ||
+          key.startsWith('CUBEJS_AWS')
+        )
+      ).length > 0;
+
+    return (
+      hasDbCredentials ||
+      this.systemOptions?.isCubeConfigEmpty === undefined ||
+      !this.systemOptions?.isCubeConfigEmpty
+    );
+  }
+
+  /**
+   * Determines whether the current configuration is set for running scheduled
+   * refresh intervals or not.
+   */
+  public configuredForScheduledRefresh(): boolean {
+    return (
+      this.initializedOptions.scheduledRefreshTimer !== undefined &&
+      (
+        (
+          typeof this.initializedOptions.scheduledRefreshTimer === 'boolean' &&
+          this.initializedOptions.scheduledRefreshTimer
+        ) ||
+        (
+          typeof this.initializedOptions.scheduledRefreshTimer === 'number' &&
+          this.initializedOptions.scheduledRefreshTimer !== 0
+        )
+      )
+    );
+  }
+
+  /**
+   * Returns scheduled refresh interval value (in ms).
+   */
+  public getScheduledRefreshInterval(): number {
+    if (!this.configuredForScheduledRefresh()) {
+      throw new Error('Instance configured to skip scheduled jobs');
+    } else if (
+      typeof this.initializedOptions.scheduledRefreshTimer === 'number'
+    ) {
+      return parseInt(
+        `${this.initializedOptions.scheduledRefreshTimer}`, 10
+      ) * 1000;
+    } else {
+      return 30000;
+    }
+  }
+
+  /**
+   * Returns `OrchestratorInitedOptions` based on provided `OrchestratorOptions`
+   * and request context.
+   */
+  public getOrchestratorInitializedOptions(
+    context: RequestContext,
+    orchestratorOptions: OrchestratorOptions,
+  ): OrchestratorInitedOptions {
+    this.asserOrchestratorOptions(orchestratorOptions);
+
+    const clone = cloneDeep(orchestratorOptions);
+    const queryCacheOptions = clone.queryCacheOptions || {};
+    const preAggregationsOptions = clone.preAggregationsOptions || {};
+    // Not a public option (Joi rejects it), but a function-form orchestratorOptions skips validation
+    const { maxSourceRowLimit } = preAggregationsOptions as AggsInitedOptions;
+
+    return {
+      ...clone,
+      // rollup only mode (querying pre-aggs only)
+      rollupOnlyMode: clone.rollupOnlyMode !== undefined
+        ? clone.rollupOnlyMode
+        : getEnv('rollupOnlyMode'),
+      queryCacheOptions: {
+        ...queryCacheOptions,
+        localRefreshKey: getEnv('refreshKeyLocalTime'),
+        queueOptions: this.queueOptionsWrapper(
+          context,
+          queryCacheOptions.queueOptions,
+          'query'
+        ),
+      },
+      preAggregationsOptions: {
+        ...preAggregationsOptions,
+        queueOptions: this.queueOptionsWrapper(
+          context,
+          preAggregationsOptions.queueOptions,
+          'pre-aggs'
+        ),
+        // pre-aggs external refresh flag (force to run pre-aggs build flow first if
+        // pre-agg is not exists/updated at the query moment). Initially the default
+        // was equal to [rollupOnlyMode && !scheduledRefreshTimer].
+        externalRefresh: preAggregationsOptions.externalRefresh !== undefined
+          ? preAggregationsOptions.externalRefresh
+          : !this.isPreAggsBuilder(),
+        maxPartitions: preAggregationsOptions.maxPartitions !== undefined
+          ? preAggregationsOptions.maxPartitions
+          : getEnv('maxPartitionsPerCube'),
+        maxSourceRowLimit: maxSourceRowLimit !== undefined
+          ? maxSourceRowLimit
+          : getEnv('maxSourceRowLimit'),
+      },
+    };
+  }
+}

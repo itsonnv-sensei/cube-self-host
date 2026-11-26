@@ -1,0 +1,89 @@
+{
+  "name": "@cubejs-backend/native",
+  "version": "1.8.34",
+  "author": "Cube Dev, Inc.",
+  "description": "Native module for Cube (binding to Rust codebase)",
+  "main": "dist/js/index.js",
+  "typings": "dist/js/index.d.ts",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cube-js/cube.git",
+    "directory": "packages/cubejs-backend-native"
+  },
+  "scripts": {
+    "tsc": "tsc",
+    "build": "tsc",
+    "native:build": "cargo-cp-artifact -a cdylib cubejs-native index.node -- cargo build --message-format=json-render-diagnostics",
+    "native:build-debug": "npm run native:build --",
+    "native:build-release": "npm run native:build -- --release",
+    "native:build-debug-python": "npm run native:build -- --features python",
+    "native:build-release-python": "npm run native:build -- --release --features python",
+    "native:build-debug-bridge-tests": "npm run native:build -- --features bridge-test-harness",
+    "native:build-release-bridge-tests": "npm run native:build -- --release --features bridge-test-harness",
+    "postinstall": "post-installer || echo 'Your system is not supported by @cubejs-backend/native, some feature will be unavailable.'",
+    "test:server": "CUBEJS_NATIVE_INTERNAL_DEBUG=true CUBESQL_LOG_LEVEL=trace CUBESQL_PG_PORT=5555 node dist/test/server.js",
+    "test:server:stream": "CUBESQL_STREAM_MODE=true CUBESQL_LOG_LEVEL=error CUBESQL_PG_PORT=5555 node dist/test/server.js",
+    "test:python": "CUBEJS_NATIVE_INTERNAL_DEBUG=true CUBESQL_LOG_LEVEL=trace CUBESQL_PG_PORT=5555 node dist/test/python.js",
+    "unit": "jest --forceExit",
+    "test:unit": "yarn run unit",
+    "test:bridge": "npm run native:build-debug-bridge-tests && npm run tsc && jest --config jest-bridge.config.js --forceExit",
+    "test:cargo": "cargo test",
+    "bench": "jest --config jest-bench.config.js --forceExit"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "files": [
+    "dist/js"
+  ],
+  "devDependencies": {
+    "@cubejs-backend/linter": "1.8.34",
+    "@types/jest": "^29",
+    "@types/node": "^22",
+    "cargo-cp-artifact": "^0.1.9",
+    "jest": "^29",
+    "jest-bench": "^29",
+    "pg": "^8.18.0",
+    "typescript": "~6.0.3",
+    "uuid": "^11.1.1"
+  },
+  "dependencies": {
+    "@cubejs-backend/cubesql": "1.8.34",
+    "@cubejs-backend/shared": "1.8.34",
+    "@cubejs-infra/post-installer": "^0.2.0"
+  },
+  "resources": {
+    "vars": {
+      "libpython_or_fallback": {
+        "default": "fallback",
+        "value": [
+          "libpython",
+          [
+            "3.13",
+            "3.12",
+            "3.11",
+            "3.10",
+            "3.9"
+          ]
+        ],
+        "constraints": {
+          "platform-arch": [
+            "linux-x64",
+            "linux-arm64"
+          ]
+        }
+      }
+    },
+    "files": [
+      {
+        "host": "https://github.com/cube-js/cube/releases/download/v${version}/",
+        "path": "native-${platform}-${arch}-${libc}-${libpython_or_fallback}.tar.gz",
+        "not_found": "Your system is not supported by @cubejs-backend/native, some feature will be unavailable."
+      }
+    ]
+  },
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,30 @@
+use crate::logical_plan::visitor::*;
+use crate::logical_plan::*;
+use crate::planner::CubeId;
+use cubenativeutils::CubeError;
+use itertools::Itertools;
+use std::rc::Rc;
+
+struct CubeNamesCollector {
+    cube_names: Vec<CubeId>,
+}
+
+impl LogicalNodeVisitor for CubeNamesCollector {
+    fn process_node(&mut self, node: &PlanNode) -> Result<(), CubeError> {
+        if let PlanNode::LogicalFrom(from) = node {
+            self.cube_names.extend(from.cube_ids());
+        }
+        Ok(())
+    }
+}
+
+pub fn collect_cube_names_from_node<T: LogicalNode>(
+    node: &Rc<T>,
+) -> Result<Vec<CubeId>, CubeError> {
+    let mut collector = CubeNamesCollector {
+        cube_names: Vec::new(),
+    };
+    let visitor = LogicalPlanVisitor::new();
+    visitor.visit(&mut collector, node)?;
+    Ok(collector.cube_names.into_iter().unique().collect_vec())
+}

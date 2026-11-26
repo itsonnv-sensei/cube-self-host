@@ -1,0 +1,21 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "js",
+    "test",
+    "benchmarks"
+  ],
+  "exclude": [
+    "test/snapshotResolver.js",
+    "test/globalSetup.js"
+  ],
+  "compilerOptions": {
+    "types": ["node", "jest"],
+    "outDir": "dist",
+    "rootDir": ".",
+    "allowJs": true,
+  },
+  "references": [
+    { "path": "../cubejs-backend-shared" }
+  ]
+}

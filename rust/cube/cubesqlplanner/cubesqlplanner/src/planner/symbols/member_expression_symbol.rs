@@ -1,0 +1,247 @@
+use super::common::CompiledMemberPath;
+use super::deps::{self, symbol_deps, DepVisitor, DepVisitorMut, SymbolDeps};
+use super::MemberSymbol;
+use crate::planner::collectors::member_childs;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::{CubeId, CubeTableSymbol, MemberId, SqlCall};
+use crate::utils::debug::DebugSql;
+use cubenativeutils::CubeError;
+use itertools::Itertools;
+use std::rc::Rc;
+
+/// Body of a member expression.
+///
+/// - `SqlCall` — an arbitrary SQL expression provided directly by the
+///   query input.
+/// - `PatchedSymbol` — an existing member with query-time
+///   modifications applied on top.
+#[derive(Clone)]
+pub enum MemberExpressionExpression {
+    SqlCall(Rc<SqlCall>),
+    PatchedSymbol(Rc<MemberSymbol>),
+}
+
+impl SymbolDeps for MemberExpressionExpression {
+    fn visit_deps(&self, visitor: &mut dyn DepVisitor) -> std::ops::ControlFlow<()> {
+        match self {
+            Self::SqlCall(sql_call) => sql_call.visit_deps(visitor),
+            Self::PatchedSymbol(symbol) => visitor.symbol(symbol),
+        }
+    }
+
+    fn visit_deps_mut(&mut self, visitor: &mut dyn DepVisitorMut) -> Result<(), CubeError> {
+        match self {
+            Self::SqlCall(sql_call) => sql_call.visit_deps_mut(visitor),
+            Self::PatchedSymbol(symbol) => visitor.symbol(symbol),
+        }
+    }
+}
+
+/// `MemberSymbol::MemberExpression` body: a member built from a SQL
+/// expression or from another member with query-time modifications.
+/// Query expressions live in the `expr:` namespace; a data-model segment
+/// compiled into one keeps its plain member id.
+#[derive(Clone)]
+pub struct MemberExpressionSymbol {
+    pub(super) compiled_path: CompiledMemberPath,
+    pub(super) expression: MemberExpressionExpression,
+    #[allow(dead_code)]
+    pub(super) definition: Option<String>,
+    pub(super) is_reference: bool,
+    pub(super) parenthesized: bool,
+    /// True when this expression materialises a `segments:` entry used as a
+    /// selected dimension (in a pre-aggregation). Such a boolean must be
+    /// wrapped per dialect when projected/grouped (e.g. MSSQL `BIT`).
+    pub(super) is_segment: bool,
+}
+
+symbol_deps! {
+    MemberExpressionSymbol {
+        expression: dep,
+        compiled_path: skip,
+        definition: skip,
+        is_reference: skip,
+        parenthesized: skip,
+        is_segment: skip,
+    }
+}
+
+impl MemberExpressionSymbol {
+    pub fn try_new(
+        cube: Rc<CubeTableSymbol>,
+        name: String,
+        expression: MemberExpressionExpression,
+        definition: Option<String>,
+        alias: Option<String>,
+        path: Vec<CubeId>,
+    ) -> Result<Rc<Self>, CubeError> {
+        let id = MemberId::expression(cube.cube_id().clone(), name.clone());
+        Self::try_new_with_id(cube, id, name, expression, definition, alias, path)
+    }
+
+    /// A `segments:` entry of the data model. It is declared there, so it is
+    /// identified like the cube's other members rather than in the `expr:`
+    /// namespace, where a query expression of the same name would share its id.
+    pub fn try_new_segment(
+        cube: Rc<CubeTableSymbol>,
+        name: String,
+        sql_call: Rc<SqlCall>,
+        alias: Option<String>,
+        path: Vec<CubeId>,
+    ) -> Result<Rc<Self>, CubeError> {
+        let id = MemberId::member(cube.cube_id().clone(), name.clone());
+        Self::try_new_with_id(
+            cube,
+            id,
+            name,
+            MemberExpressionExpression::SqlCall(sql_call),
+            None,
+            alias,
+            path,
+        )
+    }
+
+    fn try_new_with_id(
+        cube: Rc<CubeTableSymbol>,
+        id: MemberId,
+        name: String,
+        expression: MemberExpressionExpression,
+        definition: Option<String>,
+        alias: Option<String>,
+        path: Vec<CubeId>,
+    ) -> Result<Rc<Self>, CubeError> {
+        let alias = alias.unwrap_or_else(|| PlanSqlTemplates::alias_name(&name));
+        let is_reference = match &expression {
+            MemberExpressionExpression::SqlCall(sql_call) => sql_call.is_direct_reference(),
+            MemberExpressionExpression::PatchedSymbol(_symbol) => false,
+        };
+        let compiled_path = CompiledMemberPath::new(cube, id, name, alias, path);
+        Ok(Rc::new(Self {
+            compiled_path,
+            expression,
+            definition,
+            is_reference,
+            parenthesized: false,
+            is_segment: false,
+        }))
+    }
+
+    /// Returns a copy of the symbol marked as parenthesized when
+    /// rendered.
+    pub fn with_parenthesized(self: &Rc<Self>) -> Rc<Self> {
+        let mut result = self.as_ref().clone();
+        result.parenthesized = true;
+        Rc::new(result)
+    }
+
+    /// Returns a copy marked as a segment-as-dimension, so rendering wraps it
+    /// per dialect (e.g. MSSQL `CAST(... AS BIT)`).
+    pub fn with_is_segment(self: &Rc<Self>) -> Rc<Self> {
+        let mut result = self.as_ref().clone();
+        result.is_segment = true;
+        Rc::new(result)
+    }
+
+    pub fn is_segment(&self) -> bool {
+        self.is_segment
+    }
+
+    pub fn expression(&self) -> &MemberExpressionExpression {
+        &self.expression
+    }
+
+    pub fn is_parenthesized(&self) -> bool {
+        self.parenthesized
+    }
+
+    pub fn compiled_path(&self) -> &CompiledMemberPath {
+        &self.compiled_path
+    }
+
+    /// Full unique identifier of the symbol; see the type doc for which
+    /// namespace it lives in.
+    pub fn full_name(&self) -> String {
+        self.compiled_path.full_name().clone()
+    }
+
+    pub fn id(&self) -> &crate::planner::MemberId {
+        self.compiled_path.id()
+    }
+
+    /// Default alias of the expression, derived from the compiled
+    /// member path.
+    pub fn alias(&self) -> String {
+        self.compiled_path.alias().clone()
+    }
+
+    pub fn is_reference(&self) -> bool {
+        self.is_reference
+    }
+
+    /// The member this expression references, or `None` if it is not
+    /// a reference. An expression is a reference only when its body
+    /// is a `SqlCall` that is itself a direct member reference.
+    pub fn reference_member(&self) -> Option<Rc<MemberSymbol>> {
+        if !self.is_reference() {
+            return None;
+        }
+        self.get_dependencies().first().cloned()
+    }
+
+    pub fn get_dependencies(&self) -> Vec<Rc<MemberSymbol>> {
+        deps::collect_deps(self)
+    }
+
+    /// If every leaf member referenced by the expression is a
+    /// dimension, returns the list of cube names those dimensions
+    /// belong to. Returns `None` if any leaf is a measure or other
+    /// non-dimension member.
+    pub fn cube_names_if_dimension_only_expression(
+        self: Rc<Self>,
+    ) -> Result<Option<Vec<CubeId>>, CubeError> {
+        let childs = member_childs(&MemberSymbol::new_member_expression(self), true)?;
+        if childs.iter().any(|s| !s.is_dimension()) {
+            Ok(None)
+        } else {
+            // Single member expression can reference multiple dimensions from
+            // the same cube
+            let cube_names = childs
+                .into_iter()
+                .map(|child| child.cube_id())
+                .unique()
+                .collect_vec();
+            Ok(Some(cube_names))
+        }
+    }
+
+    pub fn cube_id(&self) -> CubeId {
+        self.compiled_path.cube_id().clone()
+    }
+
+    pub fn name(&self) -> String {
+        self.compiled_path.name().clone()
+    }
+
+    pub fn path(&self) -> &Vec<CubeId> {
+        self.compiled_path.path()
+    }
+
+    pub fn definition(&self) -> &Option<String> {
+        &self.definition
+    }
+}
+
+impl DebugSql for MemberExpressionSymbol {
+    fn debug_sql(&self, expand_deps: bool) -> String {
+        match &self.expression {
+            MemberExpressionExpression::SqlCall(sql) => sql.debug_sql(expand_deps),
+            MemberExpressionExpression::PatchedSymbol(symbol) => {
+                if expand_deps {
+                    symbol.debug_sql(true)
+                } else {
+                    format!("{{EXPRESSION:{}}}", self.full_name())
+                }
+            }
+        }
+    }
+}

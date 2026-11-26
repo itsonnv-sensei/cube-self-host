@@ -1,0 +1,112 @@
+use super::SqlNode;
+use crate::physical_plan::sql_nodes::PreAggregationColumns;
+use crate::physical_plan::SqlEvaluatorVisitor;
+use crate::planner::query_tools::QueryTools;
+use crate::planner::sql_templates::PlanSqlTemplates;
+use crate::planner::symbols::AggregateWrap;
+use crate::planner::MemberSymbol;
+use cubenativeutils::CubeError;
+use std::any::Any;
+use std::rc::Rc;
+
+/// Substitutes a measure with the matching pre-aggregation column
+/// reference (rolled up via the `pre_aggregate_wrap` of the measure's
+/// `rollup_kind`),
+/// or falls through to `input` when the measure has no
+/// pre-aggregation entry.
+pub struct FinalPreAggregationMeasureSqlNode {
+    input: Rc<dyn SqlNode>,
+    references: Rc<PreAggregationColumns>,
+}
+
+impl FinalPreAggregationMeasureSqlNode {
+    pub fn new(input: Rc<dyn SqlNode>, references: Rc<PreAggregationColumns>) -> Rc<Self> {
+        Rc::new(Self { input, references })
+    }
+
+    pub fn input(&self) -> &Rc<dyn SqlNode> {
+        &self.input
+    }
+}
+
+impl SqlNode for FinalPreAggregationMeasureSqlNode {
+    fn to_sql(
+        &self,
+        visitor: &SqlEvaluatorVisitor,
+        node: &Rc<MemberSymbol>,
+        query_tools: Rc<QueryTools>,
+        node_processor: Rc<dyn SqlNode>,
+        templates: &PlanSqlTemplates,
+    ) -> Result<String, CubeError> {
+        let ev = node.as_measure()?;
+        Ok(
+            if let Some(column_name) = self.references.get(&node.full_name()) {
+                let table_ref = if let Some(table_name) = column_name.source() {
+                    format!("{}.", templates.quote_identifier(table_name)?)
+                } else {
+                    format!("")
+                };
+                let pre_aggregation_measure = format!(
+                    "{}{}",
+                    table_ref,
+                    templates.quote_identifier(&column_name.name())?
+                );
+                let rollup_kind = ev.rollup_kind();
+                let pre_aggregation_measure =
+                    if let Some(condition) = visitor.measure_row_condition() {
+                        match rollup_kind.pre_aggregate_wrap() {
+                            AggregateWrap::Function(_) | AggregateWrap::PassThrough => {
+                                format!(
+                                    "CASE WHEN ({}) THEN {} END",
+                                    condition, pre_aggregation_measure
+                                )
+                            }
+                            _ => {
+                                return Err(CubeError::internal(format!(
+                                    "Row condition is not supported for rollup measure {}",
+                                    node.full_name()
+                                )))
+                            }
+                        }
+                    } else {
+                        pre_aggregation_measure
+                    };
+                match rollup_kind.pre_aggregate_wrap() {
+                    // The rollup column holds an HLL state, so it
+                    // must be merged, not recomputed. Keep the
+                    // merged state when this query itself feeds a
+                    // further aggregation; otherwise take its
+                    // cardinality.
+                    AggregateWrap::CountDistinctApproxState => {
+                        templates.hll_merge(pre_aggregation_measure)?
+                    }
+                    AggregateWrap::CountDistinctApprox => {
+                        templates.hll_cardinality_merge(pre_aggregation_measure)?
+                    }
+                    AggregateWrap::Function(name) => {
+                        format!("{}({})", name, pre_aggregation_measure)
+                    }
+                    AggregateWrap::PassThrough | AggregateWrap::CountDistinct => {
+                        format!("sum({})", pre_aggregation_measure)
+                    }
+                }
+            } else {
+                self.input.to_sql(
+                    visitor,
+                    node,
+                    query_tools.clone(),
+                    node_processor.clone(),
+                    templates,
+                )?
+            },
+        )
+    }
+
+    fn as_any(self: Rc<Self>) -> Rc<dyn Any> {
+        self.clone()
+    }
+
+    fn childs(&self) -> Vec<Rc<dyn SqlNode>> {
+        vec![self.input.clone()]
+    }
+}

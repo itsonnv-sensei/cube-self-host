@@ -1,0 +1,46 @@
+{
+  "name": "@cubejs-backend/maven",
+  "description": "Cube Maven Wrapper for java dependencies downloading",
+  "author": "Cube Dev, Inc.",
+  "version": "1.8.34",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cube-js/cube.git",
+    "directory": "packages/cubejs-druid-driver"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "bin": {
+    "maven-resolve": "bin/maven-resolve"
+  },
+  "main": "dist/src/index.js",
+  "typings": "dist/src/index.d.ts",
+  "scripts": {
+    "build": "rm -rf dist && npm run tsc",
+    "tsc": "tsc",
+    "watch": "tsc -w",
+    "unit:disabled-for-ci": "jest dist/test/*.js"
+  },
+  "files": [
+    "README.md",
+    "bin",
+    "dist/src/*"
+  ],
+  "dependencies": {
+    "@cubejs-backend/shared": "1.8.34",
+    "source-map-support": "^0.5.19",
+    "xmlbuilder2": "^4.0.3"
+  },
+  "devDependencies": {
+    "@cubejs-backend/linter": "1.8.34",
+    "@types/jest": "^29",
+    "@types/node": "^22",
+    "jest": "^29",
+    "typescript": "~6.0.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

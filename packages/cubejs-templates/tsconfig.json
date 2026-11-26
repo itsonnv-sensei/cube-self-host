@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "include": [
+    "src",
+  ],
+  "compilerOptions": {
+    "outDir": "dist",
+    "rootDir": ".",
+    "noImplicitAny": false,
+  },
+  "references": [
+    { "path": "../cubejs-backend-shared" }
+  ]
+}

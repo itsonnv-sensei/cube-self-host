@@ -1,0 +1,112 @@
+import workerpool from 'workerpool';
+import { parse } from '@babel/parser';
+import babelGenerator from '@babel/generator';
+import babelTraverse from '@babel/traverse';
+
+import { NativeInstance } from '@cubejs-backend/native';
+import { ValidationTranspiler } from './ValidationTranspiler';
+import { ImportExportTranspiler } from './ImportExportTranspiler';
+import { CubeCheckDuplicatePropTranspiler } from './CubeCheckDuplicatePropTranspiler';
+import { CubePropContextTranspiler } from './CubePropContextTranspiler';
+import { ErrorReporter } from '../ErrorReporter';
+import { LightweightSymbolResolver } from './LightweightSymbolResolver';
+import { LightweightNodeCubeDictionary } from './LightweightNodeCubeDictionary';
+import { IIFETranspiler } from './IIFETranspiler';
+import { MemoKeyTranspiler } from './MemoKeyTranspiler';
+import { TranspilerInterface } from './transpiler.interface';
+import { YamlCompiler } from '../YamlCompiler';
+
+type TransferContent = {
+  fileName: string;
+  content: string;
+  transpilers: string[];
+  cubeNames: string[];
+  cubeSymbols: Record<string, Record<string, boolean>>;
+};
+
+const cubeDictionary = new LightweightNodeCubeDictionary();
+const cubeSymbols = new LightweightSymbolResolver();
+const errorsReport = new ErrorReporter(null, []);
+const yamlCompiler = new YamlCompiler(cubeSymbols, cubeDictionary, new NativeInstance(), cubeSymbols);
+
+const transpilers: Record<string, TranspilerInterface> = {
+  ValidationTranspiler: new ValidationTranspiler(),
+  ImportExportTranspiler: new ImportExportTranspiler(),
+  CubeCheckDuplicatePropTranspiler: new CubeCheckDuplicatePropTranspiler(),
+  CubePropContextTranspiler: new CubePropContextTranspiler(cubeSymbols, cubeDictionary, cubeSymbols),
+  MemoKeyTranspiler: new MemoKeyTranspiler(),
+  IIFETranspiler: new IIFETranspiler(),
+};
+
+// The reporter accumulates across calls, so each file gets only the errors and warnings it added
+const transpileJs = (data: TransferContent) => {
+  const errorsBefore = errorsReport.getErrors().length;
+  const warningsBefore = errorsReport.getWarnings().length;
+
+  cubeDictionary.setCubeNames(data.cubeNames);
+  cubeSymbols.setSymbols(data.cubeSymbols);
+
+  const ast = parse(
+    data.content,
+    {
+      sourceFilename: data.fileName,
+      sourceType: 'module',
+      plugins: ['objectRestSpread']
+    },
+  );
+
+  errorsReport.inFile(data);
+  data.transpilers.forEach(transpilerName => {
+    if (transpilers[transpilerName]) {
+      babelTraverse(ast, transpilers[transpilerName].traverseObject(errorsReport));
+    } else {
+      throw new Error(`Transpiler ${transpilerName} not supported`);
+    }
+  });
+  errorsReport.exitFile();
+
+  const content = babelGenerator(ast, {}, data.content).code;
+
+  return {
+    content,
+    errors: errorsReport.getErrors().slice(errorsBefore),
+    warnings: errorsReport.getWarnings().slice(warningsBefore)
+  };
+};
+
+const transpileYaml = (data: TransferContent) => {
+  const errorsBefore = errorsReport.getErrors().length;
+  const warningsBefore = errorsReport.getWarnings().length;
+
+  cubeDictionary.setCubeNames(data.cubeNames);
+  cubeSymbols.setSymbols(data.cubeSymbols);
+
+  errorsReport.inFile(data);
+  const transpiledFile = yamlCompiler.transpileYamlFile(data, errorsReport);
+  errorsReport.exitFile();
+
+  return {
+    content: transpiledFile?.content || '',
+    errors: errorsReport.getErrors().slice(errorsBefore),
+    warnings: errorsReport.getWarnings().slice(warningsBefore)
+  };
+};
+
+type BulkTransferContent = Omit<TransferContent, 'fileName' | 'content'> & {
+  files: { fileName: string; content: string }[];
+};
+
+// A file that throws gets null: the caller retries it alone to report the error as the per-file call does
+const transpileJsBulk = ({ files, ...shared }: BulkTransferContent) => files.map(({ fileName, content }) => {
+  try {
+    return transpileJs({ ...shared, fileName, content });
+  } catch {
+    return null;
+  }
+});
+
+workerpool.worker({
+  transpileJs,
+  transpileJsBulk,
+  transpileYaml,
+});

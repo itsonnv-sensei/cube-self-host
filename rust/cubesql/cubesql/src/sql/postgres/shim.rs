@@ -1,0 +1,2197 @@
+use std::{
+    backtrace::Backtrace,
+    collections::HashMap,
+    io::ErrorKind,
+    pin::pin,
+    pin::Pin,
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
+
+use super::{
+    ast_helpers::parse_fetch_limit, error::ConnectionError, extended::PreparedStatement,
+    pg_auth_service::AuthenticationStatus,
+};
+use crate::sql::statement::{redact_error_message, redact_sql_literals, redacted_query_key};
+use crate::{
+    compile::{
+        convert_statement_to_cube_query, describe_statement_to_cube_query,
+        parser::{parse_sql_to_statement, parse_sql_to_statements},
+        qtrace::Qtrace,
+        CommandCompletion, CompilationError, CopyFromPlan, DatabaseProtocol, QueryPlan,
+        StatusFlags,
+    },
+    sql::{
+        compiler_cache::CompilerCacheEntry,
+        df_type_to_pg_tid,
+        extended::{Cursor, ParsedPlan, Portal, PortalBatch, PortalFrom, ResultFormat},
+        postgres::copy::CopyFromDecoder,
+        statement::{PostgresStatementParamsFinder, StatementPlaceholderReplacer},
+        temp_tables::TempTableManager,
+        AuthContextRef, Session, SessionState,
+    },
+    telemetry::ContextLogger,
+    transport::{MetaContext, SpanId},
+    CubeError,
+};
+use futures::{FutureExt, StreamExt};
+use log::{debug, trace};
+use pg_srv::{
+    buffer,
+    protocol::{
+        self, AuthenticationRequest, ErrorCode, ErrorResponse, Format, InitialMessage,
+        PortalCompletion,
+    },
+    PgType, PgTypeId, ProtocolError,
+};
+use sqlparser::ast::{self, CloseCursor, FetchDirection, SetExpr, Statement};
+use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+pub struct AsyncPostgresShim {
+    socket: TcpStream,
+    // If empty, this means socket is on a message boundary.
+    partial_write_buf: bytes::BytesMut,
+    semifast_shutdown_interruptor: CancellationToken,
+    // Extended query
+    cursors: HashMap<String, Cursor>,
+    portals: HashMap<String, Portal>,
+    // Shared
+    session: Arc<Session>,
+    logger: Arc<dyn ContextLogger>,
+}
+
+pub enum StartupState {
+    // Initial parameters which client sends in the first message, we use it later in auth method
+    Success(HashMap<String, String>, AuthenticationRequest),
+    SslRequested,
+    Denied,
+    CancelRequest,
+}
+
+pub trait QueryPlanExt {
+    fn to_row_description(
+        &self,
+        format: &ResultFormat,
+    ) -> Result<Option<protocol::RowDescription>, ConnectionError>;
+}
+
+impl QueryPlanExt for QueryPlan {
+    /// This method returns schema for response
+    /// None is used for special queries, which doesnt have any data, for example: DISCARD ALL
+    fn to_row_description(
+        &self,
+        format: &ResultFormat,
+    ) -> Result<Option<protocol::RowDescription>, ConnectionError> {
+        match &self {
+            // COPY FROM STDIN replies with CopyInResponse instead of a row description
+            QueryPlan::MetaOk(_, _)
+            | QueryPlan::CopyFrom(_)
+            | QueryPlan::CreateEmptyTempTable(_)
+            | QueryPlan::CreateTempTable(_, _, _, _, _) => Ok(None),
+            QueryPlan::MetaTabular(_, frame) => {
+                let mut result = vec![];
+
+                for (idx, field) in frame.get_columns().iter().enumerate() {
+                    result.push(protocol::RowDescriptionField::new(
+                        field.get_name(),
+                        PgType::get_by_tid(PgTypeId::TEXT),
+                        format.format_for(idx),
+                    ));
+                }
+
+                Ok(Some(protocol::RowDescription::new(result)))
+            }
+            QueryPlan::DataFusionSelect(logical_plan, _) => {
+                let mut result = vec![];
+
+                for (idx, field) in logical_plan.schema().fields().iter().enumerate() {
+                    result.push(protocol::RowDescriptionField::new(
+                        field.name().clone(),
+                        df_type_to_pg_tid(field.data_type())?.to_type(),
+                        format.format_for(idx),
+                    ));
+                }
+
+                Ok(Some(protocol::RowDescription::new(result)))
+            }
+        }
+    }
+}
+
+impl AsyncPostgresShim {
+    async fn flush_and_write_admin_shutdown_fatal_message(
+        shim: &mut AsyncPostgresShim,
+    ) -> Result<(), ConnectionError> {
+        // We flush the partially written buf and add the fatal message -- it's another place's
+        // responsibility to impose a timeout and abort us.
+        shim.socket
+            .write_all_buf(&mut shim.partial_write_buf)
+            .await?;
+        shim.partial_write_buf = bytes::BytesMut::new();
+        shim.write_admin_shutdown_fatal_message().await?;
+        return Ok(());
+    }
+
+    async fn get_cache_entry(&self) -> Result<Arc<CompilerCacheEntry>, CubeError> {
+        self.session
+            .session_manager
+            .server
+            .compiler_cache
+            .get_cache_entry(self.auth_context()?, self.session.state.protocol.clone())
+            .await
+    }
+
+    pub async fn run_on(
+        fast_shutdown_interruptor: CancellationToken,
+        semifast_shutdown_interruptor: CancellationToken,
+        socket: TcpStream,
+        session: Arc<Session>,
+        logger: Arc<dyn ContextLogger>,
+    ) -> Result<(), ConnectionError> {
+        let mut shim = Self {
+            semifast_shutdown_interruptor,
+            socket,
+            partial_write_buf: bytes::BytesMut::new(),
+            cursors: HashMap::new(),
+            portals: HashMap::new(),
+            session,
+            logger,
+        };
+
+        let run_result = tokio::select! {
+            _ = fast_shutdown_interruptor.cancelled() => {
+                Self::flush_and_write_admin_shutdown_fatal_message(&mut shim).await?;
+                shim.socket.shutdown().await?;
+                return Ok(());
+            }
+            res = shim.run() => res,
+        };
+
+        match run_result {
+            Err(e) => {
+                if let ConnectionError::Protocol(ProtocolError::IO { source, .. }, _) = &e {
+                    if source.kind() == ErrorKind::BrokenPipe
+                        || source.kind() == ErrorKind::UnexpectedEof
+                    {
+                        trace!("Error during processing PostgreSQL connection: {}", e);
+
+                        return Ok(());
+                    }
+                } else if let ConnectionError::CompilationError(CompilationError::Fatal(_, _), _) =
+                    &e
+                {
+                    assert!(shim.partial_write_buf.is_empty());
+                    shim.write(e.to_error_response()).await?;
+                    shim.socket.shutdown().await?;
+                    return Ok(());
+                }
+
+                Err(e)
+            }
+            _ => {
+                shim.socket.shutdown().await?;
+                return Ok(());
+            }
+        }
+    }
+
+    fn session_state_is_semifast_shutdownable(session_state: &SessionState) -> bool {
+        return !session_state.is_in_transaction() && !session_state.has_current_query();
+    }
+
+    fn is_semifast_shutdownable(&self) -> bool {
+        return self.cursors.is_empty()
+            && self.portals.is_empty()
+            && Self::session_state_is_semifast_shutdownable(&self.session.state);
+    }
+
+    fn admin_shutdown_error() -> ConnectionError {
+        ConnectionError::Protocol(
+            ProtocolError::ErrorResponse {
+                source: ErrorResponse::admin_shutdown(),
+                backtrace: Backtrace::disabled(),
+            },
+            None,
+        )
+    }
+
+    pub async fn run(&mut self) -> Result<(), ConnectionError> {
+        let (initial_parameters, auth_method) = match self.process_initial_message().await? {
+            StartupState::Success(parameters, auth_method) => (parameters, auth_method),
+            StartupState::SslRequested => match self.process_initial_message().await? {
+                StartupState::Success(parameters, auth_method) => (parameters, auth_method),
+                _ => return Ok(()),
+            },
+            StartupState::Denied | StartupState::CancelRequest => return Ok(()),
+        };
+
+        let message_tag_parser = self.session.server.pg_auth.get_pg_message_tag_parser();
+        let auth_secret = buffer::read_message(
+            &mut self.socket,
+            Arc::clone(&message_tag_parser),
+            buffer::MAX_AUTH_MESSAGE_LENGTH,
+        )
+        .await?;
+        if !self
+            .authenticate(auth_method, auth_secret, initial_parameters)
+            .await?
+        {
+            return Ok(());
+        }
+
+        self.ready().await?;
+
+        // When an error is detected while processing any extended-query message, the backend issues ErrorResponse,
+        // then reads and discards messages until a Sync is reached, then issues ReadyForQuery and returns to normal message processing.
+        let mut tracked_error: Option<ConnectionError> = None;
+
+        // Clone here to avoid conflicting borrows of self in the tokio::select!.
+        let semifast_shutdown_interruptor = self.semifast_shutdown_interruptor.clone();
+
+        loop {
+            let mut doing_extended_query_message = false;
+            let semifast_shutdownable = self.is_semifast_shutdownable();
+
+            let message: protocol::FrontendMessage = tokio::select! {
+                true = async { semifast_shutdownable && { semifast_shutdown_interruptor.cancelled().await; true } } => {
+                    return Self::flush_and_write_admin_shutdown_fatal_message(self).await;
+                }
+                message_result = buffer::read_message(&mut self.socket, Arc::clone(&message_tag_parser), buffer::MAX_FRONTEND_MESSAGE_LENGTH) => message_result?
+            };
+
+            let result = match message {
+                protocol::FrontendMessage::Query(body) => {
+                    let span_id = self.new_span_id(body.query.clone());
+                    let mut qtrace = Qtrace::new(&body.query);
+                    if let Some(qtrace) = &qtrace {
+                        debug!("Assigned query UUID: {}", qtrace.uuid())
+                    }
+                    let result = self
+                        .process_query(body.query, &mut qtrace, span_id.clone())
+                        .await
+                        .map_err(|e| e.with_span_id(Some(span_id)));
+                    if let Some(qtrace) = &qtrace {
+                        qtrace.save_json()
+                    }
+                    result
+                }
+                protocol::FrontendMessage::Flush => self.flush().await,
+                protocol::FrontendMessage::Terminate => return Ok(()),
+                // Extended
+                protocol::FrontendMessage::Parse(body) => {
+                    if tracked_error.is_some() {
+                        continue;
+                    }
+                    doing_extended_query_message = true;
+                    let mut qtrace = Qtrace::new(&body.query);
+                    let span_id = self.new_span_id(body.query.clone());
+                    if let Some(qtrace) = &qtrace {
+                        debug!("Assigned query UUID: {}", qtrace.uuid())
+                    }
+                    if let Some(auth_context) = self.session.state.auth_context() {
+                        self.session
+                            .session_manager
+                            .server
+                            .transport
+                            .log_load_state(
+                                Some(span_id.clone()),
+                                auth_context,
+                                self.session.state.get_load_request_meta("sql"),
+                                "Load Request".to_string(),
+                                serde_json::json!({
+                                    "query": span_id.query_key.clone(),
+                                    // Hide query by default until Execute
+                                    "isDataQuery": false,
+                                }),
+                            )
+                            .await?;
+                    }
+                    let result = self
+                        .parse(body, &mut qtrace, Some(span_id.clone()))
+                        .await
+                        .map_err(|e| e.with_span_id(Some(span_id)));
+                    if let Err(err) = &result {
+                        if let Some(qtrace) = &mut qtrace {
+                            qtrace.set_query_error_message(&err.to_string())
+                        }
+                    };
+                    if let Some(qtrace) = &qtrace {
+                        qtrace.save_json()
+                    }
+                    result
+                }
+                protocol::FrontendMessage::Bind(body) => {
+                    if tracked_error.is_some() {
+                        continue;
+                    }
+                    doing_extended_query_message = true;
+                    let span_id = {
+                        let statements_guard = self.session.state.statements.read().await;
+                        statements_guard
+                            .get(&body.statement)
+                            .and_then(|s| s.span_id())
+                    };
+                    self.bind(body, span_id.clone())
+                        .await
+                        .map_err(|e| e.with_span_id(span_id))
+                }
+                protocol::FrontendMessage::Execute(body) => {
+                    let span_id = self
+                        .portals
+                        .get(&body.portal)
+                        .and_then(|portal| portal.span_id());
+                    if let Some(err) = &tracked_error {
+                        if let Some(auth_context) = self.session.state.auth_context() {
+                            // Bind is skipped after an error, so the portal may be a stale one
+                            if let Some(span_id) = err.span_id().or(span_id) {
+                                // If there was an error, always show the query
+                                self.session
+                                    .session_manager
+                                    .server
+                                    .transport
+                                    .log_load_state(
+                                        Some(span_id.clone()),
+                                        auth_context,
+                                        self.session.state.get_load_request_meta("sql"),
+                                        "Data Query Status".to_string(),
+                                        serde_json::json!({
+                                            "isDataQuery": true
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                        }
+                        continue;
+                    }
+                    doing_extended_query_message = true;
+                    let result = self
+                        .execute(body)
+                        .await
+                        .map_err(|e| e.with_span_id(span_id.clone()));
+                    if let Some(auth_context) = self.session.state.auth_context() {
+                        if let Some(span_id) = span_id {
+                            // Always indicate whether this is a data query
+                            // Errors are always visible ("data queries")
+                            if result.is_err() {
+                                self.session
+                                    .session_manager
+                                    .server
+                                    .transport
+                                    .log_load_state(
+                                        Some(span_id.clone()),
+                                        auth_context.clone(),
+                                        self.session.state.get_load_request_meta("sql"),
+                                        "Data Query Status".to_string(),
+                                        serde_json::json!({
+                                            "isDataQuery": true,
+                                        }),
+                                    )
+                                    .await?;
+                            } else {
+                                self.session
+                                    .session_manager
+                                    .server
+                                    .transport
+                                    .log_load_state(
+                                        Some(span_id.clone()),
+                                        auth_context,
+                                        self.session.state.get_load_request_meta("sql"),
+                                        "Load Request Success".to_string(),
+                                        serde_json::json!({
+                                            "query": span_id.query_key.clone(),
+                                            "apiType": "sql",
+                                            "duration": span_id.duration(),
+                                            "isDataQuery": span_id.is_data_query().await,
+                                            "lastRefreshTime": span_id.last_refresh_time().await
+                                        }),
+                                    )
+                                    .await?;
+                            }
+                        }
+                    }
+                    result
+                }
+                protocol::FrontendMessage::Close(body) => {
+                    if tracked_error.is_none() {
+                        self.close(body).await
+                    } else {
+                        continue;
+                    }
+                }
+                protocol::FrontendMessage::Describe(body) => {
+                    if tracked_error.is_none() {
+                        self.describe(body).await
+                    } else {
+                        continue;
+                    }
+                }
+                protocol::FrontendMessage::Sync => {
+                    if let Some(err) = tracked_error.take() {
+                        self.handle_connection_error(err).await?;
+                    };
+
+                    self.write_ready().await?;
+
+                    continue;
+                }
+                // PostgreSQL drops leftovers of an aborted or finished copy
+                protocol::FrontendMessage::CopyData(_)
+                | protocol::FrontendMessage::CopyDone
+                | protocol::FrontendMessage::CopyFail(_) => {
+                    trace!("[pg] Ignoring COPY data received outside of a COPY FROM STDIN");
+
+                    continue;
+                }
+                command_id => {
+                    return Err(ConnectionError::Protocol(
+                        ErrorResponse::error(
+                            ErrorCode::InternalError,
+                            format!("Unsupported operation: {:?}", command_id),
+                        )
+                        .into(),
+                        None,
+                    ))
+                }
+            };
+            if let Err(err) = result {
+                if doing_extended_query_message {
+                    tracked_error = Some(err);
+                } else {
+                    self.handle_connection_error(err).await?;
+                }
+            }
+        }
+    }
+
+    fn new_span_id(&self, sql: String) -> Arc<SpanId> {
+        let redacted_query_key = redacted_query_key(&sql, self.log_redaction());
+        Arc::new(
+            SpanId::new(
+                Uuid::new_v4().to_string(),
+                serde_json::json!({ "sql": sql }),
+            )
+            .with_redacted_query_key(redacted_query_key),
+        )
+    }
+
+    fn log_redaction(&self) -> bool {
+        self.session
+            .session_manager
+            .server
+            .config_obj
+            .log_redaction()
+    }
+
+    pub async fn handle_connection_error(
+        &mut self,
+        err: ConnectionError,
+    ) -> Result<(), ConnectionError> {
+        let (message, props) = match &err {
+            ConnectionError::CompilationError(e, _) => match e {
+                CompilationError::Unsupported(_, meta)
+                | CompilationError::User(_, meta)
+                | CompilationError::Internal(_, _, meta)
+                | CompilationError::RestApi(_, meta)
+                | CompilationError::SqlParser(_, meta)
+                | CompilationError::Planning(_, meta)
+                | CompilationError::PostProcessing(_, meta)
+                | CompilationError::Rewrite(_, meta)
+                | CompilationError::DatabaseExecution(_, meta) => (e.to_string(), meta.clone()),
+                CompilationError::Fatal(_, _) => return Err(err),
+                // Should never execute
+                CompilationError::ContinueWait => ("Continue wait".to_string(), None),
+            },
+            ConnectionError::Protocol(ProtocolError::IO { source, .. }, _) => match source.kind() {
+                // Propagate unrecoverable errors to top level - run_on
+                ErrorKind::UnexpectedEof | ErrorKind::BrokenPipe => return Err(err),
+                _ => (
+                    format!(
+                        "Internal Error: Error during processing PostgreSQL message: {}",
+                        err
+                    ),
+                    None,
+                ),
+            },
+            _ => (
+                format!(
+                    "Internal Error: Error during processing PostgreSQL message: {}",
+                    err
+                ),
+                None,
+            ),
+        };
+
+        if let Some(bt) = err.backtrace() {
+            trace!("{}", bt);
+        } else {
+            trace!("Backtrace: not found");
+        }
+
+        // Redacted twins travel beside the originals: the log sink swaps them in,
+        // APM events and the client keep the statement and message as sent
+        let query = props
+            .as_ref()
+            .filter(|_| self.log_redaction())
+            .and_then(|props| props.get("query"));
+        let (redacted_query, redacted_error) = match query {
+            Some(query) => (
+                Some(redact_sql_literals(query)),
+                Some(redact_error_message(&message, query)),
+            ),
+            None => (None, None),
+        };
+
+        if let Some(auth_context) = self.session.state.auth_context() {
+            if let Some(span_id) = err.span_id() {
+                let mut properties = serde_json::json!({
+                    "query": span_id.query_key.clone(),
+                    "error": message.clone(),
+                    "duration": span_id.duration(),
+                });
+                if let Some(redacted_error) = &redacted_error {
+                    properties["redactedError"] = serde_json::json!(redacted_error);
+                }
+                self.session
+                    .session_manager
+                    .server
+                    .transport
+                    .log_load_state(
+                        Some(span_id.clone()),
+                        auth_context,
+                        self.session.state.get_load_request_meta("sql"),
+                        "SQL API Error".to_string(),
+                        properties,
+                    )
+                    .await?;
+            }
+        }
+
+        let err_response = match &props {
+            Some(props) => {
+                let query = props.get(&"query".to_string());
+                let mut err_response = err.to_error_response();
+                if let Some(query) = query {
+                    err_response.message = format!("{}\nQUERY: {}", message, query);
+                }
+
+                err_response
+            }
+            None => err.to_error_response(),
+        };
+
+        let log_props = props.map(|mut props| {
+            if let Some(redacted_query) = redacted_query {
+                props.insert("redactedQuery".to_string(), redacted_query);
+            }
+            if let Some(redacted_error) = redacted_error {
+                props.insert("redactedError".to_string(), redacted_error);
+            }
+            props
+        });
+        self.logger.error(message.as_str(), log_props);
+
+        self.write(err_response).await?;
+
+        Ok(())
+    }
+
+    pub async fn write_multi<Message: protocol::Serialize>(
+        &mut self,
+        message: Vec<Message>,
+    ) -> Result<(), ConnectionError> {
+        buffer::write_messages(&mut self.partial_write_buf, &mut self.socket, message).await?;
+
+        Ok(())
+    }
+
+    pub async fn write_completion(
+        &mut self,
+        completion: PortalCompletion,
+    ) -> Result<(), ConnectionError> {
+        match completion {
+            PortalCompletion::Complete(c) => {
+                buffer::write_message(&mut self.partial_write_buf, &mut self.socket, c).await?
+            }
+            PortalCompletion::Suspended(s) => {
+                buffer::write_message(&mut self.partial_write_buf, &mut self.socket, s).await?
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn write<Message: protocol::Serialize>(
+        &mut self,
+        message: Message,
+    ) -> Result<(), ConnectionError> {
+        buffer::write_message(&mut self.partial_write_buf, &mut self.socket, message).await?;
+
+        Ok(())
+    }
+
+    pub async fn write_admin_shutdown_fatal_message(&mut self) -> Result<(), ConnectionError> {
+        buffer::write_message(
+            &mut bytes::BytesMut::new(),
+            &mut self.socket,
+            Self::admin_shutdown_error().to_error_response(),
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn process_initial_message(&mut self) -> Result<StartupState, ConnectionError> {
+        let mut buffer =
+            buffer::read_contents(&mut self.socket, 0, buffer::MAX_STARTUP_PACKET_LENGTH).await?;
+
+        let initial_message = protocol::InitialMessage::from(&mut buffer).await?;
+        match initial_message {
+            InitialMessage::Startup(startup) => self.process_startup_message(startup).await,
+            InitialMessage::CancelRequest(cancel) => self.process_cancel(cancel).await,
+            InitialMessage::Gssenc | InitialMessage::SslRequest => {
+                self.write(protocol::SSLResponse::new()).await?;
+                return Ok(StartupState::SslRequested);
+            }
+        }
+    }
+
+    pub async fn process_cancel(
+        &mut self,
+        cancel_message: protocol::CancelRequest,
+    ) -> Result<StartupState, ConnectionError> {
+        trace!("Cancel request {:?}", cancel_message);
+
+        if let Some(s) = self
+            .session
+            .session_manager
+            .get_session(cancel_message.process_id)
+            .await
+        {
+            if s.state.secret == cancel_message.secret {
+                s.state.cancel_query();
+            } else {
+                trace!(
+                    "Unable to process cancel: wrong secret, {} != {}",
+                    s.state.secret,
+                    cancel_message.secret
+                );
+            }
+        } else {
+            trace!("Unable to process cancel: unknown session");
+        }
+
+        Ok(StartupState::CancelRequest)
+    }
+
+    pub async fn process_startup_message(
+        &mut self,
+        startup_message: protocol::StartupMessage,
+    ) -> Result<StartupState, ConnectionError> {
+        if startup_message.major != 3 || startup_message.minor != 0 {
+            let error_response = protocol::ErrorResponse::new(
+                protocol::ErrorSeverity::Fatal,
+                protocol::ErrorCode::FeatureNotSupported,
+                format!(
+                    "unsupported frontend protocol {}.{}: server supports 3.0 to 3.0",
+                    startup_message.major, startup_message.minor,
+                ),
+            );
+            buffer::write_message(
+                &mut self.partial_write_buf,
+                &mut self.socket,
+                error_response,
+            )
+            .await?;
+            return Ok(StartupState::Denied);
+        }
+
+        let parameters = startup_message.parameters;
+        if !parameters.contains_key("user") {
+            let error_response = protocol::ErrorResponse::new(
+                protocol::ErrorSeverity::Fatal,
+                protocol::ErrorCode::InvalidAuthorizationSpecification,
+                "no PostgreSQL user name specified in startup packet".to_string(),
+            );
+            buffer::write_message(
+                &mut self.partial_write_buf,
+                &mut self.socket,
+                error_response,
+            )
+            .await?;
+            return Ok(StartupState::Denied);
+        }
+
+        let auth_method = self.session.server.pg_auth.get_auth_method(&parameters);
+        self.write(protocol::Authentication::new(auth_method.clone()))
+            .await?;
+
+        Ok(StartupState::Success(parameters, auth_method))
+    }
+
+    pub async fn authenticate(
+        &mut self,
+        auth_request: AuthenticationRequest,
+        auth_secret: protocol::FrontendMessage,
+        parameters: HashMap<String, String>,
+    ) -> Result<bool, ConnectionError> {
+        let auth_service = self.session.server.auth.clone();
+        let auth_status = self
+            .session
+            .server
+            .pg_auth
+            .authenticate(auth_service, auth_request, auth_secret, &parameters)
+            .await;
+        let result = match auth_status {
+            AuthenticationStatus::UnexpectedFrontendMessage => Err((
+                "invalid authorization specification".to_string(),
+                protocol::ErrorCode::InvalidAuthorizationSpecification,
+            )),
+            AuthenticationStatus::Failed(err) => Err((err, protocol::ErrorCode::InvalidPassword)),
+            AuthenticationStatus::Success(user, auth_context) => Ok((user, auth_context)),
+        };
+
+        match result {
+            Err((message, code)) => {
+                let error_response = protocol::ErrorResponse::fatal(code, message);
+                buffer::write_message(
+                    &mut self.partial_write_buf,
+                    &mut self.socket,
+                    error_response,
+                )
+                .await?;
+
+                Ok(false)
+            }
+            Ok((user, auth_context)) => {
+                let database = parameters
+                    .get("database")
+                    .cloned()
+                    .unwrap_or("db".to_string());
+                self.session.state.set_database(Some(database));
+                self.session.state.set_user(Some(user.clone()));
+                self.session.state.set_original_user(Some(user));
+                self.session.state.set_auth_context(Some(auth_context));
+
+                self.write(protocol::Authentication::new(AuthenticationRequest::Ok))
+                    .await?;
+
+                Ok(true)
+            }
+        }
+    }
+
+    pub async fn ready(&mut self) -> Result<(), ConnectionError> {
+        let params = vec![
+            protocol::ParameterStatus::new(
+                "server_version".to_string(),
+                "14.2 (Cube SQL)".to_string(),
+            ),
+            protocol::ParameterStatus::new("server_encoding".to_string(), "UTF8".to_string()),
+            protocol::ParameterStatus::new("client_encoding".to_string(), "UTF8".to_string()),
+            protocol::ParameterStatus::new("DateStyle".to_string(), "ISO".to_string()),
+            // Reports whether PostgreSQL was built with support for 64-bit-integer dates and times.
+            protocol::ParameterStatus::new("integer_datetimes".to_string(), "on".to_string()),
+            protocol::ParameterStatus::new("TimeZone".to_string(), "Etc/UTC".to_string()),
+            protocol::ParameterStatus::new("IntervalStyle".to_string(), "postgres".to_string()),
+            // Some drivers rely on it, for example, SQLAlchemy
+            // https://github.com/sqlalchemy/sqlalchemy/blob/6104c163eb58e35e46b0bb6a237e824ec1ee1d15/lib/sqlalchemy/dialects/postgresql/base.py#L2994
+            protocol::ParameterStatus::new(
+                "standard_conforming_strings".to_string(),
+                "on".to_string(),
+            ),
+        ];
+
+        self.write_multi(params).await?;
+        self.write(protocol::BackendKeyData::new(
+            self.session.state.connection_id,
+            self.session.state.secret,
+        ))
+        .await?;
+        self.write(protocol::ReadyForQuery::new(
+            protocol::TransactionStatus::Idle,
+        ))
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn write_ready(&mut self) -> Result<(), ConnectionError> {
+        self.write(protocol::ReadyForQuery::new(
+            if self.session.state.is_in_transaction() {
+                protocol::TransactionStatus::InTransactionBlock
+            } else {
+                protocol::TransactionStatus::Idle
+            },
+        ))
+        .await
+    }
+
+    pub async fn flush(&mut self) -> Result<(), ConnectionError> {
+        // TODO: flush network buffers here once buffering has been implemented
+        Ok(())
+    }
+
+    pub async fn describe_portal(&mut self, name: String) -> Result<(), ConnectionError> {
+        if let Some(portal) = self.portals.get(&name) {
+            if portal.is_empty() {
+                self.write(protocol::NoData::new()).await
+            } else {
+                match portal.get_description()? {
+                    // If Query doesnt return data, no fields in response.
+                    None => self.write(protocol::NoData::new()).await,
+                    Some(packet) => self.write(packet).await,
+                }
+            }
+        } else {
+            self.write(protocol::ErrorResponse::new(
+                protocol::ErrorSeverity::Error,
+                protocol::ErrorCode::InvalidCursorName,
+                "missing cursor".to_string(),
+            ))
+            .await
+        }
+    }
+
+    pub async fn describe_statement(&mut self, name: String) -> Result<(), ConnectionError> {
+        let session = self.session.clone();
+        let statements_guard = session.state.statements.read().await;
+        match statements_guard.get(&name) {
+            None => {
+                self.write(protocol::ErrorResponse::new(
+                    protocol::ErrorSeverity::Error,
+                    protocol::ErrorCode::InvalidSqlStatement,
+                    "missing statement".to_string(),
+                ))
+                .await?;
+
+                return Ok(());
+            }
+            Some(statement) => match statement {
+                PreparedStatement::Empty { .. } => {
+                    self.write(protocol::ParameterDescription::new(vec![]))
+                        .await?;
+                    self.write(protocol::NoData::new()).await
+                }
+                PreparedStatement::Query {
+                    description,
+                    parameters,
+                    ..
+                } => match description {
+                    // If Query doesnt return data, no fields in response.
+                    None => {
+                        self.write(parameters.clone()).await?;
+                        self.write(protocol::NoData::new()).await
+                    }
+                    Some(packet) => {
+                        self.write(parameters.clone()).await?;
+                        self.write(packet.clone()).await
+                    }
+                },
+                PreparedStatement::Error { .. } => Err(CubeError::internal(
+                    "Describe called on errored prepared statement (it's a bug)".to_string(),
+                )
+                .into()),
+            },
+        }
+    }
+
+    pub async fn describe(&mut self, body: protocol::Describe) -> Result<(), ConnectionError> {
+        match body.typ {
+            protocol::DescribeType::Statement => self.describe_statement(body.name).await,
+            protocol::DescribeType::Portal => self.describe_portal(body.name).await,
+        }
+    }
+
+    pub async fn close(&mut self, body: protocol::Close) -> Result<(), ConnectionError> {
+        match body.typ {
+            protocol::CloseType::Statement => {
+                self.session
+                    .state
+                    .statements
+                    .write()
+                    .await
+                    .remove(&body.name);
+            }
+            protocol::CloseType::Portal => {
+                self.portals.remove(&body.name);
+            }
+        };
+
+        self.write(protocol::CloseComplete::new()).await?;
+
+        Ok(())
+    }
+
+    /// https://github.com/postgres/postgres/blob/REL_14_4/src/backend/commands/portalcmds.c#L167
+    pub async fn execute(&mut self, execute: protocol::Execute) -> Result<(), ConnectionError> {
+        // COPY FROM STDIN reads its data from the connection, so it is executed here
+        // rather than by the portal
+        let copy_from = self
+            .portals
+            .get_mut(&execute.portal)
+            .and_then(|portal| portal.take_copy_from());
+        if let Some(plan) = copy_from {
+            let cancel = self
+                .session
+                .state
+                .begin_query(format!("portal #{}", execute.portal));
+            let result = self.handle_copy_in(*plan, cancel).await;
+            self.session.state.end_query();
+
+            return result;
+        }
+
+        if let Some(portal) = self.portals.get_mut(&execute.portal) {
+            if portal.is_empty() {
+                self.write(protocol::EmptyQueryResponse::new()).await?;
+            } else {
+                let cancel = self
+                    .session
+                    .state
+                    .begin_query(format!("portal #{}", execute.portal));
+
+                let mut portal = Pin::new(portal);
+                let stream = portal.execute(execute.max_rows as usize);
+                let mut stream = pin!(stream);
+
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            self.session.state.end_query();
+
+                            return Err(protocol::ErrorResponse::query_canceled().into());
+                        },
+                        chunk = stream.next() => {
+                            let chunk = match chunk {
+                                Some(chunk) => match chunk {
+                                    Ok(chunk) => chunk,
+                                    Err(_) => {
+                                        self.session.state.end_query();
+                                        chunk?
+                                    }
+                                },
+                                None => return Ok(()),
+                            };
+
+                            if cancel.is_cancelled() {
+                                self.session.state.end_query();
+
+                                return Err(protocol::ErrorResponse::query_canceled().into());
+                            }
+
+                            match chunk {
+                                PortalBatch::Rows(writer) if writer.has_data() => buffer::write_direct(&mut self.partial_write_buf, &mut self.socket, writer).await?,
+                                PortalBatch::Notice(notice) => buffer::write_message(&mut self.partial_write_buf, &mut self.socket, notice).await?,
+                                PortalBatch::Completion(completion) => {
+                                    self.session.state.end_query();
+
+                                    // TODO:
+                                    match completion {
+                                        PortalCompletion::Complete(c) => buffer::write_message(&mut self.partial_write_buf, &mut self.socket, c).await?,
+                                        PortalCompletion::Suspended(s) => buffer::write_message(&mut self.partial_write_buf, &mut self.socket, s).await?,
+                                    }
+
+                                    return Ok(());
+                                },
+                                _ => (),
+                            }
+                        },
+                    }
+                }
+            };
+
+            Ok(())
+        } else {
+            Err(ErrorResponse::error(
+                ErrorCode::InvalidCursorName,
+                format!(r#"Unknown portal: {}"#, execute.portal),
+            )
+            .into())
+        }
+    }
+
+    pub async fn bind(
+        &mut self,
+        body: protocol::Bind,
+        span_id: Option<Arc<SpanId>>,
+    ) -> Result<(), ConnectionError> {
+        if self.portals.len() >= self.session.server.configuration.connection_max_portals {
+            return Err(ConnectionError::Protocol(
+                protocol::ErrorResponse::error(
+                    protocol::ErrorCode::ConfigurationLimitExceeded,
+                    format!(
+                        "Unable to allocate a new portal: max allocation reached, actual: {}, max: {}",
+                        self.portals.len(),
+                        self.session.server.configuration.connection_max_portals),
+                )
+                    .into(),
+                span_id.clone(),
+            ));
+        }
+
+        let is_query = matches!(
+            self.session
+                .state
+                .statements
+                .read()
+                .await
+                .get(&body.statement)
+                .ok_or_else(|| {
+                    ErrorResponse::error(
+                        ErrorCode::InvalidSqlStatement,
+                        format!(r#"Unknown statement: {}"#, body.statement),
+                    )
+                })?,
+            PreparedStatement::Query { .. }
+        );
+        // Only a query needs the compiled model, to plan it or to check the Parse plan
+        let meta = if is_query {
+            let cache_entry = self.get_cache_entry().await?;
+            Some(self.session.server.compiler_cache.meta(cache_entry).await?)
+        } else {
+            None
+        };
+
+        let mut statements_guard = self.session.state.statements.write().await;
+        let source_statement = statements_guard.get_mut(&body.statement).ok_or_else(|| {
+            ErrorResponse::error(
+                ErrorCode::InvalidSqlStatement,
+                format!(r#"Unknown statement: {}"#, body.statement),
+            )
+        })?;
+        let parsed_plan = match (&mut *source_statement, &meta) {
+            (PreparedStatement::Query { plan, .. }, Some(meta)) => plan.take().filter(|parsed| {
+                parsed.is_valid_for(
+                    meta.compiler_id,
+                    &self.session.state.auth_context(),
+                    self.session.state.planning_state(),
+                )
+            }),
+            _ => None,
+        };
+
+        let source_statement = &*source_statement;
+
+        let format = ResultFormat::from(body.result_formats.clone());
+        let portal = match source_statement {
+            PreparedStatement::Empty { .. } => {
+                drop(statements_guard);
+
+                Portal::new_empty(format, PortalFrom::Extended, span_id)
+            }
+            PreparedStatement::Query { parameters, .. } => {
+                let values = body.to_bind_values(&parameters)?;
+                let plan = match parsed_plan {
+                    Some(parsed) => {
+                        drop(statements_guard);
+                        parsed.plan
+                    }
+                    None => {
+                        let prepared_statement = source_statement.bind(values)?;
+                        drop(statements_guard);
+
+                        let meta = match meta {
+                            Some(meta) => meta,
+                            None => {
+                                let cache_entry = self.get_cache_entry().await?;
+                                self.session.server.compiler_cache.meta(cache_entry).await?
+                            }
+                        };
+
+                        convert_statement_to_cube_query(
+                            prepared_statement,
+                            meta,
+                            self.session.clone(),
+                            &mut None,
+                            span_id.clone(),
+                        )
+                        .await?
+                    }
+                };
+
+                Portal::new(plan, format, PortalFrom::Extended, span_id)
+            }
+            PreparedStatement::Error { .. } => {
+                drop(statements_guard);
+
+                Portal::new_empty(format, PortalFrom::Extended, span_id)
+            }
+        };
+
+        self.portals.insert(body.portal, portal);
+        self.write(protocol::BindComplete::new()).await?;
+
+        Ok(())
+    }
+
+    pub async fn parse(
+        &mut self,
+        parse: protocol::Parse,
+        qtrace: &mut Option<Qtrace>,
+        span_id: Option<Arc<SpanId>>,
+    ) -> Result<(), ConnectionError> {
+        if parse.query.trim() == "" {
+            let mut statements_guard = self.session.state.statements.write().await;
+            statements_guard.insert(
+                parse.name,
+                PreparedStatement::Empty {
+                    from_sql: false,
+                    created: chrono::offset::Utc::now(),
+                    span_id: span_id.clone(),
+                },
+            );
+        } else {
+            match parse_sql_to_statement(&parse.query, DatabaseProtocol::PostgreSQL, qtrace) {
+                Ok(query) => {
+                    if let Some(qtrace) = qtrace {
+                        qtrace.push_statement(&query);
+                    }
+                    self.prepare_statement(
+                        parse.name,
+                        Ok(query),
+                        &parse.param_types,
+                        false,
+                        qtrace,
+                        span_id.clone(),
+                    )
+                    .await?;
+                }
+                Err(err) => {
+                    self.prepare_statement(
+                        parse.name,
+                        Err(parse.query.to_string()),
+                        &parse.param_types,
+                        false,
+                        qtrace,
+                        span_id.clone(),
+                    )
+                    .await?;
+                    Err(err)?;
+                }
+            }
+        }
+
+        self.write(protocol::ParseComplete::new()).await?;
+
+        Ok(())
+    }
+
+    pub async fn prepare_statement(
+        &mut self,
+        name: String,
+        query: Result<Statement, String>,
+        param_types: &[u32],
+        from_sql: bool,
+        qtrace: &mut Option<Qtrace>,
+        span_id: Option<Arc<SpanId>>,
+    ) -> Result<(), ConnectionError> {
+        let prepared_statements_count = self.session.state.statements.read().await.len();
+        if prepared_statements_count
+            >= self
+                .session
+                .server
+                .configuration
+                .connection_max_prepared_statements
+        {
+            return Err(ConnectionError::Protocol(
+                protocol::ErrorResponse::error(
+                    protocol::ErrorCode::ConfigurationLimitExceeded,
+                    format!(
+                        "Unable to allocate a new prepared statement: max allocation reached, actual: {}, max: {}",
+                        prepared_statements_count,
+                        self.session.server.configuration.connection_max_prepared_statements),
+                )
+                    .into(),
+                span_id.clone(),
+            ));
+        }
+
+        let (pstmt, result) = match query {
+            Ok(query) => {
+                let stmt_finder = PostgresStatementParamsFinder::new(param_types);
+                let parameters: Vec<PgTypeId> = stmt_finder
+                    .find(&query)?
+                    .into_iter()
+                    .map(|param| param.coltype.to_pg_tid())
+                    .collect();
+
+                let cache_entry = self.get_cache_entry().await?;
+                let meta = self.session.server.compiler_cache.meta(cache_entry).await?;
+                let compiler_id = meta.compiler_id;
+
+                let stmt_replacer = StatementPlaceholderReplacer::new();
+                let hacked_query = stmt_replacer.replace(query.clone())?;
+
+                // Placeholders are not values, so Bind plans such a statement again to run it
+                let plan = if parameters.is_empty() {
+                    convert_statement_to_cube_query(
+                        hacked_query,
+                        meta,
+                        self.session.clone(),
+                        qtrace,
+                        span_id.clone(),
+                    )
+                    .await
+                } else {
+                    describe_statement_to_cube_query(
+                        hacked_query,
+                        meta,
+                        self.session.clone(),
+                        qtrace,
+                        span_id.clone(),
+                    )
+                    .await
+                };
+
+                match plan {
+                    Ok(plan) => {
+                        let description = plan
+                            .to_row_description(&ResultFormat::AllText)?
+                            .filter(|description| description.len() > 0);
+                        // Without parameters, Bind would plan this very query again
+                        let plan = (!from_sql && parameters.is_empty()).then(|| {
+                            Box::new(ParsedPlan {
+                                plan,
+                                compiler_id,
+                                auth_context: self.session.state.auth_context(),
+                                planning_state: self.session.state.planning_state(),
+                                planned_at: Instant::now(),
+                            })
+                        });
+
+                        (
+                            PreparedStatement::Query {
+                                from_sql,
+                                created: chrono::offset::Utc::now(),
+                                query: Box::new(query),
+                                parameters: protocol::ParameterDescription::new(parameters),
+                                description,
+                                span_id,
+                                plan,
+                            },
+                            Ok(()),
+                        )
+                    }
+                    Err(err) => (
+                        PreparedStatement::Error {
+                            from_sql,
+                            sql: query.to_string(),
+                            created: chrono::offset::Utc::now(),
+                            span_id,
+                        },
+                        Err(err.into()),
+                    ),
+                }
+            }
+            Err(sql) => (
+                PreparedStatement::Error {
+                    from_sql,
+                    sql,
+                    created: chrono::offset::Utc::now(),
+                    span_id,
+                },
+                Ok(()),
+            ),
+        };
+        self.session
+            .state
+            .statements
+            .write()
+            .await
+            .insert(name, pstmt);
+
+        result
+    }
+
+    pub fn end_transaction(&mut self) -> Result<bool, ConnectionError> {
+        if let Some(_) = self.session.state.end_transaction() {
+            // Portals + Cursors which we want to remove
+            let mut to_remove = Vec::new();
+
+            for (key, cursor) in &self.cursors {
+                if !cursor.hold {
+                    to_remove.push(key.clone());
+                }
+            }
+
+            for key in &to_remove {
+                self.cursors.remove(key);
+                self.portals.remove(key);
+
+                trace!("Closing cursor/portal {}", key);
+            }
+
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub async fn handle_simple_query(
+        &mut self,
+        stmt: ast::Statement,
+        meta: Arc<MetaContext>,
+        qtrace: &mut Option<Qtrace>,
+        span_id: Option<Arc<SpanId>>,
+    ) -> Result<(), ConnectionError> {
+        let cancel = self.session.state.begin_query(stmt.to_string());
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                self.session.state.end_query();
+
+                // We don't return error, because query can contains multiple statements
+                // then cancel request will cancel only one query
+                self.write(protocol::ErrorResponse::query_canceled()).await?;
+                if let Some(qtrace) = qtrace {
+                    qtrace.set_statement_error_message("Execution cancelled by user");
+                }
+
+                Ok(())
+            },
+            res = self.process_simple_query(stmt, meta, cancel.clone(), qtrace, span_id) => {
+                self.session.state.end_query();
+
+                if cancel.is_cancelled() {
+                    self.write(protocol::ErrorResponse::query_canceled()).await?;
+                    if let Some(qtrace) = qtrace {
+                        qtrace.set_statement_error_message("Execution cancelled by user");
+                    }
+                }
+
+                res
+            },
+        }
+    }
+
+    pub async fn process_simple_query(
+        &mut self,
+        stmt: ast::Statement,
+        meta: Arc<MetaContext>,
+        cancel: CancellationToken,
+        qtrace: &mut Option<Qtrace>,
+        span_id: Option<Arc<SpanId>>,
+    ) -> Result<(), ConnectionError> {
+        match stmt {
+            Statement::StartTransaction { .. } => {
+                if !self.session.state.begin_transaction() {
+                    self.write(protocol::NoticeResponse::warning(
+                        ErrorCode::ActiveSqlTransaction,
+                        "there is already a transaction in progress".to_string(),
+                    ))
+                    .await?
+                };
+
+                let plan = QueryPlan::MetaOk(StatusFlags::empty(), CommandCompletion::Begin);
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+            Statement::Rollback { .. } => {
+                if !self.end_transaction()? {
+                    // PostgreSQL returns command completion anyway
+                    self.write(protocol::NoticeResponse::warning(
+                        ErrorCode::NoActiveSqlTransaction,
+                        "there is no transaction in progress".to_string(),
+                    ))
+                    .await?
+                };
+
+                let plan = QueryPlan::MetaOk(StatusFlags::empty(), CommandCompletion::Rollback);
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    CancellationToken::new(),
+                )
+                .await?;
+            }
+            Statement::Commit { .. } => {
+                if !self.end_transaction()? {
+                    // PostgreSQL returns command completion anyway
+                    self.write(protocol::NoticeResponse::warning(
+                        ErrorCode::NoActiveSqlTransaction,
+                        "there is no transaction in progress".to_string(),
+                    ))
+                    .await?
+                };
+
+                let plan = QueryPlan::MetaOk(StatusFlags::empty(), CommandCompletion::Commit);
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    CancellationToken::new(),
+                )
+                .await?;
+            }
+            Statement::Fetch {
+                name,
+                direction,
+                into,
+                ..
+            } => {
+                if into.is_some() {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "INTO is not supported for FETCH statement".to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                };
+
+                let limit: usize = match direction {
+                    FetchDirection::Count { limit } => parse_fetch_limit(&limit, &span_id)?,
+
+                    // Fetch the next row. This is the default if direction is omitted.
+                    FetchDirection::Next => 1,
+
+                    FetchDirection::Forward { limit } => match limit {
+                        // Fetch the next count rows. FORWARD 0 re-fetches the current row.
+                        Some(v) => parse_fetch_limit(&v, &span_id)?,
+                        // Fetch the next row (same as NEXT).
+                        None => 1,
+                    },
+
+                    // Fetch all remaining rows.
+                    FetchDirection::All | FetchDirection::ForwardAll => usize::MAX,
+
+                    other => {
+                        return Err(ConnectionError::Protocol(
+                            protocol::ErrorResponse::error(
+                                protocol::ErrorCode::FeatureNotSupported,
+                                format!("FETCH with direction ({}) is not supported", other),
+                            )
+                            .into(),
+                            span_id.clone(),
+                        ));
+                    }
+                };
+
+                if let Some(mut portal) = self.portals.remove(&name.value) {
+                    self.write_portal(&mut portal, limit, CancellationToken::new())
+                        .await?;
+                    self.portals.insert(name.value.clone(), portal);
+
+                    return Ok(());
+                } else {
+                    trace!(
+                        r#"Unable to find portal for cursor: "{}". Maybe it was not created. Opening..."#,
+                        &name.value
+                    );
+                }
+
+                if self.portals.len() >= self.session.server.configuration.connection_max_portals {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::ConfigurationLimitExceeded,
+                            format!(
+                                "Unable to allocate a new portal to open cursor: max allocation reached, actual: {}, max: {}",
+                                self.portals.len(),
+                                self.session.server.configuration.connection_max_portals),
+                        )
+                            .into(),
+                        span_id.clone(),
+                    ));
+                }
+
+                let auth_context = self.session.state.auth_context();
+                let planning_state = self.session.state.planning_state();
+                let cursor = self.cursors.get_mut(&name.value).ok_or_else(|| {
+                    ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::ProtocolViolation,
+                            format!(r#"cursor "{}" does not exist"#, name.value),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    )
+                })?;
+                let format = cursor.format;
+
+                let parsed_plan = cursor.plan.take().filter(|parsed| {
+                    parsed.is_valid_for(meta.compiler_id, &auth_context, planning_state)
+                });
+                let plan = match parsed_plan {
+                    Some(parsed) => {
+                        // Planning marks a data query; this FETCH runs the load DECLARE planned
+                        if cursor.is_data_query {
+                            if let Some(span_id) = &span_id {
+                                span_id.set_is_data_query(true).await;
+                            }
+                        }
+                        parsed.plan
+                    }
+                    None => {
+                        convert_statement_to_cube_query(
+                            cursor.query.as_ref().clone(),
+                            meta,
+                            self.session.clone(),
+                            qtrace,
+                            span_id.clone(),
+                        )
+                        .await?
+                    }
+                };
+
+                let mut portal = Portal::new(
+                    plan,
+                    ResultFormat::from(vec![format]),
+                    PortalFrom::Fetch,
+                    span_id.clone(),
+                );
+
+                self.write_portal(&mut portal, limit, cancel).await?;
+                self.portals.insert(name.value, portal);
+            }
+            Statement::Declare { mut stmts } => {
+                if stmts.len() != 1 {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "Only a single cursor per DECLARE statement is supported".to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                }
+                let ast::Declare {
+                    names,
+                    binary,
+                    for_query: query,
+                    scroll,
+                    sensitive,
+                    hold,
+                    ..
+                } = stmts
+                    .pop()
+                    .expect("DECLARE must contain a single statement");
+
+                if names.len() > 1 {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "Only a single cursor name per DECLARE statement is supported"
+                                .to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                }
+
+                let Some(name) = names.into_iter().next() else {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "DECLARE statement must specify a cursor name".to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                };
+
+                let binary = binary.unwrap_or(false);
+
+                // The default is to allow scrolling in some cases; this is not the same as specifying SCROLL.
+                if scroll.is_some() {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "SCROLL|NO SCROLL is not supported for DECLARE statement".to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                };
+
+                // In PostgreSQL, all cursors are insensitive
+                if Some(true) == sensitive {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "INSENSITIVE|ASENSITIVE is not supported for DECLARE statement"
+                                .to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                };
+
+                if self
+                    .session
+                    .state
+                    .statements
+                    .read()
+                    .await
+                    .contains_key(&name.value)
+                {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::DuplicateCursor,
+                            format!(r#"cursor "{}" already exists"#, name.value),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                }
+
+                let Some(query) = query else {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::FeatureNotSupported,
+                            "DECLARE statement must specify a query".to_string(),
+                        )
+                        .into(),
+                        span_id.clone(),
+                    ));
+                };
+                let select_stmt = Statement::Query(query);
+                // Planning here reports an invalid query on DECLARE, as PostgreSQL does, and the
+                // plan serves the FETCH that opens the cursor
+                let plan = convert_statement_to_cube_query(
+                    select_stmt.clone(),
+                    meta.clone(),
+                    self.session.clone(),
+                    qtrace,
+                    span_id.clone(),
+                )
+                .await?;
+                let is_data_query = match &span_id {
+                    Some(span_id) => span_id.is_data_query().await,
+                    None => false,
+                };
+
+                let cursor = Cursor {
+                    query: Box::new(select_stmt),
+                    hold: hold.unwrap_or(false),
+                    format: if binary { Format::Binary } else { Format::Text },
+                    plan: Some(Box::new(ParsedPlan {
+                        plan,
+                        compiler_id: meta.compiler_id,
+                        auth_context: self.session.state.auth_context(),
+                        planning_state: self.session.state.planning_state(),
+                        planned_at: Instant::now(),
+                    })),
+                    is_data_query,
+                };
+
+                if self.cursors.len() >= self.session.server.configuration.connection_max_cursors {
+                    return Err(ConnectionError::Protocol(
+                        protocol::ErrorResponse::error(
+                            protocol::ErrorCode::ConfigurationLimitExceeded,
+                            format!(
+                                "Unable to allocate a new cursor: max allocation reached, actual: {}, max: {}",
+                                self.cursors.len(),
+                                self.session.server.configuration.connection_max_cursors),
+                        )
+                            .into(),
+                        span_id.clone(),
+                    ));
+                }
+
+                self.cursors.insert(name.value, cursor);
+
+                let plan =
+                    QueryPlan::MetaOk(StatusFlags::empty(), CommandCompletion::DeclareCursor);
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+            Statement::Discard { object_type } => {
+                self.session.state.clear_extended().await;
+                self.portals = HashMap::new();
+                self.cursors = HashMap::new();
+
+                let plan = QueryPlan::MetaOk(
+                    StatusFlags::empty(),
+                    CommandCompletion::Discard(object_type.to_string()),
+                );
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+            Statement::Deallocate { name, .. } => {
+                let plan = if name.value.eq_ignore_ascii_case(&"all") {
+                    self.session.state.clear_prepared_statements().await;
+
+                    Ok(QueryPlan::MetaOk(
+                        StatusFlags::empty(),
+                        CommandCompletion::DeallocateAll,
+                    ))
+                } else {
+                    let mut statements_guard = self.session.state.statements.write().await;
+                    if statements_guard.remove(&name.value).is_some() {
+                        Ok(QueryPlan::MetaOk(
+                            StatusFlags::empty(),
+                            CommandCompletion::Deallocate,
+                        ))
+                    } else {
+                        Err(ConnectionError::Protocol(
+                            protocol::ErrorResponse::error(
+                                protocol::ErrorCode::ProtocolViolation,
+                                format!(r#"prepared statement "{}" does not exist"#, name.value),
+                            )
+                            .into(),
+                            span_id.clone(),
+                        ))
+                    }
+                }?;
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+            Statement::Close { cursor } => {
+                let plan = match cursor {
+                    CloseCursor::All => {
+                        for key in self.cursors.keys() {
+                            self.portals.remove(key);
+                        }
+                        self.cursors.clear();
+
+                        Ok(QueryPlan::MetaOk(
+                            StatusFlags::empty(),
+                            CommandCompletion::CloseCursorAll,
+                        ))
+                    }
+                    CloseCursor::Specific { name } => {
+                        if self.cursors.remove(&name.value).is_some() {
+                            self.portals.remove(&name.value);
+
+                            Ok(QueryPlan::MetaOk(
+                                StatusFlags::empty(),
+                                CommandCompletion::CloseCursor,
+                            ))
+                        } else {
+                            Err(ConnectionError::Protocol(
+                                protocol::ErrorResponse::error(
+                                    protocol::ErrorCode::ProtocolViolation,
+                                    format!(r#"cursor "{}" does not exist"#, name.value),
+                                )
+                                .into(),
+                                span_id.clone(),
+                            ))
+                        }
+                    }
+                }?;
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+            Statement::Prepare {
+                name, statement, ..
+            } => {
+                // Ensure the statement isn't wrapped in extra parens
+                let statement = match *statement.clone() {
+                    Statement::Query(outer_query)
+                        if outer_query.with.is_none()
+                            && outer_query.order_by.is_none()
+                            && outer_query.limit_clause.is_none()
+                            && outer_query.fetch.is_none()
+                            && outer_query.locks.is_empty()
+                            && matches!(*outer_query.body, SetExpr::Query(_)) =>
+                    {
+                        match *outer_query.body {
+                            SetExpr::Query(inner_query) => Statement::Query(inner_query),
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => *statement,
+                };
+
+                self.prepare_statement(
+                    name.value,
+                    Ok(statement),
+                    &[],
+                    true,
+                    qtrace,
+                    span_id.clone(),
+                )
+                .await?;
+
+                let plan = QueryPlan::MetaOk(StatusFlags::empty(), CommandCompletion::Prepare);
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+            other => {
+                let plan = convert_statement_to_cube_query(
+                    other,
+                    meta.clone(),
+                    self.session.clone(),
+                    qtrace,
+                    span_id.clone(),
+                )
+                .await?;
+
+                // COPY FROM STDIN reads its data from the connection, so it is not
+                // something a portal can execute
+                if let QueryPlan::CopyFrom(plan) = plan {
+                    return self.handle_copy_in(*plan, cancel).await;
+                }
+
+                self.write_portal(
+                    &mut Portal::new(
+                        plan,
+                        ResultFormat::AllText,
+                        PortalFrom::Simple,
+                        span_id.clone(),
+                    ),
+                    0,
+                    cancel,
+                )
+                .await?;
+            }
+        };
+
+        Ok(())
+    }
+
+    /// Read the data of a `COPY ... FROM STDIN` from the connection and append it to
+    /// the target temporary table.
+    ///
+    /// The copy ends when the client sends CopyDone, when it aborts with CopyFail,
+    /// or when the data holds the end-of-copy marker. An error stops the copy right
+    /// away: the caller turns it into an ErrorResponse, and the CopyData messages the
+    /// client keeps sending are dropped by the main loop, as PostgreSQL does.
+    pub async fn handle_copy_in(
+        &mut self,
+        plan: CopyFromPlan,
+        cancel: CancellationToken,
+    ) -> Result<(), ConnectionError> {
+        let CopyFromPlan {
+            table_name,
+            schema,
+            column_indices,
+            options,
+            temp_tables,
+        } = plan;
+
+        // The copy may only use what the session has not taken yet, so that a copy
+        // into a nearly full session fails at once instead of after reading it all
+        let budget =
+            TempTableManager::session_memory_limit().saturating_sub(temp_tables.physical_size());
+
+        let mut decoder = CopyFromDecoder::new(
+            table_name.clone(),
+            Arc::clone(&schema),
+            column_indices.clone(),
+            options,
+            budget,
+        )?;
+
+        // The count of the columns travels as an i16 in CopyInResponse
+        if column_indices.len() > i16::MAX as usize {
+            return Err(protocol::ErrorResponse::error(
+                protocol::ErrorCode::ProgramLimitExceeded,
+                format!("tables can have at most {} columns for COPY", i16::MAX),
+            )
+            .into());
+        }
+
+        self.write(protocol::CopyInResponse::new(
+            Format::Text,
+            column_indices.len(),
+        ))
+        .await?;
+
+        let message_tag_parser = self.session.server.pg_auth.get_pg_message_tag_parser();
+
+        while !decoder.is_finished() {
+            let message = tokio::select! {
+                _ = cancel.cancelled() => {
+                    return Err(protocol::ErrorResponse::query_canceled().into());
+                },
+                message = buffer::read_message(
+                    &mut self.socket,
+                    Arc::clone(&message_tag_parser),
+                    buffer::MAX_FRONTEND_MESSAGE_LENGTH,
+                ) => message?,
+            };
+
+            match message {
+                protocol::FrontendMessage::CopyData(body) => decoder.push(&body.data)?,
+                protocol::FrontendMessage::CopyDone => break,
+                protocol::FrontendMessage::CopyFail(body) => {
+                    return Err(protocol::ErrorResponse::error(
+                        protocol::ErrorCode::QueryCanceled,
+                        format!("COPY from stdin failed: {}", body.message),
+                    )
+                    .into());
+                }
+                // PostgreSQL ignores these while it is reading copy data, for the
+                // convenience of clients which always send them after Execute
+                protocol::FrontendMessage::Flush | protocol::FrontendMessage::Sync => (),
+                // The client is closing the connection, and is not waiting for an
+                // answer to the copy it abandoned
+                protocol::FrontendMessage::Terminate => return Ok(()),
+                // Any other message aborts the copy
+                other => {
+                    return Err(protocol::ErrorResponse::error(
+                        protocol::ErrorCode::ProtocolViolation,
+                        format!(
+                            "unexpected message type 0x{:02X} during COPY from stdin",
+                            other.tag()
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+
+        let (batch, rows) = decoder.finish()?;
+
+        // An empty copy is still a copy into the table, and has to find it there
+        let batches = match rows {
+            0 => vec![],
+            _ => vec![batch],
+        };
+        let appended_to = table_name.clone();
+        tokio::task::spawn_blocking(move || temp_tables.append(&appended_to, batches))
+            .await
+            .map_err(CubeError::from)??;
+
+        self.write_completion(PortalCompletion::Complete(protocol::CommandComplete::Copy(
+            rows as u32,
+        )))
+        .await
+    }
+
+    pub async fn write_portal(
+        &mut self,
+        portal: &mut Portal,
+        max_rows: usize,
+        cancel: CancellationToken,
+    ) -> Result<(), ConnectionError> {
+        let mut portal = Pin::new(portal);
+        let stream = portal.execute(max_rows);
+        let mut stream = pin!(stream);
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    // TODO: Cancellation handling via errors?
+                    return Ok(());
+                },
+                chunk = stream.next() => {
+                    let chunk = match chunk {
+                        Some(chunk) => chunk?,
+                        None => return Ok(()),
+                    };
+
+                    match chunk {
+                        PortalBatch::Description(description) => match description.len() {
+                            // Special handling for special queries, such as DISCARD ALL.
+                            0 => self.write(protocol::NoData::new()).await?,
+                            _ => self.write(description).await?,
+                        },
+                        PortalBatch::Rows(writer) => {
+                            if writer.has_data() {
+                                buffer::write_direct(&mut self.partial_write_buf, &mut self.socket, writer).await?
+                            }
+                        }
+                        PortalBatch::Notice(notice) => self.write(notice).await?,
+                        PortalBatch::Completion(completion) => return self.write_completion(completion).await,
+                    }
+                }
+            }
+        }
+    }
+
+    /// Pipeline of Execution
+    /// process_query -> (&str)
+    ///     execute_query -> (&str)
+    ///         handle_simple_query
+    ///             process_simple_query -> (portal)
+    ///                 write_portal
+    pub async fn execute_query(
+        &mut self,
+        query: &str,
+        qtrace: &mut Option<Qtrace>,
+        span_id: Option<Arc<SpanId>>,
+    ) -> Result<(), ConnectionError> {
+        let cache_entry = self.get_cache_entry().await?;
+        let meta = self.session.server.compiler_cache.meta(cache_entry).await?;
+
+        let statements = parse_sql_to_statements(query, DatabaseProtocol::PostgreSQL, qtrace)?;
+
+        if statements.len() == 0 {
+            self.write(protocol::EmptyQuery::new()).await?;
+        } else {
+            for statement in statements {
+                if let Some(qtrace) = qtrace {
+                    qtrace.push_statement(&statement);
+                }
+                match std::panic::AssertUnwindSafe(self.handle_simple_query(
+                    statement,
+                    meta.clone(),
+                    qtrace,
+                    span_id.clone(),
+                ))
+                .catch_unwind()
+                .await
+                {
+                    Ok(res) => {
+                        if let Some(qtrace) = qtrace {
+                            if let Err(err) = &res {
+                                qtrace.set_statement_error_message(&err.to_string());
+                            }
+                        }
+                        res?
+                    }
+                    Err(err) => {
+                        let err: ConnectionError = CubeError::panic(err).into();
+                        if let Some(qtrace) = qtrace {
+                            qtrace.set_statement_error_message(&err.to_string());
+                        }
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub async fn process_query(
+        &mut self,
+        query: String,
+        qtrace: &mut Option<Qtrace>,
+        span_id: Arc<SpanId>,
+    ) -> Result<(), ConnectionError> {
+        let start_time = SystemTime::now();
+        if let Some(auth_context) = self.session.state.auth_context() {
+            self.session
+                .session_manager
+                .server
+                .transport
+                .log_load_state(
+                    Some(span_id.clone()),
+                    auth_context,
+                    self.session.state.get_load_request_meta("sql"),
+                    "Load Request".to_string(),
+                    serde_json::json!({
+                        "query": span_id.query_key.clone(),
+                    }),
+                )
+                .await?;
+        }
+        debug!("Query: {}", query);
+
+        if let Err(err) = self
+            .execute_query(&query, qtrace, Some(span_id.clone()))
+            .await
+        {
+            if let Some(qtrace) = qtrace {
+                qtrace.set_query_error_message(&err.to_string())
+            }
+            let err = err.with_span_id(Some(span_id.clone()));
+            self.handle_connection_error(err).await?;
+        } else if let Some(auth_context) = self.session.state.auth_context() {
+            self.session
+                .session_manager
+                .server
+                .transport
+                .log_load_state(
+                    Some(span_id.clone()),
+                    auth_context,
+                    self.session.state.get_load_request_meta("sql"),
+                    "Load Request Success".to_string(),
+                    serde_json::json!({
+                        "query": span_id.query_key.clone(),
+                        "apiType": "sql",
+                        "duration": start_time.elapsed().unwrap().as_millis() as u64,
+                        "isDataQuery": span_id.is_data_query().await,
+                        "lastRefreshTime": span_id.last_refresh_time().await,
+                    }),
+                )
+                .await?;
+        }
+
+        self.write_ready().await
+    }
+
+    pub(crate) fn auth_context(&self) -> Result<AuthContextRef, CubeError> {
+        self.session
+            .state
+            .auth_context()
+            .ok_or(CubeError::internal("must be auth".to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_connection_error_mem_size() {
+        assert_eq!(std::mem::size_of::<ConnectionError>(), 136)
+    }
+}

@@ -1,0 +1,1392 @@
+use async_trait::async_trait;
+use chrono::{DateTime, SecondsFormat, Utc};
+use cubeclient::apis::{
+    configuration::Configuration as ClientConfiguration, default_api as cube_api,
+};
+
+use datafusion::{
+    arrow::{
+        datatypes::{DataType, SchemaRef},
+        record_batch::RecordBatch,
+    },
+    logical_expr::AggregateUDF,
+    logical_plan::window_frames::{WindowFrame, WindowFrameBound, WindowFrameUnits},
+    physical_plan::{aggregates::AggregateFunction, windows::WindowFunction},
+};
+use minijinja::{context, value::Value, Environment};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fmt::Debug,
+    sync::Arc,
+    time::{Duration, SystemTime},
+};
+use tokio::{
+    sync::{mpsc::Receiver, RwLock as RwLockAsync},
+    time::Instant,
+};
+use uuid::Uuid;
+
+use crate::compile::engine::df::scan::CacheMode;
+use crate::transport::TransportLoadRequestCacheMode;
+use crate::{
+    compile::{
+        engine::df::{
+            scan::{convert_transport_response, MemberField},
+            wrapper::{GroupingSetDesc, GroupingSetType, SqlQuery},
+        },
+        rewrite::LikeType,
+    },
+    sql::{AuthContextRef, HttpAuthContext},
+    transport::{MetaContext, TransportLoadRequest, TransportLoadRequestQuery},
+    CubeError, RWLockAsync,
+};
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LoadRequestMeta {
+    protocol: String,
+    #[serde(rename = "apiType")]
+    api_type: String,
+    #[serde(rename = "appName")]
+    app_name: Option<String>,
+    // Optional fields
+    #[serde(rename = "changeUser", skip_serializing_if = "Option::is_none")]
+    change_user: Option<String>,
+    // Whether `sql()` may answer with a query over a Cube Store pre-aggregation.
+    // Not part of the request meta Cube sees, the transport sends it as its own field
+    #[serde(skip)]
+    external_pre_aggregations: bool,
+}
+
+impl LoadRequestMeta {
+    #[must_use]
+    pub fn new(protocol: String, api_type: String, app_name: Option<String>) -> Self {
+        Self {
+            protocol,
+            api_type,
+            app_name,
+            change_user: None,
+            external_pre_aggregations: false,
+        }
+    }
+
+    pub fn change_user(&self) -> Option<String> {
+        self.change_user.clone()
+    }
+
+    pub fn set_change_user(&mut self, change_user: Option<String>) {
+        self.change_user = change_user;
+    }
+
+    pub fn external_pre_aggregations(&self) -> bool {
+        self.external_pre_aggregations
+    }
+
+    pub fn set_external_pre_aggregations(&mut self, external_pre_aggregations: bool) {
+        self.external_pre_aggregations = external_pre_aggregations;
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SqlResponse {
+    pub sql: SqlQuery,
+    /// The SQL reads a Cube Store pre-aggregation, so it is in the Cube Store dialect
+    /// and has to run there
+    #[serde(default)]
+    pub external: bool,
+    /// Descriptions of the pre-aggregations the SQL reads, as Cube's `/v1/sql` reports
+    /// them; the load request carries them back so the orchestrator builds the rollups
+    /// and swaps their table names in
+    #[serde(default)]
+    pub pre_aggregations: Vec<serde_json::Value>,
+}
+
+#[derive(Debug)]
+pub struct SpanId {
+    pub span_id: String,
+    pub query_key: serde_json::Value,
+    /// The query key with its string literals redacted, when log redaction is on.
+    /// Logged beside `query_key` as `redactedQuery`: the log sink swaps it in, APM
+    /// events keep the statement as sent.
+    pub redacted_query_key: Option<serde_json::Value>,
+    span_start: SystemTime,
+    is_data_query: RWLockAsync<bool>,
+    last_refresh_time: RWLockAsync<Option<DateTime<Utc>>>,
+    external: RWLockAsync<Option<bool>>,
+    used_pre_aggregations: RWLockAsync<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl SpanId {
+    pub fn new(span_id: String, query_key: serde_json::Value) -> Self {
+        Self {
+            span_id,
+            query_key,
+            redacted_query_key: None,
+            span_start: SystemTime::now(),
+            is_data_query: tokio::sync::RwLock::new(false),
+            last_refresh_time: tokio::sync::RwLock::new(None),
+            external: tokio::sync::RwLock::new(None),
+            used_pre_aggregations: tokio::sync::RwLock::new(serde_json::Map::new()),
+        }
+    }
+
+    pub fn with_redacted_query_key(
+        mut self,
+        redacted_query_key: Option<serde_json::Value>,
+    ) -> Self {
+        self.redacted_query_key = redacted_query_key;
+        self
+    }
+
+    pub async fn set_is_data_query(&self, is_data_query: bool) {
+        let mut write = self.is_data_query.write().await;
+        *write = is_data_query;
+    }
+
+    pub async fn is_data_query(&self) -> bool {
+        let read = self.is_data_query.read().await;
+        *read
+    }
+
+    /// Records the refresh time of a load result contributing to this span.
+    /// A span may cover several load requests (e.g. a join of cube scans);
+    /// the oldest value wins, matching `lastRefreshTime` semantics elsewhere.
+    pub async fn set_last_refresh_time(&self, last_refresh_time: DateTime<Utc>) {
+        let mut write = self.last_refresh_time.write().await;
+        *write = Some(match *write {
+            Some(current) => current.min(last_refresh_time),
+            None => last_refresh_time,
+        });
+    }
+
+    pub async fn last_refresh_time(&self) -> Option<String> {
+        let read = self.last_refresh_time.read().await;
+        read.map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+    }
+
+    /// Records whether a load result contributing to this span was served from
+    /// an external (CubeStore) pre-aggregation. A span may cover several load
+    /// requests (e.g. a join of cube scans); the span counts as external only
+    /// when *every* one of them was, matching how the flag is folded elsewhere
+    /// (`usages.iter().all(..)` in cubesqlplanner's `base_query`). Otherwise a
+    /// join of one pre-aggregated and one live scan would claim the whole result
+    /// came from a pre-aggregation, while `last_refresh_time` above reports the
+    /// oldest of the two — the two would disagree on the same result.
+    ///
+    /// `None` means no load has reported yet, which is distinct from a load
+    /// having reported `false`.
+    pub async fn set_external(&self, external: bool) {
+        let mut write = self.external.write().await;
+        *write = Some(write.unwrap_or(true) && external);
+    }
+
+    /// `None` when no load has reported yet, so callers can tell a span that
+    /// is silent from one that deliberately folded to `false`.
+    pub async fn external(&self) -> Option<bool> {
+        *self.external.read().await
+    }
+
+    /// Records the pre-aggregations a load result contributing to this span was
+    /// served from. A span may cover several load requests (e.g. a join of cube
+    /// scans), and the entries are keyed by pre-aggregation table name, so they
+    /// merge: the span reports the union of every pre-aggregation read. Two
+    /// loads reporting the same table report the same identity for it, so a
+    /// later entry overwriting an earlier one is a no-op.
+    ///
+    /// Anything but a JSON object is ignored - the value is passed through from
+    /// the API gateway, and only an object can be merged.
+    pub async fn merge_used_pre_aggregations(&self, used_pre_aggregations: serde_json::Value) {
+        if let serde_json::Value::Object(entries) = used_pre_aggregations {
+            let mut write = self.used_pre_aggregations.write().await;
+            for (table_name, usage) in entries {
+                write.insert(table_name, usage);
+            }
+        }
+    }
+
+    /// `None` when no load has reported a pre-aggregation, so callers can fall
+    /// back to another source instead of reporting an empty object.
+    pub async fn used_pre_aggregations(&self) -> Option<serde_json::Value> {
+        let read = self.used_pre_aggregations.read().await;
+        if read.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(read.clone()))
+        }
+    }
+
+    pub fn duration(&self) -> u64 {
+        self.span_start
+            .elapsed()
+            .unwrap_or_else(|_| Duration::from_secs(0))
+            .as_millis() as u64
+    }
+}
+
+#[async_trait]
+pub trait TransportService: Send + Sync + Debug {
+    // Load meta information about cubes
+    async fn meta(&self, ctx: AuthContextRef) -> Result<Arc<MetaContext>, CubeError>;
+
+    async fn compiler_id(&self, ctx: AuthContextRef) -> Result<Uuid, CubeError> {
+        let meta = self.meta(ctx).await?;
+        Ok(meta.compiler_id)
+    }
+
+    // Get sql for query to be used in wrapped SQL query
+    async fn sql(
+        &self,
+        span_id: Option<Arc<SpanId>>,
+        query: TransportLoadRequestQuery,
+        ctx: AuthContextRef,
+        meta_fields: LoadRequestMeta,
+        member_to_alias: Option<HashMap<String, String>>,
+        expression_params: Option<Vec<Option<String>>>,
+    ) -> Result<SqlResponse, CubeError>;
+
+    /// Which of `queries` Cube would serve from a Cube Store pre-aggregation, in order.
+    /// Matching only, no SQL: the rewrite asks this to settle which scans of a plan may
+    /// read a pre-aggregation before it generates any SQL. None by default
+    async fn pre_aggregation_matches(
+        &self,
+        _span_id: Option<Arc<SpanId>>,
+        queries: Vec<TransportLoadRequestQuery>,
+        _ctx: AuthContextRef,
+        _meta_fields: LoadRequestMeta,
+    ) -> Result<Vec<bool>, CubeError> {
+        Ok(vec![false; queries.len()])
+    }
+
+    // Execute load query
+    async fn load(
+        &self,
+        span_id: Option<Arc<SpanId>>,
+        query: TransportLoadRequestQuery,
+        sql_query: Option<SqlQuery>,
+        ctx: AuthContextRef,
+        meta_fields: LoadRequestMeta,
+        schema: SchemaRef,
+        member_fields: Vec<MemberField>,
+        cache_mode: Option<CacheMode>,
+        throw_continue_wait: bool,
+    ) -> Result<Vec<RecordBatch>, CubeError>;
+
+    async fn load_stream(
+        &self,
+        span_id: Option<Arc<SpanId>>,
+        query: TransportLoadRequestQuery,
+        sql_query: Option<SqlQuery>,
+        ctx: AuthContextRef,
+        meta_fields: LoadRequestMeta,
+        schema: SchemaRef,
+        member_fields: Vec<MemberField>,
+        throw_continue_wait: bool,
+    ) -> Result<CubeStreamReceiver, CubeError>;
+
+    async fn can_switch_user_for_session(
+        &self,
+        ctx: AuthContextRef,
+        to_user: String,
+    ) -> Result<bool, CubeError>;
+
+    async fn log_load_state(
+        &self,
+        span_id: Option<Arc<SpanId>>,
+        ctx: AuthContextRef,
+        meta_fields: LoadRequestMeta,
+        event: String,
+        properties: serde_json::Value,
+    ) -> Result<(), CubeError>;
+}
+
+#[async_trait]
+pub trait SqlGenerator: Send + Sync + Debug {
+    fn get_sql_templates(&self) -> Arc<SqlTemplates>;
+
+    async fn call_template(
+        &self,
+        name: String,
+        params: HashMap<String, String>,
+    ) -> Result<String, CubeError>;
+}
+
+pub type CubeStreamReceiver = Receiver<Option<Result<RecordBatch, CubeError>>>;
+
+#[derive(Debug)]
+struct MetaCacheBucket {
+    lifetime: Instant,
+    value: Arc<MetaContext>,
+}
+
+/// This transport is used in standalone mode
+#[derive(Debug)]
+pub struct HttpTransport {
+    /// We use simple cache to improve DX with standalone mode
+    /// because currently we don't persist DF in the SessionState,
+    /// and it causes a lot of HTTP requests which slow down BI connections
+    cache: RwLockAsync<Option<MetaCacheBucket>>,
+}
+
+const CACHE_LIFETIME_DURATION: Duration = Duration::from_secs(5);
+
+impl HttpTransport {
+    pub fn new() -> Self {
+        Self {
+            cache: RwLockAsync::new(None),
+        }
+    }
+
+    fn get_client_config_for_ctx(&self, ctx: AuthContextRef) -> ClientConfiguration {
+        let http_ctx = ctx
+            .as_any()
+            .downcast_ref::<HttpAuthContext>()
+            .expect("Unable to cast AuthContext to HttpAuthContext");
+
+        let mut cube_config = ClientConfiguration::default();
+        cube_config.bearer_access_token = Some(http_ctx.access_token.clone());
+        cube_config.base_path = http_ctx.base_path.clone();
+
+        cube_config
+    }
+}
+
+crate::di_service!(HttpTransport, [TransportService]);
+
+#[async_trait]
+impl TransportService for HttpTransport {
+    async fn meta(&self, ctx: AuthContextRef) -> Result<Arc<MetaContext>, CubeError> {
+        {
+            let store = self.cache.read().await;
+            if let Some(cache_bucket) = &*store {
+                if cache_bucket.lifetime.elapsed() < CACHE_LIFETIME_DURATION {
+                    return Ok(cache_bucket.value.clone());
+                };
+            };
+        }
+
+        let response = cube_api::meta_v1(&self.get_client_config_for_ctx(ctx), true).await?;
+
+        let mut store = self.cache.write().await;
+        if let Some(cache_bucket) = &*store {
+            if cache_bucket.lifetime.elapsed() < CACHE_LIFETIME_DURATION {
+                return Ok(cache_bucket.value.clone());
+            }
+        };
+
+        // Not used -- doesn't make sense to implement
+        let value = Arc::new(MetaContext::new(
+            response.cubes.unwrap_or_else(Vec::new),
+            HashMap::new(),
+            HashMap::new(),
+            Uuid::new_v4(),
+        ));
+
+        *store = Some(MetaCacheBucket {
+            lifetime: Instant::now(),
+            value: value.clone(),
+        });
+
+        Ok(value)
+    }
+
+    async fn sql(
+        &self,
+        _span_id: Option<Arc<SpanId>>,
+        _query: TransportLoadRequestQuery,
+        _ctx: AuthContextRef,
+        _meta_fields: LoadRequestMeta,
+        _member_to_alias: Option<HashMap<String, String>>,
+        _expression_params: Option<Vec<Option<String>>>,
+    ) -> Result<SqlResponse, CubeError> {
+        todo!()
+    }
+
+    async fn load(
+        &self,
+        _span_id: Option<Arc<SpanId>>,
+        mut query: TransportLoadRequestQuery,
+        _sql_query: Option<SqlQuery>,
+        ctx: AuthContextRef,
+        meta: LoadRequestMeta,
+        schema: SchemaRef,
+        member_fields: Vec<MemberField>,
+        cache_mode: Option<CacheMode>,
+        _throw_continue_wait: bool,
+    ) -> Result<Vec<RecordBatch>, CubeError> {
+        if meta.change_user().is_some() {
+            return Err(CubeError::user(
+                "Changing security context (__user) is not supported in the standalone mode"
+                    .to_string(),
+            ));
+        }
+
+        let cache_mode = match cache_mode {
+            None => None,
+            Some(m) => match m {
+                CacheMode::StaleIfSlow => Some(TransportLoadRequestCacheMode::StaleIfSlow),
+                CacheMode::StaleWhileRevalidate => {
+                    Some(TransportLoadRequestCacheMode::StaleWhileRevalidate)
+                }
+                CacheMode::MustRevalidate => Some(TransportLoadRequestCacheMode::MustRevalidate),
+                CacheMode::NoCache => Some(TransportLoadRequestCacheMode::NoCache),
+            },
+        };
+
+        query.response_format =
+            Some(cubeclient::models::v1_load_request_query::ResponseFormat::Columnar);
+
+        // TODO: support meta_fields for HTTP
+        let request = TransportLoadRequest {
+            query: Some(Box::new(query)),
+            query_type: Some("multi".to_string()),
+            cache: cache_mode,
+        };
+        let response =
+            cube_api::load_v1(&self.get_client_config_for_ctx(ctx), Some(request)).await?;
+
+        convert_transport_response(response, schema, member_fields)
+    }
+
+    async fn load_stream(
+        &self,
+        _span_id: Option<Arc<SpanId>>,
+        _query: TransportLoadRequestQuery,
+        _sql_query: Option<SqlQuery>,
+        _ctx: AuthContextRef,
+        _meta_fields: LoadRequestMeta,
+        _schema: SchemaRef,
+        _member_fields: Vec<MemberField>,
+        _throw_continue_wait: bool,
+    ) -> Result<CubeStreamReceiver, CubeError> {
+        panic!("Does not work for standalone mode yet");
+    }
+
+    async fn can_switch_user_for_session(
+        &self,
+        _ctx: AuthContextRef,
+        _to_user: String,
+    ) -> Result<bool, CubeError> {
+        panic!("Does not work for standalone mode yet");
+    }
+
+    async fn log_load_state(
+        &self,
+        span_id: Option<Arc<SpanId>>,
+        ctx: AuthContextRef,
+        meta_fields: LoadRequestMeta,
+        event: String,
+        properties: serde_json::Value,
+    ) -> Result<(), CubeError> {
+        println!(
+            "Load state: {:?} {:?} {:?} {} {:?}",
+            span_id, ctx, meta_fields, event, properties
+        );
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub struct SqlTemplates {
+    pub templates: HashMap<String, String>,
+    pub reuse_params: bool,
+    jinja: Environment<'static>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AliasedColumn {
+    pub expr: String,
+    pub alias: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemplateColumn {
+    pub expr: String,
+    pub alias: String,
+    pub aliased: String,
+    pub index: usize,
+}
+
+impl SqlTemplates {
+    pub fn new(templates: HashMap<String, String>, reuse_params: bool) -> Result<Self, CubeError> {
+        let mut jinja = Environment::new();
+        for (name, template) in templates.iter() {
+            jinja
+                .add_template_owned(name.to_string(), template.to_string())
+                .map_err(|e| {
+                    CubeError::internal(format!(
+                        "Error parsing template {} '{}': {}",
+                        name, template, e
+                    ))
+                })?;
+        }
+
+        Ok(Self {
+            templates,
+            jinja,
+            reuse_params,
+        })
+    }
+
+    pub fn contains_template(&self, template_name: &str) -> bool {
+        self.templates.contains_key(template_name)
+    }
+
+    pub fn aggregate_function_name(
+        aggregate_function: AggregateFunction,
+        distinct: bool,
+    ) -> String {
+        match aggregate_function {
+            AggregateFunction::Count if distinct => "COUNT_DISTINCT".to_string(),
+            // DataFusion names these VARIANCE, VARIANCEPOP, STDDEV and STDDEVPOP
+            AggregateFunction::Variance => "VAR_SAMP".to_string(),
+            AggregateFunction::VariancePop => "VAR_POP".to_string(),
+            AggregateFunction::Stddev => "STDDEV_SAMP".to_string(),
+            AggregateFunction::StddevPop => "STDDEV_POP".to_string(),
+            _ => aggregate_function.to_string(),
+        }
+    }
+
+    pub fn udaf_function_name(&self, udaf: &AggregateUDF, _distinct: bool) -> String {
+        udaf.name.to_ascii_uppercase()
+    }
+
+    pub fn select(
+        &self,
+        from: String,
+        joins: Vec<String>,
+        projection: Vec<AliasedColumn>,
+        group_by: Vec<AliasedColumn>,
+        group_descs: Vec<Option<GroupingSetDesc>>,
+        aggregate: Vec<AliasedColumn>,
+        window: Vec<AliasedColumn>,
+        alias: String,
+        filter: Option<String>,
+        _having: Option<String>,
+        order_by: Vec<AliasedColumn>,
+        limit: Option<usize>,
+        offset: Option<usize>,
+        distinct: bool,
+    ) -> Result<String, CubeError> {
+        let group_by = self.to_template_columns(group_by)?;
+        let aggregate = self.to_template_columns(aggregate)?;
+        let window = self.to_template_columns(window)?;
+        let projection = self.to_template_columns(projection)?;
+        let order_by = self.to_template_columns(order_by)?;
+        let select_concat = group_by
+            .iter()
+            .chain(aggregate.iter())
+            .chain(window.iter())
+            .chain(projection.iter())
+            .cloned()
+            .collect::<Vec<_>>();
+        let quoted_from_alias = self.quote_identifier(&alias)?;
+        let has_grouping_sets = group_descs.iter().any(|d| d.is_some());
+        let group_by_expr = if has_grouping_sets {
+            self.group_by_with_grouping_sets(&group_by, &group_descs)?
+        } else {
+            self.render_template(
+                "statements/group_by_exprs",
+                context! { group_by => group_by },
+            )?
+        };
+        self.render_template(
+            "statements/select",
+            context! {
+                from => from,
+                joins => joins,
+                select_concat => select_concat,
+                group_by => group_by_expr,
+                aggregate => aggregate,
+                window => window,
+                projection => projection,
+                order_by => order_by,
+                filter => filter,
+                from_alias => quoted_from_alias,
+                limit => limit,
+                offset => offset,
+                distinct => distinct,
+            },
+        )
+    }
+
+    fn group_by_with_grouping_sets(
+        &self,
+        group_by: &Vec<TemplateColumn>,
+        group_descs: &Vec<Option<GroupingSetDesc>>,
+    ) -> Result<String, CubeError> {
+        let mut parts = Vec::new();
+        let mut curr_set = Vec::new();
+        let mut curr_set_desc = None;
+        for (col, desc) in group_by.iter().zip(group_descs.iter()) {
+            if desc != &curr_set_desc {
+                if let Some(curr_desc) = &curr_set_desc {
+                    let part_expr = match curr_desc.group_type {
+                        GroupingSetType::Rollup => self.rollup_expr(curr_set)?,
+                        GroupingSetType::Cube => self.cube_expr(curr_set)?,
+                    };
+                    parts.push(part_expr);
+                }
+                curr_set_desc = desc.clone();
+                curr_set = Vec::new();
+            }
+            if desc.is_some() {
+                curr_set.push(col.index.to_string());
+            } else {
+                parts.push(col.index.to_string())
+            }
+        }
+        if let Some(curr_desc) = &curr_set_desc {
+            let part_expr = match curr_desc.group_type {
+                GroupingSetType::Rollup => self.rollup_expr(curr_set)?,
+                GroupingSetType::Cube => self.cube_expr(curr_set)?,
+            };
+            parts.push(part_expr);
+        }
+
+        Ok(parts.join(", "))
+    }
+
+    fn to_template_columns(
+        &self,
+        aliased_columns: Vec<AliasedColumn>,
+    ) -> Result<Vec<TemplateColumn>, CubeError> {
+        aliased_columns
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| -> Result<_, CubeError> {
+                Ok(TemplateColumn {
+                    expr: c.expr.to_string(),
+                    alias: c.alias.to_string(),
+                    aliased: self.alias_expr(&c.expr, &c.alias)?,
+                    index: i + 1,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    pub fn alias_expr(&self, expr: &str, alias: &str) -> Result<String, CubeError> {
+        let quoted_alias = self.quote_identifier(alias)?;
+        self.render_template(
+            "expressions/column_aliased",
+            context! { alias => alias, expr => expr, quoted_alias => quoted_alias },
+        )
+    }
+
+    pub fn quote_identifier(&self, column_name: &str) -> Result<String, CubeError> {
+        let quote = self.templates.get("quotes/identifiers").ok_or_else(|| {
+            CubeError::internal("quotes/identifiers template not found".to_string())
+        })?;
+        let escape = self
+            .templates
+            .get("quotes/escape")
+            .ok_or_else(|| CubeError::internal("quotes/escape template not found".to_string()))?;
+        let column_name = if escape.starts_with('\\') {
+            column_name.replace('\\', "\\\\")
+        } else {
+            column_name.to_string()
+        };
+        Ok(format!(
+            "{}{}{}",
+            quote,
+            column_name.replace(quote.as_str(), escape),
+            quote
+        ))
+    }
+
+    fn render_template(&self, name: &str, ctx: Value) -> Result<String, CubeError> {
+        Ok(self
+            .jinja
+            .get_template(name)
+            .map_err(|e| CubeError::internal(format!("Error getting {} template: {}", name, e)))?
+            .render(ctx)
+            .map_err(|e| {
+                CubeError::internal(format!("Error rendering {} template: {}", name, e))
+            })?)
+    }
+
+    pub fn aggregate_function(
+        &self,
+        aggregate_function: AggregateFunction,
+        args: Vec<String>,
+        distinct: bool,
+        within_group: Vec<String>,
+    ) -> Result<String, CubeError> {
+        let function = Self::aggregate_function_name(aggregate_function, distinct);
+        let args_concat = args.join(", ");
+        let sql = self.render_template(
+            &format!("functions/{}", function),
+            context! { args_concat => args_concat, args => args, distinct => distinct },
+        )?;
+        if within_group.len() == 0 {
+            return Ok(sql);
+        }
+
+        let within_group_concat = within_group.join(", ");
+        self.render_template(
+            "expressions/within_group",
+            context! { fun_sql => sql, within_group_concat => within_group_concat },
+        )
+    }
+
+    pub fn udaf_function(
+        &self,
+        udaf: &AggregateUDF,
+        args: Vec<String>,
+        distinct: bool,
+    ) -> Result<String, CubeError> {
+        let function = self.udaf_function_name(udaf, distinct);
+        let args_concat = args.join(", ");
+        self.render_template(
+            &format!("functions/{}", function),
+            context! { args_concat => args_concat, args => args, distinct => distinct },
+        )
+    }
+
+    pub fn scalar_function(
+        &self,
+        scalar_function: String,
+        args: Vec<String>,
+        date_part: Option<String>,
+        interval: Option<String>,
+    ) -> Result<String, CubeError> {
+        let function = scalar_function.to_string().to_uppercase();
+        let args_concat = args.join(", ");
+        self.render_template(
+            &format!("functions/{}", function),
+            context! {
+                args_concat => args_concat,
+                args => args,
+                date_part => date_part,
+                interval => interval,
+            },
+        )
+    }
+
+    pub fn window_function_name(window_function: WindowFunction) -> String {
+        match window_function {
+            WindowFunction::AggregateFunction(aggregate_function) => {
+                Self::aggregate_function_name(aggregate_function, false)
+            }
+            WindowFunction::BuiltInWindowFunction(built_in_window_function) => {
+                built_in_window_function.to_string()
+            }
+        }
+    }
+
+    pub fn window_function(
+        &self,
+        window_function: WindowFunction,
+        args: Vec<String>,
+    ) -> Result<String, CubeError> {
+        let function = Self::window_function_name(window_function);
+        let args_concat = args.join(", ");
+        self.render_template(
+            &format!("functions/{}", function),
+            context! { args_concat => args_concat, args => args },
+        )
+    }
+
+    pub fn window_frame(&self, window_frame: Option<WindowFrame>) -> Result<String, CubeError> {
+        let Some(window_frame) = window_frame else {
+            return Ok("".to_string());
+        };
+
+        let type_template = match window_frame.units {
+            WindowFrameUnits::Rows => "rows",
+            WindowFrameUnits::Range => "range",
+            WindowFrameUnits::Groups => "groups",
+        };
+        let frame_type = self.render_template(
+            &format!("window_frame_types/{}", type_template),
+            context! {},
+        )?;
+
+        let frame_start = self.window_frame_bound(&window_frame.start_bound)?;
+        let frame_end = self.window_frame_bound(&window_frame.end_bound)?;
+
+        self.render_template(
+            "expressions/window_frame_bounds",
+            context! {
+                frame_type => frame_type,
+                frame_start => frame_start,
+                frame_end => frame_end
+            },
+        )
+    }
+
+    pub fn window_frame_bound(&self, frame_bound: &WindowFrameBound) -> Result<String, CubeError> {
+        match frame_bound {
+            WindowFrameBound::Preceding(n) => {
+                self.render_template("window_frame_bounds/preceding", context! { n => n })
+            }
+            WindowFrameBound::CurrentRow => {
+                self.render_template("window_frame_bounds/current_row", context! {})
+            }
+            WindowFrameBound::Following(n) => {
+                self.render_template("window_frame_bounds/following", context! { n => n })
+            }
+        }
+    }
+
+    pub fn window_function_expr(
+        &self,
+        window_function: WindowFunction,
+        args: Vec<String>,
+        partition_by: Vec<String>,
+        order_by: Vec<String>,
+        window_frame: Option<WindowFrame>,
+    ) -> Result<String, CubeError> {
+        let fun_call = self.window_function(window_function, args)?;
+        let partition_by_concat = partition_by.join(", ");
+        let order_by_concat = order_by.join(", ");
+        let window_frame = self.window_frame(window_frame)?;
+        self.render_template(
+            "expressions/window_function",
+            context! {
+                fun_call => fun_call,
+                partition_by => partition_by,
+                partition_by_concat => partition_by_concat,
+                order_by => order_by,
+                order_by_concat => order_by_concat,
+                window_frame => window_frame
+            },
+        )
+    }
+
+    pub fn case(
+        &self,
+        expr: Option<String>,
+        when_then: Vec<(String, String)>,
+        else_expr: Option<String>,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/case",
+            context! { expr => expr, when_then => when_then, else_expr => else_expr },
+        )
+    }
+
+    pub fn binary_expr(
+        &self,
+        left: String,
+        op: String,
+        right: String,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/binary",
+            context! { left => left, op => op, right => right },
+        )
+    }
+
+    pub fn int_division_expr(&self, left: String, right: String) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/int_division",
+            context! { left => left, right => right },
+        )
+    }
+
+    pub fn is_null_expr(&self, expr: String, negate: bool) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/is_null",
+            context! { expr => expr, negate => negate },
+        )
+    }
+
+    pub fn negative_expr(&self, expr: String) -> Result<String, CubeError> {
+        self.render_template("expressions/negative", context! { expr => expr })
+    }
+
+    pub fn not_expr(&self, expr: String) -> Result<String, CubeError> {
+        self.render_template("expressions/not", context! { expr => expr })
+    }
+
+    /// Native-boolean dialects need no conversion. Other dialects opt in with
+    /// templates for the two SQL expression contexts.
+    pub fn boolean_context_expr(&self, expr: String, predicate: bool) -> Result<String, CubeError> {
+        let template = if predicate {
+            "expressions/scalar_to_predicate"
+        } else {
+            "expressions/predicate_to_scalar"
+        };
+        if self.contains_template(template) {
+            self.render_template(template, context! { expr => expr })
+        } else {
+            Ok(expr)
+        }
+    }
+
+    pub fn sort_expr(
+        &self,
+        expr: String,
+        asc: bool,
+        nulls_first: bool,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/sort",
+            context! { expr => expr, asc => asc, nulls_first => nulls_first },
+        )
+    }
+
+    pub fn extract_expr(&self, date_part: String, expr: String) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/extract",
+            context! { date_part => date_part, expr => expr },
+        )
+    }
+
+    /// Renders the epoch (in seconds) of a timestamp difference `left - right`.
+    /// Used for dialects (e.g. Snowflake) where `EXTRACT(EPOCH FROM (left - right))`
+    /// is invalid because EPOCH can't be extracted from an interval.
+    pub fn extract_epoch_diff_expr(
+        &self,
+        left: String,
+        right: String,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/extract_epoch_diff",
+            context! { left => left, right => right },
+        )
+    }
+
+    pub fn interval_any_expr(
+        &self,
+        interval: String,
+        num: i64,
+        date_part: &'static str,
+    ) -> Result<String, CubeError> {
+        const INTERVAL_TEMPLATE: &str = "expressions/interval";
+        const INTERVAL_SINGLE_TEMPLATE: &str = "expressions/interval_single_date_part";
+        if self.contains_template(INTERVAL_TEMPLATE) {
+            self.interval_expr(interval)
+        } else if self.contains_template(INTERVAL_SINGLE_TEMPLATE) {
+            self.interval_single_expr(num, date_part)
+        } else {
+            Err(CubeError::unsupported(
+                "Interval template generation is not supported".to_string(),
+            ))
+        }
+    }
+
+    pub fn interval_expr(&self, interval: String) -> Result<String, CubeError> {
+        self.render_template("expressions/interval", context! { interval => interval })
+    }
+
+    pub fn interval_single_expr(
+        &self,
+        num: i64,
+        date_part: &'static str,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/interval_single_date_part",
+            context! { num => num, date_part => date_part },
+        )
+    }
+
+    pub fn cast_expr(&self, expr: String, data_type: String) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/cast",
+            context! { expr => expr, data_type => data_type },
+        )
+    }
+
+    pub fn float_literal_expr(&self, value: String) -> Result<String, CubeError> {
+        if self.contains_template("expressions/float_literal") {
+            let is_int32 = value.parse::<i32>().is_ok();
+            self.render_template(
+                "expressions/float_literal",
+                context! { value => value, is_int32 => is_int32 },
+            )
+        } else {
+            Ok(value)
+        }
+    }
+
+    pub fn in_list_expr(
+        &self,
+        expr: String,
+        in_exprs: Vec<String>,
+        negated: bool,
+    ) -> Result<String, CubeError> {
+        let in_exprs_concat = in_exprs.join(", ");
+        self.render_template(
+            "expressions/in_list",
+            context! {
+                expr => expr,
+                in_exprs_concat => in_exprs_concat,
+                in_exprs => in_exprs,
+                negated => negated
+            },
+        )
+    }
+
+    pub fn rollup_expr(&self, exprs: Vec<String>) -> Result<String, CubeError> {
+        let exprs_concat = exprs.join(", ");
+        self.render_template(
+            "expressions/rollup",
+            context! {
+                exprs_concat => exprs_concat,
+            },
+        )
+    }
+
+    pub fn cube_expr(&self, exprs: Vec<String>) -> Result<String, CubeError> {
+        let exprs_concat = exprs.join(", ");
+        self.render_template(
+            "expressions/cube",
+            context! {
+                exprs_concat => exprs_concat,
+            },
+        )
+    }
+
+    pub fn subquery_expr(&self, subquery_expr: String) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/subquery",
+            context! {
+                expr => subquery_expr,
+            },
+        )
+    }
+
+    pub fn in_subquery_expr(
+        &self,
+        expr: String,
+        subquery_expr: String,
+        negated: bool,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/in_subquery",
+            context! {
+                expr => expr,
+                subquery_expr => subquery_expr,
+                negated => negated
+            },
+        )
+    }
+
+    pub fn literal_bool_expr(&self, value: bool) -> Result<String, CubeError> {
+        match value {
+            true => self.render_template("expressions/true", context! {}),
+            false => self.render_template("expressions/false", context! {}),
+        }
+    }
+
+    pub fn timestamp_literal_expr(&self, value: String) -> Result<String, CubeError> {
+        self.render_template("expressions/timestamp_literal", context! { value => value })
+    }
+
+    pub fn like_expr(
+        &self,
+        like_type: LikeType,
+        expr: String,
+        negated: bool,
+        pattern: String,
+        escape_char: Option<String>,
+    ) -> Result<String, CubeError> {
+        let expression_name = match like_type {
+            LikeType::Like => "like",
+            LikeType::ILike => "ilike",
+            _ => {
+                return Err(CubeError::unsupported(format!(
+                    "Error rendering template: like type {} is not supported",
+                    like_type
+                )))
+            }
+        };
+
+        let rendered_like = self.render_template(
+            &format!("expressions/{}", expression_name),
+            context! {
+                expr => expr,
+                negated => negated,
+                pattern => pattern,
+                default_escape => escape_char.is_none(),
+            },
+        )?;
+
+        let Some(escape_char) = escape_char else {
+            return Ok(rendered_like);
+        };
+        self.render_template(
+            "expressions/like_escape",
+            context! { like_expr => rendered_like, escape_char => escape_char },
+        )
+    }
+
+    pub fn between_expr(
+        &self,
+        expr: String,
+        negated: bool,
+        low: String,
+        high: String,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "expressions/between",
+            context! {
+                expr => expr,
+                negated => negated,
+                low => low,
+                high => high
+            },
+        )
+    }
+
+    pub fn param(&self, param_index: usize) -> Result<String, CubeError> {
+        self.render_template("params/param", context! { param_index => param_index })
+    }
+
+    /// The type a cast has to name to produce a NULL of `sql_type`.
+    pub fn nullable_type(&self, sql_type: String) -> Result<String, CubeError> {
+        if !self.contains_template("types/nullable") {
+            return Ok(sql_type);
+        }
+
+        self.render_template("types/nullable", context! { data_type => sql_type })
+    }
+
+    /// The `types/*` template a data type renders with, `None` for a type without one.
+    fn sql_type_template(data_type: &DataType) -> Option<&'static str> {
+        Some(match data_type {
+            DataType::Decimal128(_, _) => "types/decimal",
+            // NULL is not a type in databases. In PostgreSQL, untyped NULL is TEXT
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Null => "types/string",
+            DataType::Boolean => "types/boolean",
+            DataType::Int8 | DataType::UInt8 => "types/tinyint",
+            DataType::Int16 | DataType::UInt16 => "types/smallint",
+            DataType::Int32 | DataType::UInt32 => "types/integer",
+            DataType::Int64 | DataType::UInt64 => "types/bigint",
+            DataType::Float16 | DataType::Float32 => "types/float",
+            DataType::Float64 => "types/double",
+            DataType::Timestamp(_, _) => "types/timestamp",
+            DataType::Date32 | DataType::Date64 => "types/date",
+            DataType::Time32(_) | DataType::Time64(_) => "types/time",
+            DataType::Duration(_) | DataType::Interval(_) => "types/interval",
+            DataType::Binary | DataType::FixedSizeBinary(_) | DataType::LargeBinary => {
+                "types/binary"
+            }
+            _ => return None,
+        })
+    }
+
+    /// Whether `sql_type` can render the data type: a lookup, no template is rendered.
+    pub fn contains_sql_type(&self, data_type: &DataType) -> bool {
+        Self::sql_type_template(data_type)
+            .map(|template| self.contains_template(template))
+            .unwrap_or(false)
+    }
+
+    pub fn sql_type(&self, data_type: DataType) -> Result<String, CubeError> {
+        let Some(template) = Self::sql_type_template(&data_type) else {
+            return Err(CubeError::unsupported(format!(
+                "Can't generate SQL for type {:?}: not supported",
+                data_type
+            )));
+        };
+        let ctx = match data_type {
+            DataType::Decimal128(precision, scale) => context! {
+                precision => precision,
+                scale => scale,
+            },
+            _ => context! {},
+        };
+        self.render_template(template, ctx)
+    }
+
+    pub fn left_join(&self) -> Result<String, CubeError> {
+        self.render_template("join_types/left", context! {})
+    }
+
+    pub fn inner_join(&self) -> Result<String, CubeError> {
+        self.render_template("join_types/inner", context! {})
+    }
+
+    pub fn full_join(&self) -> Result<String, CubeError> {
+        self.render_template("join_types/full", context! {})
+    }
+
+    pub fn right_join(&self) -> Result<String, CubeError> {
+        self.render_template("join_types/right", context! {})
+    }
+
+    pub fn query_aliased(&self, query: &str, alias: &str) -> Result<String, CubeError> {
+        let bracketed_query = format!("({})", query);
+        let quoted_alias = self.quote_identifier(alias)?;
+        self.render_template(
+            "expressions/query_aliased",
+            context! { query => bracketed_query, quoted_alias => quoted_alias },
+        )
+    }
+
+    pub fn join(
+        &self,
+        join_type: &str,
+        source: &str,
+        condition: &str,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "statements/join",
+            context! { join_type => join_type, source => source, condition => condition },
+        )
+    }
+
+    /// Renders `queries` as a single set operation: `UNION` when `distinct`, `UNION ALL`
+    /// otherwise. `limit` bounds the result of the whole operation, not of any one query.
+    pub fn union(
+        &self,
+        queries: Vec<String>,
+        distinct: bool,
+        limit: Option<usize>,
+    ) -> Result<String, CubeError> {
+        self.render_template(
+            "statements/union",
+            context! { queries => queries, distinct => distinct, limit => limit },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn sql_templates_with(entries: Vec<(&str, &str)>) -> SqlTemplates {
+        let templates = entries
+            .into_iter()
+            .map(|(name, template)| (name.to_string(), template.to_string()))
+            .collect();
+        SqlTemplates::new(templates, false).unwrap()
+    }
+
+    #[test]
+    fn quote_identifier_doubles_the_quote() {
+        let templates =
+            sql_templates_with(vec![("quotes/identifiers", "`"), ("quotes/escape", "``")]);
+
+        assert_eq!(templates.quote_identifier("a`b\\").unwrap(), "`a``b\\`");
+    }
+
+    #[test]
+    fn quote_identifier_escapes_backslashes_before_a_backslash_escaped_quote() {
+        let templates =
+            sql_templates_with(vec![("quotes/identifiers", "`"), ("quotes/escape", "\\`")]);
+
+        assert_eq!(templates.quote_identifier("a`b").unwrap(), "`a\\`b`");
+        assert_eq!(templates.quote_identifier("a\\`b").unwrap(), "`a\\\\\\`b`");
+        assert_eq!(templates.quote_identifier("a\\").unwrap(), "`a\\\\`");
+    }
+
+    #[test]
+    fn nullable_type_is_the_type_itself_where_the_dialect_names_nothing() {
+        let templates = sql_templates_with(vec![("types/string", "TEXT")]);
+
+        assert_eq!(templates.nullable_type("TEXT".to_string()).unwrap(), "TEXT");
+    }
+
+    #[test]
+    fn nullable_type_is_the_form_the_dialect_names() {
+        let templates = sql_templates_with(vec![
+            ("types/string", "String"),
+            ("types/nullable", "Nullable({{ data_type }})"),
+        ]);
+
+        assert_eq!(
+            templates.nullable_type("String".to_string()).unwrap(),
+            "Nullable(String)"
+        );
+    }
+
+    #[tokio::test]
+    async fn span_id_last_refresh_time_keeps_oldest() {
+        let span_id = SpanId::new("test".to_string(), serde_json::json!({}));
+        assert_eq!(span_id.last_refresh_time().await, None);
+
+        let newer = Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
+        let older = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+
+        span_id.set_last_refresh_time(newer).await;
+        assert_eq!(
+            span_id.last_refresh_time().await,
+            Some("2024-06-01T12:00:00.000Z".to_string())
+        );
+
+        span_id.set_last_refresh_time(older).await;
+        assert_eq!(
+            span_id.last_refresh_time().await,
+            Some("2024-01-01T00:00:00.000Z".to_string())
+        );
+
+        // A newer value must not override the recorded oldest one
+        span_id.set_last_refresh_time(newer).await;
+        assert_eq!(
+            span_id.last_refresh_time().await,
+            Some("2024-01-01T00:00:00.000Z".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn span_id_external_only_when_every_load_is_external() {
+        // No load has reported yet — distinct from a load reporting `false`,
+        // so that consumers can fall back to another source when silent
+        let span_id = SpanId::new("test".to_string(), serde_json::json!({}));
+        assert_eq!(span_id.external().await, None);
+
+        // A single external load makes the whole span external
+        span_id.set_external(true).await;
+        assert_eq!(span_id.external().await, Some(true));
+
+        // ...but one live load anywhere in the span clears it, and a later
+        // external load must not bring it back
+        span_id.set_external(false).await;
+        assert_eq!(span_id.external().await, Some(false));
+        span_id.set_external(true).await;
+        assert_eq!(span_id.external().await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn span_id_external_reports_false_for_a_single_live_load() {
+        let span_id = SpanId::new("test".to_string(), serde_json::json!({}));
+
+        span_id.set_external(false).await;
+        assert_eq!(span_id.external().await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn span_id_used_pre_aggregations_merge_across_loads() {
+        // Silent span — consumers fall back to the stream schema, so an empty
+        // union must not be reported as an empty object
+        let span_id = SpanId::new("test".to_string(), serde_json::json!({}));
+        assert_eq!(span_id.used_pre_aggregations().await, None);
+
+        span_id
+            .merge_used_pre_aggregations(serde_json::json!({
+                "schema.orders_main": { "preAggregationId": "Orders.main" }
+            }))
+            .await;
+        span_id
+            .merge_used_pre_aggregations(serde_json::json!({
+                "schema.users_main": { "preAggregationId": "Users.main" }
+            }))
+            .await;
+
+        // A join of two cube scans reports both pre-aggregations, not the last
+        // one to arrive
+        assert_eq!(
+            span_id.used_pre_aggregations().await,
+            Some(serde_json::json!({
+                "schema.orders_main": { "preAggregationId": "Orders.main" },
+                "schema.users_main": { "preAggregationId": "Users.main" }
+            }))
+        );
+
+        // Anything but an object has nothing mergeable in it and is dropped
+        span_id
+            .merge_used_pre_aggregations(serde_json::json!("nonsense"))
+            .await;
+        assert_eq!(
+            span_id
+                .used_pre_aggregations()
+                .await
+                .and_then(|v| v.as_object().map(|o| o.len())),
+            Some(2)
+        );
+    }
+}

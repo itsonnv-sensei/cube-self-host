@@ -1,0 +1,131 @@
+use super::{CommonUtils, JoinTreeBuilder};
+use crate::cube_bridge::join_definition::JoinDefinition;
+use crate::cube_bridge::join_item::JoinItem;
+use crate::planner::join_hints::JoinHints;
+use crate::planner::state::State;
+use crate::planner::MemberSymbol;
+use crate::planner::SqlCall;
+use crate::planner::{CubeId, JoinTree};
+use cubenativeutils::CubeError;
+use std::rc::Rc;
+
+/// Join item with its members resolved to `MemberSymbol`s on both
+/// sides — produced from a `JoinDefinition` by `JoinPlanner` so the
+/// rest of the planner can reason about the actual columns involved
+/// without re-parsing the JS-side ON clause.
+#[derive(Clone, Debug)]
+pub struct ResolvedJoinItem {
+    pub original_from: CubeId,
+    pub original_to: CubeId,
+    pub from_members: Vec<Rc<MemberSymbol>>,
+    pub to_members: Vec<Rc<MemberSymbol>>,
+    pub on_sql: Rc<SqlCall>,
+}
+
+impl ResolvedJoinItem {
+    /// Equality on the cube pair and the resolved member sets — used
+    /// to detect duplicates without comparing the compiled `on_sql`.
+    pub fn is_same_as(&self, other: &Self) -> bool {
+        self.original_from == other.original_from
+            && self.original_to == other.original_to
+            && self.from_members == other.from_members
+            && self.to_members == other.to_members
+    }
+}
+
+/// Builds query inputs from `JoinDefinition`s (or join
+/// hints), compiles each item's ON SQL into a `SqlCall`, and exposes
+/// helpers for resolving the members each ON clause references.
+pub struct JoinPlanner {
+    utils: CommonUtils,
+    query_tools: Rc<State>,
+}
+
+impl JoinPlanner {
+    pub fn new(query_tools: Rc<State>) -> Self {
+        Self {
+            utils: CommonUtils::new(query_tools.clone()),
+            query_tools,
+        }
+    }
+
+    /// The join tree of `join_hints`, materialised by the join graph.
+    pub fn join_tree_for_hints(&self, join_hints: JoinHints) -> Result<Rc<JoinTree>, CubeError> {
+        let (_, join_tree) =
+            JoinTreeBuilder::new(self.query_tools.clone()).build_for_hints(&join_hints)?;
+        Ok(join_tree)
+    }
+
+    /// Materialises the join from `join_hints` and resolves the
+    /// members each ON clause references.
+    pub fn resolve_join_members_by_hints(
+        &self,
+        join_hints: &JoinHints,
+    ) -> Result<Vec<ResolvedJoinItem>, CubeError> {
+        let (graph_hints, joined) = join_hints.split_joined();
+        if let Some(instance) = joined.first() {
+            return Err(CubeError::user(format!(
+                "A rollup join can't reach `{}`: joins through an alias are not supported there",
+                instance
+            )));
+        }
+        let join = self.query_tools.join_graph().build_join(graph_hints)?;
+        self.resolve_join_members(join)
+    }
+    /// Resolves the members each ON clause references for an
+    /// already-built `JoinDefinition`.
+    pub fn resolve_join_members(
+        &self,
+        join: Rc<dyn JoinDefinition>,
+    ) -> Result<Vec<ResolvedJoinItem>, CubeError> {
+        join.joins()?
+            .into_iter()
+            .map(|join_item| self.resolve_item_join_members(join_item))
+            .collect::<Result<Vec<_>, _>>()
+    }
+
+    fn resolve_item_join_members(
+        &self,
+        join_item: Rc<dyn JoinItem>,
+    ) -> Result<ResolvedJoinItem, CubeError> {
+        let original_from = CubeId::cube(join_item.static_data().original_from.clone());
+        let original_to = CubeId::cube(join_item.static_data().original_to.clone());
+        let on_sql = self.utils.compile_join_condition(join_item.clone())?;
+        let mut from_members = vec![];
+        let mut to_members = vec![];
+        for member in on_sql.get_dependencies().into_iter() {
+            if member.cube_id() == original_from {
+                from_members.push(member);
+            } else if member.cube_id() == original_to {
+                to_members.push(member);
+            } else {
+                return Err(CubeError::user(format!(
+                    "Member {} in join from '{}' to '{}' doesn't reference join cubes",
+                    member.full_name(),
+                    original_from,
+                    original_to
+                )));
+            }
+        }
+
+        if from_members.is_empty() {
+            return Err(CubeError::user(format!(
+                "From members are not found in join from '{}' to '{}'",
+                original_from, original_to
+            )));
+        }
+        if to_members.is_empty() {
+            return Err(CubeError::user(format!(
+                "To members are not found in join from '{}' to '{}'",
+                original_from, original_to
+            )));
+        }
+        Ok(ResolvedJoinItem {
+            original_from,
+            original_to,
+            from_members,
+            to_members,
+            on_sql,
+        })
+    }
+}

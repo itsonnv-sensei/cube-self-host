@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "cubestore",
+    "cubestore-sql-tests",
+    "cubehll",
+    "cubedatasketches",
+    "cubezetasketch",
+    "cuberpc",
+    "cuberockstore",
+]
+
+[profile.bench]
+debug = true
+
+[patch.crates-io]
+chrono-tz = { git = "https://github.com/cube-js/chrono-tz", rev = "eec5a8cadb1b40e139195581be5f0b16afa61145" }

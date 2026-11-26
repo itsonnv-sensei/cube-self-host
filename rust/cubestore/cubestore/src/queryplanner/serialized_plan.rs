@@ -1,0 +1,1834 @@
+use crate::metastore::table::{Table, TablePath};
+use crate::metastore::{Chunk, IdRow, Index, Partition};
+use crate::queryplanner::panic::PanicWorkerNode;
+use crate::queryplanner::planning::{ClusterSendNode, ExtensionNodeSerialized, PlanningMeta};
+use crate::queryplanner::providers::InfoSchemaQueryCacheTableProvider;
+use crate::queryplanner::query_executor::{CubeTable, InlineTableId, InlineTableProvider};
+use crate::queryplanner::rolling::RollingWindowAggregate;
+use crate::queryplanner::topk::{ClusterAggregateTopKLower, ClusterAggregateTopKUpper};
+use crate::queryplanner::{
+    pretty_printers, CubeTableLogical, InfoSchemaTableProvider, QueryPlannerImpl,
+};
+use crate::table::Row;
+use crate::CubeError;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::optimizer::propagate_empty_relation::apply_aliasing_projection_if_necessary;
+use serde_derive::{Deserialize, Serialize};
+
+use datafusion::catalog::TableProvider;
+use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion, TreeNodeVisitor};
+use datafusion::common::DFSchemaRef;
+use datafusion::common::TableReference;
+use datafusion::datasource::physical_plan::ParquetFileReaderFactory;
+use datafusion::datasource::DefaultTableSource;
+use datafusion::error::DataFusionError;
+use datafusion::logical_expr::expr::{BinaryExpr, Exists, InSubquery};
+use datafusion::logical_expr::Expr;
+use datafusion::logical_expr::{
+    Aggregate, Distinct, DistinctOn, EmptyRelation, Extension, Filter, Join, Limit, LogicalPlan,
+    Projection, RecursiveQuery, Repartition, Sort, Subquery, SubqueryAlias, TableScan, Union,
+    Unnest, Values, Window,
+};
+use datafusion::prelude::{SessionConfig, SessionContext};
+use datafusion_proto::bytes::logical_plan_from_bytes_with_extension_codec;
+use datafusion_proto::logical_plan::LogicalExtensionCodec;
+use std::collections::HashMap;
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
+
+/// The plan nests subqueries as deep as the whole budget allows, so it is over budget whatever
+/// its exact depth is.
+struct OverBudget;
+
+/// Deepest expression tree carried by `node`, and the deepest plan reached through a subquery one
+/// of those expressions carries, both measured from `node`'s expressions.
+fn expression_depths(
+    node: &LogicalPlan,
+    subquery_budget: usize,
+    measured: &mut HashMap<*const LogicalPlan, usize>,
+) -> Result<(usize, usize), OverBudget> {
+    let mut deepest_expression = 0;
+    let mut deepest_subquery = 0;
+    let mut over_budget = false;
+
+    let _ = node.apply_expressions(|root| {
+        let mut pending = vec![(root, 1usize)];
+        while let Some((expr, depth)) = pending.pop() {
+            deepest_expression = deepest_expression.max(depth);
+            // A subquery is a whole plan hanging off the expression that carries it, and this is
+            // the only step here that recurses -- once per level of subquery nesting.
+            if let Expr::ScalarSubquery(subquery)
+            | Expr::Exists(Exists { subquery, .. })
+            | Expr::InSubquery(InSubquery { subquery, .. }) = expr
+            {
+                match logical_plan_depth(subquery.subquery.as_ref(), subquery_budget, measured) {
+                    Ok(below) => deepest_subquery = deepest_subquery.max(depth + below),
+                    Err(OverBudget) => {
+                        over_budget = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+            }
+            match expr {
+                // Mirrors datafusion-proto, which linearizes a same-operator left spine into
+                // one node.
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
+                    pending.push((right.as_ref(), depth + 1));
+                    let mut operand = left.as_ref();
+                    while let Expr::BinaryExpr(BinaryExpr {
+                        left,
+                        op: operand_op,
+                        right,
+                    }) = operand
+                    {
+                        if operand_op != op {
+                            break;
+                        }
+                        pending.push((right.as_ref(), depth + 1));
+                        operand = left.as_ref();
+                    }
+                    pending.push((operand, depth + 1));
+                }
+                _ => {
+                    let _ = expr.apply_children(|child| {
+                        pending.push((child, depth + 1));
+                        Ok(TreeNodeRecursion::Continue)
+                    });
+                }
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+
+    if over_budget {
+        Err(OverBudget)
+    } else {
+        Ok((deepest_expression, deepest_subquery))
+    }
+}
+
+/// Longest root-to-leaf path in `plan`, counting a plan node, an expression node and a
+/// subquery's root alike. A level of subquery nesting costs at least two levels of depth, so
+/// exhausting `subquery_budget` in nesting alone already puts the plan over the limit.
+fn logical_plan_depth(
+    plan: &LogicalPlan,
+    subquery_budget: usize,
+    measured: &mut HashMap<*const LogicalPlan, usize>,
+) -> Result<usize, OverBudget> {
+    let Some(nested_budget) = subquery_budget.checked_sub(1) else {
+        return Err(OverBudget);
+    };
+    let mut pending: Vec<(&LogicalPlan, bool)> = vec![(plan, false)];
+
+    while let Some((node, inputs_visited)) = pending.pop() {
+        let key = node as *const LogicalPlan;
+        if !inputs_visited {
+            if measured.contains_key(&key) {
+                continue;
+            }
+            pending.push((node, true));
+            pending.extend(node.inputs().into_iter().map(|input| (input, false)));
+            continue;
+        }
+
+        let below = node
+            .inputs()
+            .into_iter()
+            .filter_map(|input| measured.get(&(input as *const LogicalPlan)))
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let (in_expression, in_subquery) = expression_depths(node, nested_budget, measured)?;
+        measured.insert(key, 1 + below.max(in_expression).max(in_subquery));
+    }
+
+    Ok(measured
+        .get(&(plan as *const LogicalPlan))
+        .copied()
+        .unwrap_or(1))
+}
+
+fn check_query_plan_depth(plan: &LogicalPlan, limit: usize) -> Result<(), CubeError> {
+    let depth = match logical_plan_depth(plan, limit, &mut HashMap::new()) {
+        Ok(depth) if depth <= limit => return Ok(()),
+        Ok(depth) => depth.to_string(),
+        Err(OverBudget) => format!("more than {}", limit),
+    };
+    Err(CubeError::user(format!(
+        "Query plan is nested too deeply to execute: {} levels against a limit of {}. Reduce the \
+         nesting the query asks for -- chained stages, nested subqueries and expressions all \
+         count -- or raise CUBESTORE_MAX_QUERY_PLAN_DEPTH, together with \
+         CUBESTORE_SELECT_WORKER_STACK_SIZE, which is the stack that has to hold it.",
+        depth, limit
+    )))
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default, Eq, PartialEq)]
+pub struct RowRange {
+    /// Inclusive lower bound.
+    pub start: Option<Row>,
+    /// Exclusive upper bound.
+    pub end: Option<Row>,
+}
+
+impl RowRange {
+    pub fn matches_all_rows(&self) -> bool {
+        self.start.is_none() && self.end.is_none()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Default)]
+pub struct RowFilter {
+    pub or_filters: Vec<RowRange>,
+}
+
+impl RowFilter {
+    pub fn append_or(&mut self, r: RowRange) {
+        if self.matches_all_rows() {
+            return;
+        }
+        if r.matches_all_rows() {
+            self.or_filters.clear();
+            self.or_filters.push(r);
+        } else {
+            self.or_filters.push(r);
+        }
+    }
+
+    pub fn matches_all_rows(&self) -> bool {
+        self.or_filters.len() == 1 && self.or_filters[0].matches_all_rows()
+    }
+}
+
+/// SerializedPlan, but before we actually serialize the LogicalPlan.
+#[derive(Debug)]
+pub struct PreSerializedPlan {
+    logical_plan: LogicalPlan,
+    schema_snapshot: Arc<SchemaSnapshot>,
+    partition_ids_to_execute: Vec<(u64, RowFilter)>,
+    inline_table_ids_to_execute: Vec<InlineTableId>,
+    trace_obj: Option<String>,
+    /// Carried from the configuration the plan was built under, so the check runs at the point
+    /// the plan is encoded rather than wherever the configuration happens to be in reach.
+    max_query_plan_depth: usize,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SerializedPlan {
+    logical_plan: Arc<Vec<u8>>,
+    schema_snapshot: Arc<SchemaSnapshot>,
+    partition_ids_to_execute: Vec<(u64, RowFilter)>,
+    inline_table_ids_to_execute: Vec<InlineTableId>,
+    trace_obj: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SchemaSnapshot {
+    index_snapshots: PlanningMeta,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd)]
+pub struct IndexSnapshot {
+    pub table_path: TablePath,
+    pub index: IdRow<Index>,
+    pub partitions: Vec<PartitionSnapshot>,
+    pub sort_on: Option<Vec<String>>,
+}
+
+impl IndexSnapshot {
+    pub fn table_name(&self) -> String {
+        self.table_path.table_name()
+    }
+
+    pub fn table(&self) -> &IdRow<Table> {
+        &self.table_path.table
+    }
+
+    pub fn index(&self) -> &IdRow<Index> {
+        &self.index
+    }
+
+    pub fn partitions(&self) -> &Vec<PartitionSnapshot> {
+        &self.partitions
+    }
+
+    pub fn sort_on(&self) -> Option<&Vec<String>> {
+        self.sort_on.as_ref()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq, Hash, PartialOrd)]
+pub struct PartitionSnapshot {
+    pub partition: IdRow<Partition>,
+    pub chunks: Vec<IdRow<Chunk>>,
+}
+
+impl PartitionSnapshot {
+    pub fn partition(&self) -> &IdRow<Partition> {
+        &self.partition
+    }
+
+    pub fn chunks(&self) -> &Vec<IdRow<Chunk>> {
+        &self.chunks
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug, Hash, PartialEq, Eq, PartialOrd)]
+pub struct InlineSnapshot {
+    pub id: u64,
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct SerializedLogicalPlan {
+    serialized_bytes: Arc<Vec<u8>>,
+}
+
+pub struct WorkerContext {
+    remote_to_local_names: HashMap<String, String>,
+    worker_partition_ids: Vec<(u64, RowFilter)>,
+    inline_table_ids_to_execute: Vec<InlineTableId>,
+    chunk_id_to_record_batches: HashMap<u64, Vec<RecordBatch>>,
+    parquet_metadata_cache: Arc<dyn ParquetFileReaderFactory>,
+}
+
+fn is_empty_relation(plan: &LogicalPlan) -> Option<DFSchemaRef> {
+    match plan {
+        LogicalPlan::EmptyRelation(EmptyRelation {
+            produce_one_row,
+            schema,
+        }) => {
+            if !produce_one_row {
+                Some(schema.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+impl PreSerializedPlan {
+    fn remove_unused_tables(
+        plan: &LogicalPlan,
+        partition_ids_to_execute: &Vec<(u64, RowFilter)>,
+        inline_tables_to_execute: &Vec<InlineTableId>,
+    ) -> Result<LogicalPlan, CubeError> {
+        debug_assert!(partition_ids_to_execute
+            .iter()
+            .is_sorted_by_key(|(id, _)| id));
+        let res = match plan {
+            LogicalPlan::Projection(Projection {
+                expr,
+                input,
+                schema,
+                ..
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    &input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                if is_empty_relation(&input).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Projection(Projection::try_new_with_schema(
+                        expr.clone(),
+                        Arc::new(input),
+                        schema.clone(),
+                    )?)
+                }
+            }
+            LogicalPlan::Filter(Filter {
+                predicate,
+                input,
+                having,
+                ..
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    &input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                if let Some(schema) = is_empty_relation(&input) {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Filter(if *having {
+                        Filter::try_new_with_having(predicate.clone(), Arc::new(input))
+                    } else {
+                        Filter::try_new(predicate.clone(), Arc::new(input))
+                    }?)
+                }
+            }
+            LogicalPlan::Aggregate(Aggregate {
+                input,
+                group_expr,
+                aggr_expr,
+                schema,
+                ..
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    &input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                LogicalPlan::Aggregate(Aggregate::try_new_with_schema(
+                    Arc::new(input),
+                    group_expr.clone(),
+                    aggr_expr.clone(),
+                    schema.clone(),
+                )?)
+            }
+            LogicalPlan::Sort(Sort { expr, input, fetch }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    &input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                if let Some(schema) = is_empty_relation(&input) {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Sort(Sort {
+                        expr: expr.clone(),
+                        input: Arc::new(input),
+                        fetch: *fetch,
+                    })
+                }
+            }
+            LogicalPlan::Union(Union { inputs, schema }) => {
+                let mut new_inputs: Vec<LogicalPlan> = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    let i = PreSerializedPlan::remove_unused_tables(
+                        &input,
+                        partition_ids_to_execute,
+                        inline_tables_to_execute,
+                    )?;
+                    if !is_empty_relation(&i).is_some() {
+                        new_inputs.push(i);
+                    }
+                }
+
+                let res = match new_inputs.len() {
+                    0 => LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    }),
+                    1 => {
+                        // Union _requires_ 2 or more inputs.
+                        let plan = new_inputs.pop().unwrap();
+                        apply_aliasing_projection_if_necessary(plan, schema)?
+                    }
+                    _ => {
+                        let plan = LogicalPlan::Union(Union::try_new_with_loose_types(
+                            new_inputs.into_iter().map(Arc::new).collect(),
+                        )?);
+                        apply_aliasing_projection_if_necessary(plan, schema)?
+                    }
+                };
+                res
+            }
+            LogicalPlan::TableScan(TableScan {
+                table_name,
+                source,
+                projection,
+                projected_schema,
+                filters,
+                fetch,
+            }) => {
+                let is_empty = if let Some(default_source) =
+                    source.as_any().downcast_ref::<DefaultTableSource>()
+                {
+                    if let Some(table) = default_source
+                        .table_provider
+                        .as_any()
+                        .downcast_ref::<CubeTable>()
+                    {
+                        !table.has_partitions(partition_ids_to_execute)
+                    } else if let Some(table) = default_source
+                        .table_provider
+                        .as_any()
+                        .downcast_ref::<InlineTableProvider>()
+                    {
+                        !table.has_inline_table_id(inline_tables_to_execute)
+                    } else {
+                        return Err(CubeError::internal(
+                            "remove_unused_tables called with unexpected table provider"
+                                .to_string(),
+                        ));
+                    }
+                } else {
+                    return Err(CubeError::internal(
+                        "remove_unused_tables called with unexpected table source".to_string(),
+                    ));
+                };
+                if is_empty {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: projected_schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::TableScan(TableScan {
+                        table_name: table_name.clone(),
+                        source: source.clone(),
+                        projection: projection.clone(),
+                        projected_schema: projected_schema.clone(),
+                        filters: filters.clone(),
+                        fetch: *fetch,
+                    })
+                }
+            }
+            LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row,
+                schema,
+            }) => LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: *produce_one_row,
+                schema: schema.clone(),
+            }),
+            LogicalPlan::Limit(Limit { skip, fetch, input }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                if let Some(schema) = is_empty_relation(&input) {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Limit(Limit {
+                        skip: skip.clone(),
+                        fetch: fetch.clone(),
+                        input: Arc::new(input),
+                    })
+                }
+            }
+            LogicalPlan::Join(Join {
+                left,
+                right,
+                on,
+                filter,
+                join_type,
+                join_constraint,
+                schema,
+                null_equals_null,
+            }) => {
+                let left = PreSerializedPlan::remove_unused_tables(
+                    left,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                let right = PreSerializedPlan::remove_unused_tables(
+                    right,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                LogicalPlan::Join(Join {
+                    left: Arc::new(left),
+                    right: Arc::new(right),
+                    on: on.clone(),
+                    filter: filter.clone(),
+                    join_type: join_type.clone(),
+                    join_constraint: *join_constraint,
+                    schema: schema.clone(),
+                    null_equals_null: *null_equals_null,
+                })
+            }
+            LogicalPlan::Repartition(Repartition {
+                input,
+                partitioning_scheme,
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                if let Some(schema) = is_empty_relation(&input) {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Repartition(Repartition {
+                        input: Arc::new(input),
+                        partitioning_scheme: partitioning_scheme.clone(),
+                    })
+                }
+            }
+            LogicalPlan::Subquery(Subquery {
+                subquery,
+                outer_ref_columns,
+            }) => {
+                let subquery: LogicalPlan = PreSerializedPlan::remove_unused_tables(
+                    subquery,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                if is_empty_relation(&subquery).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: subquery.schema().clone(),
+                    })
+                } else {
+                    LogicalPlan::Subquery(Subquery {
+                        subquery: Arc::new(subquery),
+                        outer_ref_columns: outer_ref_columns.clone(),
+                    })
+                }
+            }
+            LogicalPlan::SubqueryAlias(SubqueryAlias {
+                input,
+                alias,
+                schema,
+                ..
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+
+                if is_empty_relation(&input).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                        Arc::new(input),
+                        alias.clone(),
+                    )?)
+                }
+            }
+            // TODO upgrade DF: Figure out where CrossJoin went.
+            // LogicalPlan::CrossJoin(CrossJoin {
+            //     left,
+            //     right,
+            //     schema,
+            // }) => {
+            //     let left = PreSerializedPlan::remove_unused_tables(
+            //         left,
+            //         partition_ids_to_execute,
+            //         inline_tables_to_execute,
+            //     )?;
+            //     let right = PreSerializedPlan::remove_unused_tables(
+            //         right,
+            //         partition_ids_to_execute,
+            //         inline_tables_to_execute,
+            //     )?;
+
+            //     LogicalPlan::CrossJoin(CrossJoin {
+            //         left: Arc::new(left),
+            //         right: Arc::new(right),
+            //         schema: schema.clone(),
+            //     })
+            // }
+            LogicalPlan::Window(Window {
+                input,
+                window_expr,
+                schema,
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                if is_empty_relation(&input).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Window(Window {
+                        input: Arc::new(input),
+                        window_expr: window_expr.clone(),
+                        schema: schema.clone(),
+                    })
+                }
+            }
+            LogicalPlan::Distinct(Distinct::All(input)) => {
+                let schema = input.schema();
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                if is_empty_relation(&input).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Distinct(Distinct::All(Arc::new(input)))
+                }
+            }
+            LogicalPlan::Distinct(Distinct::On(DistinctOn {
+                on_expr,
+                select_expr,
+                sort_expr,
+                input,
+                schema,
+            })) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                if is_empty_relation(&input).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Distinct(Distinct::On(DistinctOn {
+                        on_expr: on_expr.clone(),
+                        select_expr: select_expr.clone(),
+                        sort_expr: sort_expr.clone(),
+                        input: Arc::new(input),
+                        schema: schema.clone(),
+                    }))
+                }
+            }
+            LogicalPlan::RecursiveQuery(RecursiveQuery {
+                name,
+                static_term,
+                recursive_term,
+                is_distinct,
+            }) => {
+                let static_term = PreSerializedPlan::remove_unused_tables(
+                    static_term,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                let recursive_term = PreSerializedPlan::remove_unused_tables(
+                    recursive_term,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                LogicalPlan::RecursiveQuery(RecursiveQuery {
+                    name: name.clone(),
+                    static_term: Arc::new(static_term),
+                    recursive_term: Arc::new(recursive_term),
+                    is_distinct: *is_distinct,
+                })
+            }
+            LogicalPlan::Values(Values { schema, values }) => LogicalPlan::Values(Values {
+                schema: schema.clone(),
+                values: values.clone(),
+            }),
+            LogicalPlan::Unnest(Unnest {
+                input,
+                exec_columns,
+                list_type_columns,
+                struct_type_columns,
+                dependency_indices,
+                schema,
+                options,
+            }) => {
+                let input = PreSerializedPlan::remove_unused_tables(
+                    input,
+                    partition_ids_to_execute,
+                    inline_tables_to_execute,
+                )?;
+                if is_empty_relation(&input).is_some() {
+                    LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: schema.clone(),
+                    })
+                } else {
+                    LogicalPlan::Unnest(Unnest {
+                        input: Arc::new(input),
+                        exec_columns: exec_columns.clone(),
+                        list_type_columns: list_type_columns.clone(),
+                        struct_type_columns: struct_type_columns.clone(),
+                        dependency_indices: dependency_indices.clone(),
+                        schema: schema.clone(),
+                        options: options.clone(),
+                    })
+                }
+            }
+            LogicalPlan::Extension(Extension { node }) => {
+                if let Some(cluster_send) = node.as_any().downcast_ref::<ClusterSendNode>() {
+                    let ClusterSendNode {
+                        id,
+                        input,
+                        snapshots,
+                        limit_and_reverse,
+                        worker_sort_and_limit,
+                    } = cluster_send;
+                    let input = PreSerializedPlan::remove_unused_tables(
+                        &input,
+                        partition_ids_to_execute,
+                        inline_tables_to_execute,
+                    )?;
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(ClusterSendNode {
+                            id: *id,
+                            input: Arc::new(input),
+                            snapshots: snapshots.clone(),
+                            limit_and_reverse: *limit_and_reverse,
+                            worker_sort_and_limit: worker_sort_and_limit.clone(),
+                        }),
+                    })
+                } else if let Some(panic_worker) = node.as_any().downcast_ref::<PanicWorkerNode>() {
+                    let PanicWorkerNode {} = panic_worker; // (No fields to recurse; just clone the existing Arc `node`.)
+                    LogicalPlan::Extension(Extension { node: node.clone() })
+                } else if let Some(cluster_agg_topk) =
+                    node.as_any().downcast_ref::<ClusterAggregateTopKUpper>()
+                {
+                    let ClusterAggregateTopKUpper {
+                        limit,
+                        input,
+                        order_by,
+                        having_expr,
+                    } = cluster_agg_topk;
+                    let input = PreSerializedPlan::remove_unused_tables(
+                        input,
+                        partition_ids_to_execute,
+                        inline_tables_to_execute,
+                    )?;
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(ClusterAggregateTopKUpper {
+                            limit: *limit,
+                            input: Arc::new(input),
+                            order_by: order_by.clone(),
+                            having_expr: having_expr.clone(),
+                        }),
+                    })
+                } else if let Some(cluster_agg_topk) =
+                    node.as_any().downcast_ref::<ClusterAggregateTopKLower>()
+                {
+                    let ClusterAggregateTopKLower {
+                        input,
+                        group_expr,
+                        aggregate_expr,
+                        schema,
+                        snapshots,
+                    } = cluster_agg_topk;
+                    let input = PreSerializedPlan::remove_unused_tables(
+                        input,
+                        partition_ids_to_execute,
+                        inline_tables_to_execute,
+                    )?;
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(ClusterAggregateTopKLower {
+                            input: Arc::new(input),
+                            group_expr: group_expr.clone(),
+                            aggregate_expr: aggregate_expr.clone(),
+                            schema: schema.clone(),
+                            snapshots: snapshots.clone(),
+                        }),
+                    })
+                } else if let Some(rolling_window) =
+                    node.as_any().downcast_ref::<RollingWindowAggregate>()
+                {
+                    let RollingWindowAggregate {
+                        schema,
+                        input,
+                        dimension,
+                        dimension_alias,
+                        partition_by,
+                        from,
+                        to,
+                        every,
+                        rolling_aggs,
+                        rolling_aggs_alias,
+                        group_by_dimension,
+                        aggs,
+                        lower_bound,
+                        upper_bound,
+                        offset_to_end,
+                    } = rolling_window;
+                    let input = PreSerializedPlan::remove_unused_tables(
+                        input,
+                        partition_ids_to_execute,
+                        inline_tables_to_execute,
+                    )?;
+                    LogicalPlan::Extension(Extension {
+                        node: Arc::new(RollingWindowAggregate {
+                            schema: schema.clone(),
+                            input: Arc::new(input),
+                            dimension: dimension.clone(),
+                            partition_by: partition_by.clone(),
+                            from: from.clone(),
+                            to: to.clone(),
+                            every: every.clone(),
+                            rolling_aggs: rolling_aggs.clone(),
+                            rolling_aggs_alias: rolling_aggs_alias.clone(),
+                            group_by_dimension: group_by_dimension.clone(),
+                            aggs: aggs.clone(),
+                            lower_bound: lower_bound.clone(),
+                            upper_bound: upper_bound.clone(),
+                            dimension_alias: dimension_alias.clone(),
+                            offset_to_end: *offset_to_end,
+                        }),
+                    })
+                } else {
+                    // TODO upgrade DF: Ensure any uture backported plan extensions are implemented.
+                    return Err(CubeError::internal(format!(
+                        "remove_unused_tables not handling Extension case: {:?}",
+                        node
+                    )));
+                }
+            }
+            LogicalPlan::Explain(_)
+            | LogicalPlan::Statement(_)
+            | LogicalPlan::Analyze(_)
+            | LogicalPlan::Dml(_)
+            | LogicalPlan::Ddl(_)
+            | LogicalPlan::Copy(_)
+            | LogicalPlan::DescribeTable(_) => {
+                return Err(CubeError::internal(format!(
+                    "remove_unused_tables not handling case: {}",
+                    pretty_printers::pp_plan(plan)
+                )));
+            } // TODO upgrade DF
+              // SerializedLogicalPlan::CrossJoinAgg {
+              //     left,
+              //     right,
+              //     on,
+              //     join_schema,
+              //     group_expr,
+              //     agg_expr,
+              //     schema,
+              // } => {
+              //     let left =
+              //         left.remove_unused_tables(partition_ids_to_execute, inline_tables_to_execute);
+              //     let right =
+              //         right.remove_unused_tables(partition_ids_to_execute, inline_tables_to_execute);
+
+              //     SerializedLogicalPlan::CrossJoinAgg {
+              //         left: Arc::new(left),
+              //         right: Arc::new(right),
+              //         on: on.clone(),
+              //         join_schema: join_schema.clone(),
+              //         group_expr: group_expr.clone(),
+              //         agg_expr: agg_expr.clone(),
+              //         schema: schema.clone(),
+              //     }
+              // }
+              // SerializedLogicalPlan::RollingWindowAgg {
+              //     schema,
+              //     input,
+              //     dimension,
+              //     partition_by,
+              //     from,
+              //     to,
+              //     every,
+              //     rolling_aggs,
+              //     group_by_dimension,
+              //     aggs,
+              // } => {
+              //     let input =
+              //         input.remove_unused_tables(partition_ids_to_execute, inline_tables_to_execute);
+              //     SerializedLogicalPlan::RollingWindowAgg {
+              //         schema: schema.clone(),
+              //         input: Arc::new(input),
+              //         dimension: dimension.clone(),
+              //         partition_by: partition_by.clone(),
+              //         from: from.clone(),
+              //         to: to.clone(),
+              //         every: every.clone(),
+              //         rolling_aggs: rolling_aggs.clone(),
+              //         group_by_dimension: group_by_dimension.clone(),
+              //         aggs: aggs.clone(),
+              //     }
+              // }
+        };
+        // Now, for this node, we go through every Expr in the node and remove unused tables from the Subquery.
+        // This wraps a LogicalPlan::Subquery node and expects the same result.
+        let res: LogicalPlan = res
+            .map_subqueries(|node: LogicalPlan| {
+                match node {
+                    LogicalPlan::Subquery(Subquery {
+                        subquery,
+                        outer_ref_columns,
+                    }) => {
+                        let subquery: LogicalPlan = PreSerializedPlan::remove_unused_tables(
+                            &subquery,
+                            partition_ids_to_execute,
+                            inline_tables_to_execute,
+                        )?;
+
+                        // We must return a LogicalPlan::Subquery.
+                        Ok(Transformed::yes(LogicalPlan::Subquery(Subquery {
+                            subquery: Arc::new(subquery),
+                            outer_ref_columns,
+                        })))
+                    }
+                    _ => Err(DataFusionError::Internal(
+                        "map_subqueries should pass a subquery node".to_string(),
+                    )),
+                }
+            })?
+            .data;
+        Ok(res)
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub enum SerializedTableSource {
+    CubeTable(CubeTable),
+    InlineTable(InlineTableProvider),
+}
+
+impl PreSerializedPlan {
+    pub fn to_serialized_plan(&self) -> Result<SerializedPlan, CubeError> {
+        check_query_plan_depth(&self.logical_plan, self.max_query_plan_depth)?;
+        let serialized_logical_plan =
+            datafusion_proto::bytes::logical_plan_to_bytes_with_extension_codec(
+                &self.logical_plan,
+                &CubeExtensionCodec {
+                    worker_context: None,
+                },
+            )?;
+        Ok(SerializedPlan {
+            logical_plan: Arc::new(serialized_logical_plan.to_vec()),
+            schema_snapshot: self.schema_snapshot.clone(),
+            partition_ids_to_execute: self.partition_ids_to_execute.clone(),
+            inline_table_ids_to_execute: self.inline_table_ids_to_execute.clone(),
+            trace_obj: self.trace_obj.clone(),
+        })
+    }
+
+    pub fn try_new(
+        plan: LogicalPlan,
+        index_snapshots: PlanningMeta,
+        trace_obj: Option<String>,
+        max_query_plan_depth: usize,
+    ) -> Result<Self, CubeError> {
+        Ok(PreSerializedPlan {
+            logical_plan: plan,
+            schema_snapshot: Arc::new(SchemaSnapshot { index_snapshots }),
+            partition_ids_to_execute: Vec::new(),
+            inline_table_ids_to_execute: Vec::new(),
+            trace_obj,
+            max_query_plan_depth,
+        })
+    }
+
+    pub fn with_partition_id_to_execute(
+        &self,
+        partition_ids_to_execute: Vec<(u64, RowFilter)>,
+        inline_table_ids_to_execute: Vec<InlineTableId>,
+    ) -> Result<Self, CubeError> {
+        let logical_plan = PreSerializedPlan::remove_unused_tables(
+            &self.logical_plan,
+            &partition_ids_to_execute,
+            &inline_table_ids_to_execute,
+        )?;
+        Ok(Self {
+            logical_plan,
+            schema_snapshot: self.schema_snapshot.clone(),
+            partition_ids_to_execute,
+            inline_table_ids_to_execute,
+            trace_obj: self.trace_obj.clone(),
+            max_query_plan_depth: self.max_query_plan_depth,
+        })
+    }
+
+    pub fn replace_logical_plan(&self, logical_plan: LogicalPlan) -> Result<Self, CubeError> {
+        Ok(Self {
+            logical_plan,
+            schema_snapshot: self.schema_snapshot.clone(),
+            partition_ids_to_execute: self.partition_ids_to_execute.clone(),
+            inline_table_ids_to_execute: self.inline_table_ids_to_execute.clone(),
+            trace_obj: self.trace_obj.clone(),
+            max_query_plan_depth: self.max_query_plan_depth,
+        })
+    }
+
+    /// Note: avoid during normal execution, workers must filter the partitions they execute.
+    pub fn all_required_files(&self) -> Vec<(IdRow<Partition>, String, Option<u64>, Option<u64>)> {
+        self.list_files_to_download(|_| true)
+    }
+
+    fn list_files_to_download(
+        &self,
+        include_partition: impl Fn(u64) -> bool,
+    ) -> Vec<(
+        IdRow<Partition>,
+        /* file_name */ String,
+        /* size */ Option<u64>,
+        /* chunk_id */ Option<u64>,
+    )> {
+        let indexes = self.index_snapshots();
+        Self::list_files_to_download_given_index_snapshots(indexes, include_partition)
+    }
+
+    fn list_files_to_download_given_index_snapshots(
+        indexes: &Vec<IndexSnapshot>,
+        include_partition: impl Fn(u64) -> bool,
+    ) -> Vec<(
+        IdRow<Partition>,
+        /* file_name */ String,
+        /* size */ Option<u64>,
+        /* chunk_id */ Option<u64>,
+    )> {
+        let mut files = Vec::new();
+
+        for index in indexes.iter() {
+            for partition in index.partitions() {
+                if !include_partition(partition.partition.get_id()) {
+                    continue;
+                }
+                if let Some(file) = partition
+                    .partition
+                    .get_row()
+                    .get_full_name(partition.partition.get_id())
+                {
+                    files.push((
+                        partition.partition.clone(),
+                        file,
+                        partition.partition.get_row().file_size(),
+                        None,
+                    ));
+                }
+
+                for chunk in partition.chunks() {
+                    if !chunk.get_row().in_memory() {
+                        files.push((
+                            partition.partition.clone(),
+                            chunk.get_row().get_full_name(chunk.get_id()),
+                            chunk.get_row().file_size(),
+                            Some(chunk.get_id()),
+                        ))
+                    }
+                }
+            }
+        }
+
+        files
+    }
+
+    pub fn index_snapshots(&self) -> &Vec<IndexSnapshot> {
+        &self.schema_snapshot.index_snapshots.indices
+    }
+
+    pub fn planning_meta(&self) -> &PlanningMeta {
+        &self.schema_snapshot.index_snapshots
+    }
+
+    pub fn logical_plan(&self) -> &LogicalPlan {
+        &self.logical_plan
+    }
+}
+
+impl SerializedPlan {
+    pub async fn try_new(
+        plan: LogicalPlan,
+        index_snapshots: PlanningMeta,
+        trace_obj: Option<String>,
+    ) -> Result<Self, CubeError> {
+        let serialized_logical_plan =
+            datafusion_proto::bytes::logical_plan_to_bytes_with_extension_codec(
+                &plan,
+                &CubeExtensionCodec {
+                    worker_context: None,
+                },
+            )?;
+        Ok(SerializedPlan {
+            logical_plan: Arc::new(serialized_logical_plan.to_vec()),
+            schema_snapshot: Arc::new(SchemaSnapshot { index_snapshots }),
+            partition_ids_to_execute: Vec::new(),
+            inline_table_ids_to_execute: Vec::new(),
+            trace_obj,
+        })
+    }
+
+    /// `max_query_plan_depth` has to come from the caller's configuration: the router decodes a
+    /// plan and encodes it again per worker, so a budget fixed here would cap every plan that
+    /// goes out to a worker regardless of what the node was configured with.
+    pub fn to_pre_serialized(
+        &self,
+        remote_to_local_names: HashMap<String, String>,
+        chunk_id_to_record_batches: HashMap<u64, Vec<RecordBatch>>,
+        parquet_metadata_cache: Arc<dyn ParquetFileReaderFactory>,
+        max_query_plan_depth: usize,
+    ) -> Result<PreSerializedPlan, CubeError> {
+        let plan = self.logical_plan(
+            remote_to_local_names,
+            chunk_id_to_record_batches,
+            parquet_metadata_cache,
+        )?;
+        Ok(PreSerializedPlan {
+            logical_plan: plan,
+            schema_snapshot: self.schema_snapshot.clone(),
+            partition_ids_to_execute: self.partition_ids_to_execute.clone(),
+            inline_table_ids_to_execute: self.inline_table_ids_to_execute.clone(),
+            trace_obj: self.trace_obj.clone(),
+            max_query_plan_depth,
+        })
+    }
+
+    pub fn logical_plan(
+        &self,
+        remote_to_local_names: HashMap<String, String>,
+        chunk_id_to_record_batches: HashMap<u64, Vec<RecordBatch>>,
+        parquet_metadata_cache: Arc<dyn ParquetFileReaderFactory>,
+    ) -> Result<LogicalPlan, CubeError> {
+        // TODO upgrade DF: We might avoid constructing so many one-time-use SessionContexts.
+
+        // We need registered Cube UDFs and UDAFs (and there are no UDWFs) to deserialize the plan,
+        // but not much else.
+        let session_context = SessionContext::new_with_state(
+            QueryPlannerImpl::minimal_session_state_from_final_config(SessionConfig::new()).build(),
+        );
+
+        let logical_plan = logical_plan_from_bytes_with_extension_codec(
+            self.logical_plan.as_slice(),
+            &session_context,
+            &CubeExtensionCodec {
+                worker_context: Some(WorkerContext {
+                    remote_to_local_names,
+                    worker_partition_ids: self.partition_ids_to_execute.clone(),
+                    inline_table_ids_to_execute: self.inline_table_ids_to_execute.clone(),
+                    chunk_id_to_record_batches,
+                    parquet_metadata_cache,
+                }),
+            },
+        )?;
+        Ok(logical_plan)
+    }
+
+    pub fn trace_obj(&self) -> Option<String> {
+        self.trace_obj.clone()
+    }
+
+    pub fn index_snapshots(&self) -> &Vec<IndexSnapshot> {
+        &self.schema_snapshot.index_snapshots.indices
+    }
+
+    pub fn planning_meta(&self) -> &PlanningMeta {
+        &self.schema_snapshot.index_snapshots
+    }
+
+    pub fn files_to_download(&self) -> Vec<(IdRow<Partition>, String, Option<u64>, Option<u64>)> {
+        let indexes: &Vec<IndexSnapshot> = self.index_snapshots();
+        PreSerializedPlan::list_files_to_download_given_index_snapshots(indexes, |id| {
+            self.partition_ids_to_execute
+                .binary_search_by_key(&id, |(id, _)| *id)
+                .is_ok()
+        })
+    }
+
+    /// One entry per index snapshot that carries a pre-filter: its proto-encoded pushable
+    /// predicate (from `PlanningMeta::pushable_chunk_filters`) paired with the ids of its
+    /// in-memory chunks in executable partitions. Empty when no index carries a pre-filter.
+    /// The worker uses this to trim chunks before IPC.
+    pub fn in_memory_chunk_filter_groups(&self) -> Vec<(Vec<u8>, Vec<u64>)> {
+        let pushable = &self.planning_meta().pushable_chunk_filters;
+        if pushable.iter().all(|p| p.is_none()) {
+            return Vec::new();
+        }
+
+        let executable = |partition: &PartitionSnapshot| {
+            self.partition_ids_to_execute
+                .binary_search_by_key(&partition.partition.get_id(), |(id, _)| *id)
+                .is_ok()
+        };
+
+        // The subprocess shares in-memory batches by chunk id across scans (a self-join or
+        // self-union of one index yields one snapshot per scan, all pointing at the same
+        // chunks). Trimming a shared chunk in place would corrupt the rows seen by a scan
+        // that re-applies a different predicate, or none at all. So count references across
+        // ALL snapshots (predicate-bearing or not) and only pre-filter chunks referenced by
+        // exactly one scan.
+        let mut chunk_counts: HashMap<u64, usize> = HashMap::new();
+        for index in self.index_snapshots().iter() {
+            for partition in index.partitions().iter().filter(|p| executable(p)) {
+                for chunk in partition.chunks() {
+                    if chunk.get_row().in_memory() {
+                        *chunk_counts.entry(chunk.get_id()).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        let mut groups = Vec::new();
+        for (idx, index) in self.index_snapshots().iter().enumerate() {
+            let Some(bytes) = pushable.get(idx).and_then(|p| p.as_ref()) else {
+                continue;
+            };
+            let mut chunk_ids = Vec::new();
+            for partition in index.partitions().iter().filter(|p| executable(p)) {
+                for chunk in partition.chunks() {
+                    if chunk.get_row().in_memory() && chunk_counts.get(&chunk.get_id()) == Some(&1)
+                    {
+                        chunk_ids.push(chunk.get_id());
+                    }
+                }
+            }
+            if !chunk_ids.is_empty() {
+                groups.push((bytes.clone(), chunk_ids));
+            }
+        }
+        groups
+    }
+
+    pub fn in_memory_chunks_to_load(&self) -> Vec<(IdRow<Chunk>, IdRow<Partition>, IdRow<Index>)> {
+        self.list_in_memory_chunks_to_load(|id| {
+            self.partition_ids_to_execute
+                .binary_search_by_key(&id, |(id, _)| *id)
+                .is_ok()
+        })
+    }
+
+    fn list_in_memory_chunks_to_load(
+        &self,
+        include_partition: impl Fn(u64) -> bool,
+    ) -> Vec<(IdRow<Chunk>, IdRow<Partition>, IdRow<Index>)> {
+        let indexes = self.index_snapshots();
+
+        let mut chunk_ids = Vec::new();
+
+        for index in indexes.iter() {
+            for partition in index.partitions() {
+                if !include_partition(partition.partition.get_id()) {
+                    continue;
+                }
+
+                for chunk in partition.chunks() {
+                    if chunk.get_row().in_memory() {
+                        chunk_ids.push((
+                            chunk.clone(),
+                            partition.partition.clone(),
+                            index.index.clone(),
+                        ));
+                    }
+                }
+            }
+        }
+
+        chunk_ids
+    }
+
+    pub fn is_data_select_query<'a>(plan: &'a LogicalPlan) -> bool {
+        struct Visitor {
+            seen_data_scans: bool,
+        }
+        impl<'n> TreeNodeVisitor<'n> for Visitor {
+            type Node = LogicalPlan;
+
+            fn f_down(
+                &mut self,
+                plan: &'n Self::Node,
+            ) -> datafusion::common::Result<TreeNodeRecursion> {
+                if let LogicalPlan::TableScan(TableScan {
+                    source, table_name, ..
+                }) = plan
+                {
+                    let table_provider = &source
+                        .as_any()
+                        .downcast_ref::<DefaultTableSource>()
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "Non DefaultTableSource source found for {}",
+                                table_name
+                            ))
+                        })?
+                        .table_provider;
+                    if table_provider
+                        .as_any()
+                        .downcast_ref::<InfoSchemaTableProvider>()
+                        .is_none()
+                        && table_provider
+                            .as_any()
+                            .downcast_ref::<InfoSchemaQueryCacheTableProvider>()
+                            .is_none()
+                    {
+                        self.seen_data_scans = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            }
+
+            fn f_up(
+                &mut self,
+                _node: &'n Self::Node,
+            ) -> datafusion::common::Result<TreeNodeRecursion> {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        }
+
+        let mut v = Visitor {
+            seen_data_scans: false,
+        };
+        plan.visit(&mut v).expect("no failures possible");
+        return v.seen_data_scans;
+    }
+}
+
+impl Debug for CubeExtensionCodec {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "CubeExtensionCodec")
+    }
+}
+
+struct CubeExtensionCodec {
+    worker_context: Option<WorkerContext>,
+}
+
+impl LogicalExtensionCodec for CubeExtensionCodec {
+    fn try_decode(
+        &self,
+        buf: &[u8],
+        inputs: &[LogicalPlan],
+        ctx: &SessionContext,
+    ) -> datafusion::common::Result<Extension> {
+        use serde::Deserialize;
+        let r = flexbuffers::Reader::get_root(buf)
+            .map_err(|e| DataFusionError::Execution(format!("try_decode: {}", e)))?;
+        let serialized = ExtensionNodeSerialized::deserialize(r)
+            .map_err(|e| DataFusionError::Execution(format!("try_decode: {}", e)))?;
+        Ok(Extension {
+            node: match serialized {
+                ExtensionNodeSerialized::ClusterSend(serialized) => {
+                    Arc::new(ClusterSendNode::from_serialized(inputs, serialized))
+                }
+                ExtensionNodeSerialized::PanicWorker(serialized) => {
+                    Arc::new(PanicWorkerNode::from_serialized(inputs, serialized))
+                }
+                ExtensionNodeSerialized::RollingWindowAggregate(serialized) => Arc::new(
+                    RollingWindowAggregate::from_serialized(serialized, inputs, ctx)?,
+                ),
+                ExtensionNodeSerialized::ClusterAggregateTopKUpper(serialized) => Arc::new(
+                    ClusterAggregateTopKUpper::from_serialized(serialized, inputs, ctx)?,
+                ),
+                ExtensionNodeSerialized::ClusterAggregateTopKLower(serialized) => Arc::new(
+                    ClusterAggregateTopKLower::from_serialized(serialized, inputs, ctx)?,
+                ),
+            },
+        })
+    }
+
+    fn try_encode(&self, node: &Extension, buf: &mut Vec<u8>) -> datafusion::common::Result<()> {
+        use serde::Serialize;
+        let mut ser = flexbuffers::FlexbufferSerializer::new();
+        let to_serialize = if let Some(cluster_send) =
+            node.node.as_any().downcast_ref::<ClusterSendNode>()
+        {
+            ExtensionNodeSerialized::ClusterSend(cluster_send.to_serialized())
+        } else if let Some(panic_worker) = node.node.as_any().downcast_ref::<PanicWorkerNode>() {
+            ExtensionNodeSerialized::PanicWorker(panic_worker.to_serialized())
+        } else if let Some(rolling_window_aggregate) =
+            node.node.as_any().downcast_ref::<RollingWindowAggregate>()
+        {
+            ExtensionNodeSerialized::RollingWindowAggregate(
+                rolling_window_aggregate.to_serialized()?,
+            )
+        } else if let Some(topk_aggregate) = node
+            .node
+            .as_any()
+            .downcast_ref::<ClusterAggregateTopKUpper>()
+        {
+            ExtensionNodeSerialized::ClusterAggregateTopKUpper(topk_aggregate.to_serialized()?)
+        } else if let Some(topk_aggregate) = node
+            .node
+            .as_any()
+            .downcast_ref::<ClusterAggregateTopKLower>()
+        {
+            ExtensionNodeSerialized::ClusterAggregateTopKLower(topk_aggregate.to_serialized()?)
+        } else {
+            todo!("{:?}", node)
+        };
+        to_serialize
+            .serialize(&mut ser)
+            .map_err(|e| DataFusionError::Execution(format!("try_encode: {}", e)))?;
+        buf.extend(ser.take_buffer());
+        Ok(())
+    }
+
+    fn try_decode_table_provider(
+        &self,
+        buf: &[u8],
+        _table_ref: &TableReference,
+        _schema: SchemaRef,
+        _ctx: &SessionContext,
+    ) -> datafusion::common::Result<Arc<dyn TableProvider>> {
+        use serde::Deserialize;
+        let r = flexbuffers::Reader::get_root(buf)
+            .map_err(|e| DataFusionError::Execution(format!("try_decode_table_provider: {}", e)))?;
+        let serialized = SerializedTableProvider::deserialize(r)
+            .map_err(|e| DataFusionError::Execution(format!("try_decode_table_provider: {}", e)))?;
+        let provider: Arc<dyn TableProvider> = match serialized {
+            SerializedTableProvider::CubeTable(table) => {
+                let worker_context = self
+                    .worker_context
+                    .as_ref()
+                    .expect("WorkerContext isn't set for try_decode_table_provider");
+                Arc::new(table.to_worker_table(
+                    worker_context.remote_to_local_names.clone(),
+                    worker_context.worker_partition_ids.clone(),
+                    worker_context.chunk_id_to_record_batches.clone(),
+                    worker_context.parquet_metadata_cache.clone(),
+                ))
+            }
+            SerializedTableProvider::CubeTableLogical(logical) => Arc::new(logical),
+            SerializedTableProvider::InlineTableProvider(inline) => {
+                let worker_context = self
+                    .worker_context
+                    .as_ref()
+                    .expect("WorkerContext isn't set for try_decode_table_provider");
+                Arc::new(inline.to_worker_table(worker_context.inline_table_ids_to_execute.clone()))
+            }
+        };
+        Ok(provider)
+    }
+
+    fn try_encode_table_provider(
+        &self,
+        table_ref: &TableReference,
+        node: Arc<dyn TableProvider>,
+        buf: &mut Vec<u8>,
+    ) -> datafusion::common::Result<()> {
+        let to_serialize = if let Some(cube_table) = node.as_any().downcast_ref::<CubeTable>() {
+            SerializedTableProvider::CubeTable(cube_table.clone())
+        } else if let Some(cube_table_logical) = node.as_any().downcast_ref::<CubeTableLogical>() {
+            SerializedTableProvider::CubeTableLogical(cube_table_logical.clone())
+        } else if let Some(inline_table) = node.as_any().downcast_ref::<InlineTableProvider>() {
+            SerializedTableProvider::InlineTableProvider(inline_table.clone())
+        } else {
+            return Err(DataFusionError::Execution(format!(
+                "Can't encode table provider for {}",
+                table_ref
+            )));
+        };
+
+        use serde::Serialize;
+        let mut ser = flexbuffers::FlexbufferSerializer::new();
+        to_serialize
+            .serialize(&mut ser)
+            .map_err(|e| DataFusionError::Execution(format!("try_encode_table_provider: {}", e)))?;
+        buf.extend(ser.take_buffer());
+        Ok(())
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub enum SerializedTableProvider {
+    CubeTable(CubeTable),
+    CubeTableLogical(CubeTableLogical),
+    InlineTableProvider(InlineTableProvider),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::logical_expr::{col, lit, LogicalPlanBuilder};
+
+    use crate::config::DEFAULT_MAX_QUERY_PLAN_DEPTH as DEFAULT_LIMIT;
+
+    /// The shape Cube Store gets from a chain of multi-stage stages: a CTE body inlined at each
+    /// reference, so one stage becomes a projection under a subquery alias.
+    fn chained_stage_plan(stages: usize) -> LogicalPlan {
+        let mut builder = LogicalPlanBuilder::values(vec![vec![lit(1i64)]]).unwrap();
+        for stage in 0..stages {
+            builder = builder
+                .project(vec![col("column1")])
+                .unwrap()
+                .alias(format!("stage_{}", stage))
+                .unwrap();
+        }
+        builder.build().unwrap()
+    }
+
+    fn pre_serialized_with_limit(plan: LogicalPlan, limit: usize) -> PreSerializedPlan {
+        PreSerializedPlan::try_new(
+            plan,
+            PlanningMeta {
+                indices: Vec::new(),
+                multi_part_subtree: HashMap::new(),
+                pushable_chunk_filters: Vec::new(),
+            },
+            None,
+            limit,
+        )
+        .unwrap()
+    }
+
+    fn pre_serialized(plan: LogicalPlan) -> PreSerializedPlan {
+        PreSerializedPlan::try_new(
+            plan,
+            PlanningMeta {
+                indices: Vec::new(),
+                multi_part_subtree: HashMap::new(),
+                pushable_chunk_filters: Vec::new(),
+            },
+            None,
+            DEFAULT_LIMIT,
+        )
+        .unwrap()
+    }
+
+    /// The stack the budget is sized against: the select worker's default
+    /// (`CUBESTORE_SELECT_WORKER_STACK_SIZE`). A debug build spends several times more stack per
+    /// level, so only a release run holds the budget to its claim.
+    #[cfg(not(debug_assertions))]
+    const WORKER_STACK: usize = 4 * 1024 * 1024;
+    #[cfg(debug_assertions)]
+    const WORKER_STACK: usize = 32 * 1024 * 1024;
+
+    /// Depth of a plan that is known to be inside the budget, so the walk cannot bail.
+    fn depth_of(plan: &LogicalPlan) -> usize {
+        logical_plan_depth(plan, DEFAULT_LIMIT, &mut HashMap::new())
+            .unwrap_or_else(|OverBudget| panic!("plan unexpectedly past the budget"))
+    }
+
+    fn on_a_worker_stack<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(WORKER_STACK)
+            .spawn(f)
+            .unwrap()
+            .join()
+            .expect("serialization must not exhaust the stack")
+    }
+
+    fn roundtrip(plan: &LogicalPlan) -> Result<LogicalPlan, CubeError> {
+        let serialized = pre_serialized(plan.clone()).to_serialized_plan()?;
+        Ok(serialized.logical_plan(
+            HashMap::new(),
+            HashMap::new(),
+            crate::queryplanner::metadata_cache::NoopParquetMetadataCache::new(),
+        )?)
+    }
+
+    /// A plan of exactly the budget is served all the way through the roundtrip. The boundary is
+    /// the budget itself, not one short of it, and this is the deepest plan the budget admits,
+    /// so it is the one whose decoding has to fit the smallest stack that decodes.
+    ///
+    /// It also nests the encoding far past prost's own 100-level decode budget, which is what
+    /// used to refuse it.
+    #[test]
+    fn plan_at_the_depth_limit_survives_the_serialization_roundtrip() {
+        let plan = chained_stage_plan(74); // the values leaf plus 2 nodes a stage
+        assert_eq!(depth_of(&plan), DEFAULT_LIMIT);
+        let decoded = on_a_worker_stack(move || roundtrip(&plan)).unwrap();
+        assert_eq!(
+            format!("{}", decoded.display_indent()).lines().count(),
+            149,
+            "the decoded plan must be the one that was encoded"
+        );
+    }
+
+    /// Physical planning and execution recurse per node on the same stack as decoding, so a plan
+    /// at the budget has to survive all of it, not just the decode.
+    #[test]
+    fn a_plan_at_the_depth_limit_executes_on_a_worker_stack() {
+        let plan = chained_stage_plan(74);
+        assert_eq!(depth_of(&plan), DEFAULT_LIMIT);
+
+        let rows = on_a_worker_stack(move || {
+            let decoded = roundtrip(&plan)?;
+            let context = SessionContext::new_with_state(
+                QueryPlannerImpl::minimal_session_state_from_final_config(SessionConfig::new())
+                    .build(),
+            );
+            let state = context.state();
+            let physical = futures::executor::block_on(
+                state.query_planner().create_physical_plan(&decoded, &state),
+            )?;
+            let batches = futures::executor::block_on(datafusion::physical_plan::collect(
+                physical,
+                state.task_ctx(),
+            ))?;
+            Ok::<_, CubeError>(batches.iter().map(|b| b.num_rows()).sum::<usize>())
+        })
+        .expect("a plan at the budget must plan and execute, not just decode");
+        assert_eq!(rows, 1);
+    }
+
+    /// A raised budget has to survive the trip the router takes: it decodes the plan it just
+    /// encoded and encodes it again for each worker, so a budget that did not come along would
+    /// cap every dispatched plan at the default no matter what the node was configured with.
+    #[test]
+    fn a_raised_budget_survives_the_router_round_trip() {
+        let raised = DEFAULT_LIMIT * 2;
+        let plan = chained_stage_plan(100); // 201 levels: past the default, inside the raised one
+        assert!(depth_of(&plan) > DEFAULT_LIMIT);
+
+        let dispatched = on_a_worker_stack(move || {
+            let serialized = pre_serialized_with_limit(plan, raised).to_serialized_plan()?;
+            serialized
+                .to_pre_serialized(
+                    HashMap::new(),
+                    HashMap::new(),
+                    crate::queryplanner::metadata_cache::NoopParquetMetadataCache::new(),
+                    raised,
+                )?
+                .to_serialized_plan()
+        });
+        assert!(
+            dispatched.is_ok(),
+            "a plan inside the raised budget must still be dispatched, got: {:?}",
+            dispatched.err()
+        );
+    }
+
+    /// Past the budget the query has to be refused with depth named, rather than crash the node
+    /// somewhere inside the protobuf recursion.
+    #[test]
+    fn plan_over_the_depth_limit_names_depth() {
+        let plan = chained_stage_plan(75);
+        let depth = depth_of(&plan);
+        assert!(depth > DEFAULT_LIMIT);
+        let err = on_a_worker_stack(move || pre_serialized(plan).to_serialized_plan())
+            .map(|_| ())
+            .expect_err("a plan past the depth limit must not be serialized");
+
+        let message = err.to_string();
+        assert!(
+            message.contains(&format!(
+                "{} levels against a limit of {}",
+                depth, DEFAULT_LIMIT
+            )),
+            "message must name the depth reached and the budget, got: {}",
+            message
+        );
+        assert!(
+            message.contains("CUBESTORE_MAX_QUERY_PLAN_DEPTH"),
+            "message must name the knob that raises the budget, got: {}",
+            message
+        );
+        assert_eq!(
+            err.cause,
+            crate::CubeErrorCauseType::User,
+            "a query the user has to flatten is not an internal error"
+        );
+    }
+
+    /// A nested expression nests the encoding the same way a chain of plan nodes does, on a
+    /// plan of two nodes that counting nodes alone reads as trivially shallow. Nothing bounds
+    /// the decoding of it any more, so the budget has to.
+    ///
+    /// The operator has to alternate: a run of one operator is linearized into a single node.
+    #[test]
+    fn depth_counts_nested_expressions() {
+        let mut deep = col("column1");
+        for level in 0..DEFAULT_LIMIT {
+            deep = if level % 2 == 0 {
+                deep + lit(1i64)
+            } else {
+                deep * lit(2i64)
+            };
+        }
+        let plan = LogicalPlanBuilder::values(vec![vec![lit(1i64)]])
+            .unwrap()
+            .project(vec![deep.alias("deep")])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(plan.inputs().len(), 1);
+
+        let err = on_a_worker_stack(move || pre_serialized(plan).to_serialized_plan())
+            .map(|_| ())
+            .expect_err("an expression past the depth limit must not be serialized");
+        assert!(
+            err.to_string().contains("nested too deeply to execute"),
+            "message must name depth as the cause, got: {}",
+            err
+        );
+    }
+
+    /// A filter over many values renders as one long `OR` run, which the encoding linearizes
+    /// into a single node. Counting each of them would refuse a query that encodes flat.
+    #[test]
+    fn a_long_run_of_one_operator_is_one_level() {
+        let mut chain = col("column1").eq(lit(0i64));
+        for value in 1..(DEFAULT_LIMIT * 4) {
+            chain = chain.or(col("column1").eq(lit(value as i64)));
+        }
+        let plan = LogicalPlanBuilder::values(vec![vec![lit(1i64)]])
+            .unwrap()
+            .filter(chain)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert!(
+            depth_of(&plan) <= DEFAULT_LIMIT,
+            "a linearized run must not count as one level apiece, got depth {}",
+            depth_of(&plan)
+        );
+        on_a_worker_stack(move || pre_serialized(plan).to_serialized_plan())
+            .expect("a query that encodes flat must not be refused");
+    }
+
+    /// The walk that measures depth recurses once per level of subquery nesting, so it has to
+    /// stay inside the budget it is taken for: measuring a plan must not be what overflows the
+    /// stack. Far past anything the parser would admit, to pin the bound rather than the parser.
+    #[test]
+    fn measuring_a_deeply_nested_subquery_reports_rather_than_overflows() {
+        let mut plan = LogicalPlanBuilder::values(vec![vec![lit(1i64)]])
+            .unwrap()
+            .build()
+            .unwrap();
+        for _ in 0..5_000 {
+            plan = LogicalPlanBuilder::values(vec![vec![lit(1i64)]])
+                .unwrap()
+                .project(vec![Expr::ScalarSubquery(Subquery {
+                    subquery: Arc::new(plan),
+                    outer_ref_columns: vec![],
+                })
+                .alias("nested")])
+                .unwrap()
+                .build()
+                .unwrap();
+        }
+
+        let err = on_a_worker_stack(move || pre_serialized(plan).to_serialized_plan())
+            .map(|_| ())
+            .expect_err("a plan this deeply nested must not be serialized");
+        assert!(
+            err.to_string()
+                .contains(&format!("more than {} levels", DEFAULT_LIMIT)),
+            "message must say the plan is past the budget without claiming an exact depth, \
+             got: {}",
+            err
+        );
+    }
+
+    /// Subqueries carried in expressions are separate plans that nest the encoding just as
+    /// deep, so counting plan inputs alone would let them through.
+    #[test]
+    fn depth_counts_subqueries_in_expressions() {
+        let plan = LogicalPlanBuilder::values(vec![vec![lit(1i64)]])
+            .unwrap()
+            .filter(Expr::Exists(Exists::new(
+                Subquery {
+                    subquery: Arc::new(chained_stage_plan(DEFAULT_LIMIT)),
+                    outer_ref_columns: vec![],
+                },
+                false,
+            )))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(plan.inputs().len(), 1);
+
+        let err = on_a_worker_stack(move || pre_serialized(plan).to_serialized_plan())
+            .map(|_| ())
+            .expect_err("a subquery past the depth limit must not be serialized");
+        assert!(
+            err.to_string().contains("nested too deeply to execute"),
+            "message must name depth as the cause, got: {}",
+            err
+        );
+    }
+}

@@ -1,0 +1,33 @@
+{
+  "compilerOptions": {
+    "baseUrl": "./",
+    "outDir": "../../out-tsc/lib",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "inlineSources": true,
+    "experimentalDecorators": true,
+    "importHelpers": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": false,
+    "types": [],
+    "target": "es2022",
+    "module": "esnext",
+    "useDefineForClassFields": false,
+    "lib": [
+      "es2022",
+      "dom"
+    ],
+    "paths": {
+      "@angular/*": ["./node_modules/@angular/*"],
+      "@cubejs-client/core": ["../cubejs-client-core"]
+    }
+  },
+  "angularCompilerOptions": {
+    "strictInjectionParameters": true,
+    "preserveSymlinks": true
+  },
+  "exclude": ["src/test.ts", "**/*.spec.ts"],
+  "include": ["index.ts", "src/*"]
+}

@@ -1,0 +1,699 @@
+use super::{QueryDateTimeHelper, SqlInterval};
+use chrono::prelude::*;
+use chrono::Duration;
+use chrono_tz::Tz;
+use cubenativeutils::CubeError;
+use std::cmp::Ord;
+use std::str::FromStr;
+
+#[derive(Clone, PartialEq, PartialOrd, Eq, Ord, Debug)]
+pub struct QueryDateTime {
+    date_time: DateTime<Tz>,
+}
+
+const MIDNIGHT: NaiveTime = NaiveTime::MIN;
+
+impl ToString for QueryDateTime {
+    fn to_string(&self) -> String {
+        self.default_format()
+    }
+}
+
+/// The marker an interval carries when its side reaches without limit.
+pub const UNBOUNDED_INTERVAL: &str = "unbounded";
+
+/// `date` moved by `interval` on the wall clock, or `None` for an `unbounded`
+/// side — which no date states. A side with no interval keeps the date as it is.
+///
+/// Wall clock rather than absolute time because this is what SQL interval
+/// arithmetic over a naive local timestamp does, and where a series places its
+/// own points; across a daylight-saving transition the two differ by the offset.
+pub fn shift_bound_wall_clock(
+    tz: Tz,
+    date: &str,
+    interval: &Option<String>,
+    subtract: bool,
+) -> Result<Option<String>, CubeError> {
+    let interval = match interval.as_deref() {
+        Some(UNBOUNDED_INTERVAL) => return Ok(None),
+        Some(interval) => SqlInterval::from_str(interval)?,
+        None => return Ok(Some(date.to_string())),
+    };
+    let interval = if subtract {
+        interval.inverse()
+    } else {
+        interval
+    };
+    Ok(Some(
+        QueryDateTime::from_date_str(tz, date)?
+            .add_interval_wall_clock(&interval)?
+            .default_format(),
+    ))
+}
+
+impl QueryDateTime {
+    pub fn new(date_time: DateTime<Tz>) -> QueryDateTime {
+        QueryDateTime { date_time }
+    }
+    pub fn now(tz: Tz) -> Result<QueryDateTime, CubeError> {
+        let local = Local::now().naive_local();
+        Self::from_local_date_time(tz, local)
+    }
+    pub fn from_date_str(tz: Tz, date: &str) -> Result<Self, CubeError> {
+        let local_dt = QueryDateTimeHelper::parse_native_date_time(date)?;
+        Self::from_local_date_time(tz, local_dt)
+    }
+
+    pub fn from_local_date_time(tz: Tz, date: NaiveDateTime) -> Result<Self, CubeError> {
+        let date_time =
+            QueryDateTimeHelper::resolve_local_result(&tz, &date, tz.from_local_datetime(&date))?;
+        Ok(Self { date_time })
+    }
+
+    /// Start of the given predefined granularity containing this instant, on the local wall clock.
+    ///
+    /// A midnight that a DST gap swallows resolves to whatever instant the gap pushes it to; that
+    /// instant is still the start of its day.
+    pub fn start_of(&self, granularity: &str) -> Result<Self, CubeError> {
+        let dt = self.naive_local();
+        let date = dt.date();
+        let time = dt.time();
+
+        let (start_date, start_time) = match granularity {
+            "year" => (NaiveDate::from_ymd_opt(date.year(), 1, 1), Some(MIDNIGHT)),
+            "quarter" => (
+                NaiveDate::from_ymd_opt(date.year(), date.month() - (date.month() - 1) % 3, 1),
+                Some(MIDNIGHT),
+            ),
+            "month" => (
+                NaiveDate::from_ymd_opt(date.year(), date.month(), 1),
+                Some(MIDNIGHT),
+            ),
+            "week" => (
+                Some(date - Duration::days(date.weekday().num_days_from_monday() as i64)),
+                Some(MIDNIGHT),
+            ),
+            "day" => (Some(date), Some(MIDNIGHT)),
+            "hour" => (Some(date), NaiveTime::from_hms_opt(time.hour(), 0, 0)),
+            "minute" => (
+                Some(date),
+                NaiveTime::from_hms_opt(time.hour(), time.minute(), 0),
+            ),
+            "second" => (
+                Some(date),
+                NaiveTime::from_hms_opt(time.hour(), time.minute(), time.second()),
+            ),
+            other => {
+                return Err(CubeError::internal(format!(
+                    "Unexpected granularity '{other}' in date alignment check"
+                )))
+            }
+        };
+
+        let (start_date, start_time) = start_date.zip(start_time).ok_or_else(|| {
+            CubeError::internal(format!("Failed to build start of {granularity} for {dt}"))
+        })?;
+
+        Self::from_local_date_time(
+            self.date_time.timezone(),
+            NaiveDateTime::new(start_date, start_time),
+        )
+    }
+
+    /// Whether this instant is the first one of the given predefined granularity.
+    pub fn is_start_of(&self, granularity: &str) -> Result<bool, CubeError> {
+        Ok(self.start_of(granularity)?.naive_local() == self.naive_local())
+    }
+
+    /// How far this instant sits past the start of the given predefined granularity, as a calendar
+    /// interval rather than a duration. Sub-second parts are dropped.
+    pub fn offset_from_start_of(&self, granularity: &str) -> Result<SqlInterval, CubeError> {
+        let dt = self.naive_local();
+
+        let (month, day) = match granularity {
+            "year" => (dt.month() as i32 - 1, dt.day() as i32 - 1),
+            "quarter" => ((dt.month() as i32 - 1) % 3, dt.day() as i32 - 1),
+            "month" => (0, dt.day() as i32 - 1),
+            "week" => (0, dt.weekday().num_days_from_monday() as i32),
+            "day" | "hour" | "minute" | "second" => (0, 0),
+            other => {
+                return Err(CubeError::internal(format!(
+                    "Unexpected granularity '{other}' in date alignment check"
+                )))
+            }
+        };
+
+        let (hour, minute, second) = match granularity {
+            "hour" => (0, dt.minute(), dt.second()),
+            "minute" => (0, 0, dt.second()),
+            "second" => (0, 0, 0),
+            _ => (dt.hour(), dt.minute(), dt.second()),
+        };
+
+        Ok(SqlInterval::new(
+            0,
+            0,
+            month,
+            0,
+            day,
+            hour as i32,
+            minute as i32,
+            second as i32,
+        ))
+    }
+
+    pub fn month(&self) -> u32 {
+        self.date_time.month()
+    }
+
+    pub fn day(&self) -> u32 {
+        self.date_time.day()
+    }
+
+    pub fn nanosecond(&self) -> u32 {
+        self.date_time.nanosecond()
+    }
+
+    pub fn date_time(&self) -> DateTime<Tz> {
+        self.date_time
+    }
+
+    pub fn naive_local(&self) -> NaiveDateTime {
+        self.date_time.naive_local()
+    }
+
+    pub fn naive_utc(&self) -> NaiveDateTime {
+        self.date_time.naive_utc()
+    }
+
+    pub fn format(&self, format: &str) -> String {
+        self.date_time.format(format).to_string()
+    }
+
+    pub fn default_format(&self) -> String {
+        self.date_time.format("%Y-%m-%dT%H:%M:%S%.3f").to_string()
+    }
+
+    pub fn add_interval(&self, interval: &SqlInterval) -> Result<Self, CubeError> {
+        // For time-only intervals (hour, minute, second), use UTC arithmetic to avoid DST issues
+        let is_time_only = interval.year == 0
+            && interval.quarter == 0
+            && interval.month == 0
+            && interval.week == 0
+            && interval.day == 0;
+
+        if is_time_only {
+            // Use UTC-based arithmetic for time intervals
+            let duration = Duration::hours(interval.hour as i64)
+                + Duration::minutes(interval.minute as i64)
+                + Duration::seconds(interval.second as i64);
+            let new_datetime = self.date_time + duration;
+            return Ok(Self::new(new_datetime));
+        }
+
+        // For date-based intervals, use local time arithmetic
+        let date = self.naive_local().date();
+
+        // Step 1: add years and months with fallback logic. A quarter is three
+        // months — `SqlInterval` keeps it in a field of its own and never folds
+        // it in, so anything reading `month` alone would drop it silently.
+        let mut year = date.year() + interval.year;
+        let mut month = date.month() as i32 + interval.quarter * 3 + interval.month;
+
+        while month > 12 {
+            year += 1;
+            month -= 12;
+        }
+        while month < 1 {
+            year -= 1;
+            month += 12;
+        }
+
+        let day = date.day();
+        // Adjust for overflowed day in shorter months (e.g. Feb 30 → Feb 28)
+        let adjusted_date = NaiveDate::from_ymd_opt(year, month as u32, day)
+            .or_else(|| {
+                (1..=31)
+                    .rev()
+                    .find_map(|d| NaiveDate::from_ymd_opt(year, month as u32, d))
+            })
+            .ok_or_else(|| {
+                CubeError::internal(format!(
+                    "Failed to compute valid date while adding interval {:?} to date {}",
+                    interval, self.date_time
+                ))
+            })?;
+
+        // Step 2: Add weeks and days
+        let adjusted_date =
+            adjusted_date + Duration::days(interval.week as i64 * 7 + interval.day as i64);
+
+        // Step 3: Recombine with original time
+        let time = self.naive_local().time();
+        let mut naive = NaiveDateTime::new(adjusted_date, time);
+
+        // Step 4: Add time-based parts
+        naive = naive
+            + Duration::hours(interval.hour as i64)
+            + Duration::minutes(interval.minute as i64)
+            + Duration::seconds(interval.second as i64);
+
+        Self::from_local_date_time(self.date_time.timezone(), naive)
+    }
+
+    /// `add_interval`, but a time-only interval moves the wall clock rather
+    /// than the instant. An hour of interval is an hour of the clock, the way
+    /// a series places its points and the way SQL interval arithmetic reads it;
+    /// across a daylight-saving transition the two differ by the offset.
+    pub fn add_interval_wall_clock(&self, interval: &SqlInterval) -> Result<Self, CubeError> {
+        let carries_date = interval.year != 0
+            || interval.quarter != 0
+            || interval.month != 0
+            || interval.week != 0
+            || interval.day != 0;
+        if carries_date {
+            return self.add_interval(interval);
+        }
+        self.add_duration(
+            Duration::hours(interval.hour as i64)
+                + Duration::minutes(interval.minute as i64)
+                + Duration::seconds(interval.second as i64),
+        )
+    }
+
+    pub fn sub_interval(&self, interval: &SqlInterval) -> Result<Self, CubeError> {
+        self.add_interval(&interval.inverse())
+    }
+
+    pub fn add_duration(&self, duration: Duration) -> Result<Self, CubeError> {
+        let mut native = self.naive_local();
+        native += duration;
+        Self::from_local_date_time(self.date_time.timezone(), native)
+    }
+
+    pub fn granularity(&self) -> String {
+        let time = self.date_time.time();
+
+        let weekday = self.date_time.weekday();
+        let is_zero_time = |t: chrono::NaiveTime| {
+            t.hour() == 0 && t.minute() == 0 && t.second() == 0 && t.nanosecond() == 0
+        };
+
+        if self.date_time.month() == 1 && self.date_time.day() == 1 && is_zero_time(time) {
+            "year".to_string()
+        } else if self.date_time.day() == 1 && is_zero_time(time) {
+            "month".to_string()
+        } else if weekday == Weekday::Mon && is_zero_time(time) {
+            "week".to_string()
+        } else if is_zero_time(time) {
+            "day".to_string()
+        } else if time.minute() == 0 && time.second() == 0 && time.nanosecond() == 0 {
+            "hour".to_string()
+        } else if time.second() == 0 && time.nanosecond() == 0 {
+            "minute".to_string()
+        } else if time.nanosecond() == 0 {
+            "second".to_string()
+        } else {
+            "second".to_string()
+        }
+    }
+
+    pub fn align_to_origin(
+        &self,
+        origin: &Self,
+        interval: &SqlInterval,
+    ) -> Result<Self, CubeError> {
+        let mut aligned = self.clone();
+        let mut offset = origin.clone();
+
+        if self < origin {
+            while &offset > self {
+                offset = offset.sub_interval(interval)?;
+            }
+            aligned = offset;
+        } else {
+            while &offset < self {
+                aligned = offset.clone();
+                offset = offset.add_interval(interval)?;
+            }
+
+            if &offset == self {
+                aligned = offset;
+            }
+        }
+
+        Ok(aligned)
+    }
+}
+
+#[cfg(test)]
+mod shift_bound_tests {
+    use super::*;
+
+    // A bound folded out of an end-of-day anchor stays an end-of-day, and on a
+    // dialect keeping microseconds it has to survive being normalised again:
+    // read back as a range start it would lose its sub-second tail, and the
+    // window — whose frame this predicate *is* — would silently widen.
+    #[test]
+    fn an_end_of_day_bound_keeps_its_tail_at_microsecond_precision() {
+        let anchor = QueryDateTimeHelper::format_to_date("2024-01-20", 6).unwrap();
+        assert_eq!(anchor, "2024-01-20T23:59:59.999999");
+
+        let shifted = shift_bound_wall_clock(Tz::UTC, &anchor, &Some("7 day".to_string()), true)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            QueryDateTimeHelper::format_to_date(&shifted, 6).unwrap(),
+            "2024-01-13T23:59:59.999999",
+            "normalised as the anchor was"
+        );
+        assert_eq!(
+            QueryDateTimeHelper::format_from_date(&shifted, 6).unwrap(),
+            "2024-01-13T23:59:59.999000",
+            "normalised as a range start instead, which is what the bug did"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_start_of_accepts_a_midnight_swallowed_by_a_dst_gap() {
+        // Paraguay springs forward at midnight, so 2023-10-01T00:00 does not exist locally and
+        // resolves to 01:00. It is still the first instant of that day, month and quarter.
+        let tz = "America/Asuncion".parse::<Tz>().unwrap();
+        let d = QueryDateTime::from_date_str(tz, "2023-10-01").unwrap();
+
+        assert_eq!(d.default_format(), "2023-10-01T01:00:00.000");
+        assert!(d.is_start_of("day").unwrap());
+        assert!(d.is_start_of("month").unwrap());
+        assert!(d.is_start_of("quarter").unwrap());
+        assert!(!d.is_start_of("year").unwrap());
+    }
+
+    #[test]
+    fn canadian_zones_stay_on_daylight_time_after_2026_11_01() {
+        // tzdb 2026b-2026e cancel the 2026-11-01 fall-back; a stale bundled tzdb is an hour late.
+        for (zone, day, utc) in [
+            ("America/Vancouver", "2026-11-02", "2026-11-02T07:00:00"),
+            ("America/Edmonton", "2026-11-02", "2026-11-02T06:00:00"),
+            ("America/Inuvik", "2026-11-02", "2026-11-02T06:00:00"),
+            ("America/Winnipeg", "2026-11-02", "2026-11-02T05:00:00"),
+            ("America/Vancouver", "2025-11-03", "2025-11-03T08:00:00"),
+        ] {
+            let d = QueryDateTime::from_date_str(zone.parse::<Tz>().unwrap(), day).unwrap();
+            assert_eq!(
+                d.naive_utc().format("%Y-%m-%dT%H:%M:%S").to_string(),
+                utc,
+                "{zone} {day}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_start_of_still_rejects_a_real_time_component() {
+        let tz = "America/Asuncion".parse::<Tz>().unwrap();
+        // 2023-10-02 has an ordinary midnight, so 01:00 on it is genuinely mid-day.
+        let d = QueryDateTime::from_date_str(tz, "2023-10-02T01:00:00").unwrap();
+        assert!(!d.is_start_of("day").unwrap());
+        assert!(d.is_start_of("hour").unwrap());
+    }
+
+    #[test]
+    fn offset_from_start_of_measures_the_local_wall_clock() {
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let d = QueryDateTime::from_date_str(tz, "2024-04-15T06:30:15").unwrap();
+
+        assert_eq!(
+            d.offset_from_start_of("year").unwrap(),
+            SqlInterval::new(0, 0, 3, 0, 14, 6, 30, 15)
+        );
+        assert_eq!(
+            d.offset_from_start_of("quarter").unwrap(),
+            SqlInterval::new(0, 0, 0, 0, 14, 6, 30, 15)
+        );
+        assert_eq!(
+            d.offset_from_start_of("month").unwrap(),
+            SqlInterval::new(0, 0, 0, 0, 14, 6, 30, 15)
+        );
+        // 2024-04-15 is a Monday.
+        assert_eq!(
+            d.offset_from_start_of("week").unwrap(),
+            SqlInterval::new(0, 0, 0, 0, 0, 6, 30, 15)
+        );
+        assert_eq!(
+            d.offset_from_start_of("day").unwrap(),
+            SqlInterval::new(0, 0, 0, 0, 0, 6, 30, 15)
+        );
+        assert_eq!(
+            d.offset_from_start_of("hour").unwrap(),
+            SqlInterval::new(0, 0, 0, 0, 0, 0, 30, 15)
+        );
+        assert_eq!(
+            d.offset_from_start_of("minute").unwrap(),
+            SqlInterval::new(0, 0, 0, 0, 0, 0, 0, 15)
+        );
+    }
+
+    #[test]
+    fn test_parse_date_time() {
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let parsed = QueryDateTime::from_date_str(tz, "2021-01-01").unwrap();
+        assert_eq!(
+            parsed.naive_utc(),
+            NaiveDate::from_ymd_opt(2020, 12, 31)
+                .unwrap()
+                .and_hms_opt(21, 0, 0)
+                .unwrap()
+        );
+
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let parsed = QueryDateTime::from_date_str(tz, "2021-01-01 03:15:20").unwrap();
+
+        assert_eq!(
+            parsed.naive_utc(),
+            NaiveDate::from_ymd_opt(2021, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 15, 20)
+                .unwrap()
+        );
+
+        //Ambiguous time
+        let tz = "America/New_York".parse::<Tz>().unwrap();
+        let parsed = QueryDateTime::from_date_str(tz, "2024-11-03 01:30:00").unwrap();
+        assert_eq!(
+            parsed.date_time().naive_utc(),
+            NaiveDate::from_ymd_opt(2024, 11, 3)
+                .unwrap()
+                .and_hms_opt(5, 30, 0)
+                .unwrap()
+        );
+        //Not exist time
+        let tz = "America/New_York".parse::<Tz>().unwrap();
+        let parsed = QueryDateTime::from_date_str(tz, "2024-03-10 02:30:00").unwrap();
+        assert_eq!(
+            parsed.date_time().naive_utc(),
+            NaiveDate::from_ymd_opt(2024, 3, 10)
+                .unwrap()
+                .and_hms_opt(7, 0, 0)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn test_start_of_year() {
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let date = QueryDateTime::from_date_str(tz, "2024-11-03 01:30:00").unwrap();
+        let start = date.start_of("year").unwrap();
+        assert_eq!(
+            start.date_time().naive_utc(),
+            NaiveDate::from_ymd_opt(2023, 12, 31)
+                .unwrap()
+                .and_hms_opt(21, 0, 0)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn test_add_interval() {
+        let tz = "America/Los_Angeles".parse::<Tz>().unwrap();
+
+        let date = QueryDateTime::from_date_str(tz, "2024-03-10T03:00:00").unwrap();
+        let interval = "1 hour".parse::<SqlInterval>().unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_utc();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 3, 10)
+                .unwrap()
+                .and_hms_opt(11, 0, 0)
+                .unwrap()
+        );
+
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+
+        let date = QueryDateTime::from_date_str(tz, "2024-11-03 01:30:00").unwrap();
+        let interval = "4 hours 2 minutes 10 second"
+            .parse::<SqlInterval>()
+            .unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_utc();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 11, 3)
+                .unwrap()
+                .and_hms_opt(2, 32, 10)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-11-03 01:30:00").unwrap();
+        let interval = "2 hours -2 minutes 10 second"
+            .parse::<SqlInterval>()
+            .unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_utc();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 11, 3)
+                .unwrap()
+                .and_hms_opt(0, 28, 10)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-11-03 4:30:00").unwrap();
+        let interval = "-4 hours -31 minutes 10 second"
+            .parse::<SqlInterval>()
+            .unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_utc();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 11, 2)
+                .unwrap()
+                .and_hms_opt(20, 59, 10)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-02-03 01:30:00").unwrap();
+        let interval = "1 week".parse::<SqlInterval>().unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_local();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 2, 10)
+                .unwrap()
+                .and_hms_opt(1, 30, 0)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-02-03 01:30:00").unwrap();
+        let interval = "1 month 1 week".parse::<SqlInterval>().unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_local();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 3, 10)
+                .unwrap()
+                .and_hms_opt(1, 30, 0)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-02-03 01:30:00").unwrap();
+        let interval = "1 year 1 month 1 week 3 minute"
+            .parse::<SqlInterval>()
+            .unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_local();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2025, 3, 10)
+                .unwrap()
+                .and_hms_opt(1, 33, 0)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-02-03 01:30:00").unwrap();
+        let interval = "11 month 1 week 3 minute".parse::<SqlInterval>().unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_local();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2025, 1, 10)
+                .unwrap()
+                .and_hms_opt(1, 33, 0)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn test_add_interval_age_cases() {
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+
+        let date = QueryDateTime::from_date_str(tz, "2024-01-31 01:30:00").unwrap();
+        let interval = "1 month 3 minute".parse::<SqlInterval>().unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_local();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2024, 2, 29)
+                .unwrap()
+                .and_hms_opt(1, 33, 0)
+                .unwrap()
+        );
+
+        let date = QueryDateTime::from_date_str(tz, "2024-02-29 01:30:00").unwrap();
+        let interval = "1 year 3 minute".parse::<SqlInterval>().unwrap();
+        let result = date.add_interval(&interval).unwrap().naive_local();
+        assert_eq!(
+            result,
+            NaiveDate::from_ymd_opt(2025, 2, 28)
+                .unwrap()
+                .and_hms_opt(1, 33, 0)
+                .unwrap()
+        );
+    }
+    #[test]
+    fn test_align_to_origin() {
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let date = QueryDateTime::from_date_str(tz, "2024-01-31").unwrap();
+        let interval = "1 day".parse::<SqlInterval>().unwrap();
+        let origin = date.start_of("year").unwrap();
+        let result = date.align_to_origin(&origin, &interval).unwrap();
+        assert_eq!(
+            result.naive_local(),
+            NaiveDate::from_ymd_opt(2024, 1, 31)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        );
+
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let date = QueryDateTime::from_date_str(tz, "2024-01-31").unwrap();
+        let interval = "2 day".parse::<SqlInterval>().unwrap();
+        let origin = QueryDateTime::from_date_str(tz, "2024-01-30").unwrap();
+        let result = date.align_to_origin(&origin, &interval).unwrap();
+        assert_eq!(
+            result.naive_local(),
+            NaiveDate::from_ymd_opt(2024, 1, 30)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        );
+        let tz = "Etc/GMT-3".parse::<Tz>().unwrap();
+        let date = QueryDateTime::from_date_str(tz, "2024-01-31").unwrap();
+        let interval = "2 month".parse::<SqlInterval>().unwrap();
+        let origin = QueryDateTime::from_date_str(tz, "2024-05-15").unwrap();
+        let result = date.align_to_origin(&origin, &interval).unwrap();
+        assert_eq!(
+            result.naive_local(),
+            NaiveDate::from_ymd_opt(2024, 1, 15)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        );
+
+        let tz = "America/Los_Angeles".parse::<Tz>().unwrap();
+        let date = QueryDateTime::from_date_str(tz, "2017-01-01T00:10:00").unwrap();
+        let interval = "1 hour".parse::<SqlInterval>().unwrap();
+        let origin = QueryDateTime::from_date_str(tz, "2025-01-01T00:10:00").unwrap();
+        let result = date.align_to_origin(&origin, &interval).unwrap();
+        assert_eq!(
+            result.naive_local(),
+            NaiveDate::from_ymd_opt(2017, 1, 1)
+                .unwrap()
+                .and_hms_opt(0, 10, 0)
+                .unwrap()
+        );
+    }
+}

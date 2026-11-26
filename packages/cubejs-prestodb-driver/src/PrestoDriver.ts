@@ -1,0 +1,514 @@
+/**
+ * @copyright Cube Dev, Inc.
+ * @license Apache-2.0
+ * @fileoverview The `PrestoDriver` and related types declaration.
+ */
+
+import {
+  DownloadQueryResultsOptions, DownloadQueryResultsResult,
+  DriverCapabilities, DriverInterface,
+  QueryOptions,
+  StreamOptions,
+  StreamTableData,
+  TableStructure,
+  BaseDriver,
+  UnloadOptions
+} from '@cubejs-backend/base-driver';
+import {
+  getEnv,
+  assertDataSource,
+  formatAnsi,
+  extractRequestUUID,
+  isValidRequestId,
+} from '@cubejs-backend/shared';
+
+import { Transform, TransformCallback } from 'stream';
+import type { ConnectionOptions as TLSConnectionOptions } from 'tls';
+
+import {
+  map, zipObj, prop, concat
+} from 'ramda';
+
+const presto = require('presto-client');
+
+export type PrestoDriverExportBucket = {
+  exportBucket?: string,
+  bucketType?: 'gcs' | 's3',
+  credentials?: any,
+  accessKeyId?: string,
+  secretAccessKey?: string,
+  exportBucketRegion?: string,
+  exportBucketS3AdvancedFS?: boolean,
+  exportBucketCsvEscapeSymbol?: string,
+};
+
+export type PrestoDriverInternalConfiguration = {
+  engine?: 'presto' | 'trino';
+};
+
+export type PrestoDriverConfiguration = PrestoDriverExportBucket & PrestoDriverInternalConfiguration & {
+  host?: string;
+  port?: string;
+  catalog?: string;
+  schema?: string;
+  user?: string;
+  // eslint-disable-next-line camelcase
+  custom_auth?: string;
+  // eslint-disable-next-line camelcase
+  basic_auth?: { user: string, password: string };
+  ssl?: TLSConnectionOptions;
+  dataSource?: string;
+  queryTimeout?: number;
+  preAggregations?: boolean;
+  useSelectTestConnection?: boolean;
+  // @see https://trino.io/docs/current/develop/client-protocol.html
+  headers?: Record<string, string>;
+  // Session time zone (`X-Presto-Time-Zone` / `X-Trino-Time-Zone`); the coordinator's default is used when unset.
+  timezone?: string;
+};
+
+const SUPPORTED_BUCKET_TYPES = ['gcs', 's3'];
+/**
+ * Presto driver class.
+ */
+export class PrestoDriver extends BaseDriver implements DriverInterface {
+  /**
+   * Returns default concurrency value.
+   */
+  public static getDefaultConcurrency() {
+    return 2;
+  }
+
+  protected readonly config: PrestoDriverConfiguration;
+
+  protected readonly catalog: string | undefined;
+
+  protected client: any;
+
+  protected useSelectTestConnection: boolean;
+
+  private readonly traceTokenHeader: string;
+
+  /**
+   * Class constructor.
+   */
+  public constructor(config: PrestoDriverConfiguration = {}) {
+    super();
+
+    const dataSource =
+      config.dataSource ||
+      assertDataSource('default');
+    const preAggregations = config.preAggregations || false;
+
+    const dbUser = getEnv('dbUser', { dataSource, preAggregations });
+    const dbPassword = getEnv('dbPass', { dataSource, preAggregations });
+    const authToken = getEnv('prestoAuthToken', { dataSource, preAggregations });
+
+    if (authToken && dbPassword) {
+      throw new Error('Both user/password and auth token are set. Please remove password or token.');
+    }
+
+    this.useSelectTestConnection = config.useSelectTestConnection ??
+      getEnv('dbUseSelectTestConnection', { dataSource, preAggregations });
+
+    this.config = {
+      host: getEnv('dbHost', { dataSource, preAggregations }),
+      port: getEnv('dbPort', { dataSource, preAggregations }),
+      catalog:
+        getEnv('prestoCatalog', { dataSource, preAggregations }) ||
+        getEnv('dbCatalog', { dataSource, preAggregations }),
+      schema:
+        getEnv('dbName', { dataSource, preAggregations }) ||
+        getEnv('dbSchema', { dataSource, preAggregations }),
+      user: dbUser,
+      ...(authToken ? { custom_auth: `Bearer ${authToken}` } : {}),
+      ...(dbPassword ? { basic_auth: { user: dbUser, password: dbPassword } } : {}),
+      ssl: this.getSslOptions(dataSource, preAggregations),
+      bucketType: getEnv('dbExportBucketType', { supported: SUPPORTED_BUCKET_TYPES, dataSource, preAggregations }),
+      exportBucket: getEnv('dbExportBucket', { dataSource, preAggregations }),
+      accessKeyId: getEnv('dbExportBucketAwsKey', { dataSource, preAggregations }),
+      secretAccessKey: getEnv('dbExportBucketAwsSecret', { dataSource, preAggregations }),
+      exportBucketRegion: getEnv('dbExportBucketAwsRegion', { dataSource, preAggregations }),
+      credentials: getEnv('dbExportGCSCredentials', { dataSource, preAggregations }),
+      queryTimeout: getEnv('dbQueryTimeout', { dataSource, preAggregations }),
+      ...config
+    };
+    this.catalog = this.config.catalog;
+    this.traceTokenHeader = this.config.engine === 'trino' ? 'X-Trino-Trace-Token' : 'X-Presto-Trace-Token';
+    this.client = new presto.Client({
+      timeout: this.config.queryTimeout,
+      engine: 'presto',
+      ...this.config,
+    });
+
+    this.applyCustomHeadersToAllRequests(this.client);
+  }
+
+  /**
+   * https://github.com/tagomoris/presto-client-node/pull/97
+   *
+   * Reason for monkey patching:
+   *
+   * The underlying `presto-client` only applies custom headers to the initial
+   * `POST /v1/statement` request. The follow-up `nextUri` GET polls (and the
+   * cancel/kill/node requests) are issued with a fresh, empty header set.
+   */
+  protected applyCustomHeadersToAllRequests(client: any) {
+    const customHeaders = this.config.headers;
+    if (!customHeaders || Object.keys(customHeaders).length === 0) {
+      return;
+    }
+
+    // `request` lives on the prototype; capture it before shadowing it on the instance.
+    const originalRequest = client.request;
+
+    client.request = function patchedRequest(opts: any, callback: any) {
+      if (typeof opts === 'string') {
+        // `opts` is a `nextUri` URL string. The upstream client rebuilds GET
+        // options from it with empty headers, dropping our custom headers. We
+        // recreate those options ourselves (seeded with the custom headers) and
+        // invoke the original `request` with a client "view" whose host/port/
+        // protocol point at the `nextUri` target. The original object branch
+        // otherwise forces the client's configured host, so the view preserves
+        // upstream's host-following behaviour.
+        let href;
+
+        try {
+          href = new URL(opts);
+        } catch (error) {
+          return callback(error);
+        }
+
+        const view = Object.create(this);
+        view.host = href.hostname;
+        view.port = href.port || (href.protocol === 'https:' ? '443' : '80');
+        view.protocol = href.protocol;
+
+        return originalRequest.call(view, {
+          method: 'GET',
+          path: href.pathname + href.search,
+          headers: { ...customHeaders },
+        }, callback);
+      }
+
+      // Object form (POST /v1/statement, DELETE cancel/kill, node list, ...).
+      // Merge in the custom headers, letting any explicitly-provided headers win.
+      opts.headers = { ...customHeaders, ...(opts.headers || {}) };
+      return originalRequest.call(this, opts, callback);
+    };
+  }
+
+  public async testConnection(): Promise<void> {
+    if (this.useSelectTestConnection) {
+      return this.testConnectionViaSelect();
+    }
+
+    return new Promise((resolve, reject) => {
+      // Get node list of presto cluster and return it.
+      // @see https://prestodb.io/docs/current/rest/node.html
+      this.client.nodes(null, (error: any, _result: any[]) => {
+        if (error) {
+          reject(error);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  protected async testConnectionViaSelect() {
+    await this.queryPromised('SELECT 1', false);
+  }
+
+  public query(query: string, values: unknown[], options?: QueryOptions): Promise<any[]> {
+    return <Promise<any[]>> this.queryPromised(this.prepareQueryWithParams(query, values), false, options?.requestId);
+  }
+
+  protected prepareQueryWithParams(query: string, values: unknown[]) {
+    return formatAnsi(query, values || []);
+  }
+
+  public queryPromised(query: string, streaming: boolean, requestId?: string): Promise<any[] | StreamTableData> {
+    const traceToken = requestId && extractRequestUUID(requestId);
+    const headers = traceToken && isValidRequestId(traceToken)
+      ? { ...this.config.headers, [this.traceTokenHeader]: traceToken }
+      : this.config.headers;
+    const toError = (error: any) => new Error(error.error ? `${error.message}\n${error.error}` : error.message);
+    if (streaming) {
+      const rowStream = new Transform({
+        writableObjectMode: true,
+        readableObjectMode: true,
+
+        transform(obj: any, encoding: string, callback: TransformCallback) {
+          callback(null, obj);
+        }
+      });
+
+      return new Promise((resolve, reject) => {
+        this.client.execute({
+          query,
+          schema: this.config.schema || 'default',
+          timezone: this.config.timezone,
+          headers,
+          session: this.config.queryTimeout ? `query_max_run_time=${this.config.queryTimeout}s` : undefined,
+          columns: (error: any, columns: TableStructure) => {
+            resolve({
+              rowStream,
+              types: columns
+            });
+          },
+          data: (error: any, data: any[], columns: TableStructure) => {
+            const normalData = this.normalizeResultOverColumns(data, columns);
+
+            for (const obj of normalData) {
+              rowStream.write(obj);
+            }
+          },
+          success: () => {
+            rowStream.end();
+          },
+          error: (error: any) => {
+            reject(toError(error));
+          }
+        });
+      });
+    } else {
+      return new Promise((resolve, reject) => {
+        let fullData: any[] = [];
+
+        this.client.execute({
+          query,
+          schema: this.config.schema || 'default',
+          timezone: this.config.timezone,
+          headers,
+          data: (error: any, data: any[], columns: TableStructure) => {
+            const normalData = this.normalizeResultOverColumns(data, columns);
+            fullData = concat(normalData, fullData);
+          },
+          success: () => {
+            resolve(fullData);
+          },
+          error: (error: any) => {
+            reject(toError(error));
+          }
+        });
+      });
+    }
+  }
+
+  public downloadQueryResults(query: string, values: unknown[], options: DownloadQueryResultsOptions): Promise<DownloadQueryResultsResult> {
+    if (options.streamImport) {
+      return <Promise<DownloadQueryResultsResult>> this.stream(query, values, options);
+    }
+    return super.downloadQueryResults(query, values, options);
+  }
+
+  protected override informationSchemaQuery() {
+    const catalogPrefix = this.catalog ? `${this.catalog}.` : '';
+    const schemaFilter = this.config.schema ? ` AND columns.table_schema = '${this.config.schema}'` : '';
+
+    return `
+      SELECT columns.column_name as ${this.quoteIdentifier('column_name')},
+             columns.table_name as ${this.quoteIdentifier('table_name')},
+             columns.table_schema as ${this.quoteIdentifier('table_schema')},
+             columns.data_type as ${this.quoteIdentifier('data_type')}
+      FROM ${catalogPrefix}information_schema.columns
+      WHERE columns.table_schema NOT IN ('pg_catalog', 'information_schema', 'mysql', 'performance_schema', 'sys', 'INFORMATION_SCHEMA')${schemaFilter}
+   `;
+  }
+
+  protected override getSchemasQuery() {
+    const catalogPrefix = this.catalog ? `${this.catalog}.` : '';
+
+    return `
+      SELECT table_schema as ${this.quoteIdentifier('schema_name')}
+      FROM ${catalogPrefix}information_schema.tables
+      WHERE table_schema NOT IN ('pg_catalog', 'information_schema', 'mysql', 'performance_schema', 'sys', 'INFORMATION_SCHEMA')
+      GROUP BY table_schema
+    `;
+  }
+
+  protected override getTablesForSpecificSchemasQuery(schemasPlaceholders: string) {
+    const catalogPrefix = this.catalog ? `${this.catalog}.` : '';
+
+    const query = `
+      SELECT table_schema as ${this.quoteIdentifier('schema_name')},
+            table_name as ${this.quoteIdentifier('table_name')}
+      FROM ${catalogPrefix}information_schema.tables as columns
+      WHERE table_schema IN (${schemasPlaceholders})
+    `;
+    return query;
+  }
+
+  protected override getColumnsForSpecificTablesQuery(conditionString: string) {
+    const catalogPrefix = this.catalog ? `${this.catalog}.` : '';
+
+    const query = `
+      SELECT columns.column_name as ${this.quoteIdentifier('column_name')},
+             columns.table_name as ${this.quoteIdentifier('table_name')},
+             columns.table_schema as ${this.quoteIdentifier('schema_name')},
+             columns.data_type as ${this.quoteIdentifier('data_type')}
+      FROM ${catalogPrefix}information_schema.columns as columns
+      WHERE ${conditionString}
+    `;
+
+    return query;
+  }
+
+  public normalizeResultOverColumns(data: any[], columns: TableStructure) {
+    const columnNames = map(prop('name'), columns || []);
+    const arrayToObject = zipObj(columnNames);
+    return map(arrayToObject, data || []);
+  }
+
+  public stream(query: string, values: unknown[], options: StreamOptions): Promise<StreamTableData> {
+    const queryWithParams = this.prepareQueryWithParams(query, values);
+
+    return <Promise<StreamTableData>> this.queryPromised(queryWithParams, true, options?.requestId);
+  }
+
+  public capabilities(): DriverCapabilities {
+    return {
+      unloadWithoutTempTable: true
+    };
+  }
+
+  public async createSchemaIfNotExists(schemaName: string) {
+    await this.query(
+      `CREATE SCHEMA IF NOT EXISTS ${this.config.catalog}.${schemaName}`,
+      [],
+    );
+  }
+
+  // Export bucket methods
+  public async isUnloadSupported() {
+    return this.config.exportBucket !== undefined;
+  }
+
+  public async unload(tableName: string, options: UnloadOptions) {
+    if (!this.config.exportBucket) {
+      throw new Error('Export bucket is not configured.');
+    }
+
+    if (!SUPPORTED_BUCKET_TYPES.includes(this.config.bucketType as string)) {
+      throw new Error(`Unsupported export bucket type: ${this.config.bucketType}`);
+    }
+
+    const types = options.query
+      ? await this.unloadWithSql(tableName, options.query.sql, options.query.params, options.requestId)
+      : await this.unloadWithTable(tableName, options.requestId);
+
+    const csvFile = await this.getCsvFiles(tableName);
+
+    return {
+      exportBucketCsvEscapeSymbol: this.config.exportBucketCsvEscapeSymbol,
+      csvFile,
+      types,
+      csvNoHeader: true,
+    };
+  }
+
+  private splitTableFullName(tableFullName: string) {
+    const [schema, tableName] = tableFullName.split('.');
+    return { schema, tableName };
+  }
+
+  private generateTableColumnsForExport(types: { name: string, type: string }[]) {
+    return types.map((c) => `CAST(${c.name} AS varchar) ${c.name}`).join(', ');
+  }
+
+  private async unloadWithSql(tableFullName: string, sql: string, params: any[], requestId?: string) {
+    return this.unloadGeneric({
+      tableFullName,
+      typeSql: sql,
+      typeParams: params,
+      fromSql: sql,
+      fromParams: params,
+      requestId,
+    });
+  }
+
+  private async unloadWithTable(tableFullName: string, requestId?: string) {
+    return this.unloadGeneric({
+      tableFullName,
+      typeSql: `SELECT * FROM ${tableFullName}`,
+      typeParams: [],
+      fromSql: tableFullName,
+      fromParams: [],
+      requestId,
+    });
+  }
+
+  private async unloadGeneric(params: { tableFullName: string, typeSql: string, typeParams: any[], fromSql: string, fromParams: any[], requestId?: string }) {
+    if (!this.config.exportBucket) {
+      throw new Error('Export bucket is not configured.');
+    }
+
+    const { bucketType, exportBucket } = this.config;
+    const { requestId } = params;
+    const types = await this.queryColumnTypes(params.typeSql, params.typeParams, { requestId });
+
+    const { schema, tableName } = this.splitTableFullName(params.tableFullName);
+    const tableWithCatalogAndSchema = `${this.config.catalog}.${schema}.${tableName}`;
+
+    const protocol = {
+      gcs: 'gs',
+      s3: this.config.exportBucketS3AdvancedFS ? 's3a' : 's3'
+    }[bucketType || 'gcs'];
+
+    const externalLocation = `${protocol}://${exportBucket}/${schema}/${tableName}`;
+    const withParams = `( external_location = '${externalLocation}', format = 'CSV')`;
+    const select = `SELECT ${this.generateTableColumnsForExport(types)} FROM (${params.fromSql})`;
+    const createTableQuery = `CREATE TABLE ${tableWithCatalogAndSchema} WITH ${withParams} AS (${select})`;
+
+    try {
+      await this.query(
+        createTableQuery,
+        params.fromParams,
+        { requestId },
+      );
+    } finally {
+      await this.query(`DROP TABLE IF EXISTS ${tableWithCatalogAndSchema}`, [], { requestId });
+    }
+
+    return types;
+  }
+
+  public async queryColumnTypes(sql: string, params: unknown[], options?: QueryOptions): Promise<{ name: string; type: string; }[]> {
+    const response = await this.stream(`${sql} LIMIT 0`, params || [], { highWaterMark: 1, requestId: options?.requestId });
+    const result = [];
+
+    for (const column of response.types || []) {
+      result.push({ name: column.name, type: this.toGenericType(column.type) });
+    }
+    return result;
+  }
+
+  private async getCsvFiles(
+    tableFullName: string,
+  ): Promise<string[]> {
+    if (!this.config.exportBucket) {
+      throw new Error('Export bucket is not configured.');
+    }
+    const { bucketType, exportBucket } = this.config;
+    const { schema, tableName } = this.splitTableFullName(tableFullName);
+
+    switch (bucketType) {
+      case 'gcs':
+        return this.extractFilesFromGCS({ credentials: this.config.credentials }, exportBucket, `${schema}/${tableName}`);
+      case 's3':
+        return this.extractUnloadedFilesFromS3({
+          credentials: this.config.accessKeyId && this.config.secretAccessKey
+            ? {
+              accessKeyId: this.config.accessKeyId,
+              secretAccessKey: this.config.secretAccessKey,
+            }
+            : undefined,
+          region: this.config.exportBucketRegion,
+        },
+        exportBucket, `${schema}/${tableName}`);
+      default:
+        throw new Error(`Unsupported export bucket type: ${bucketType}`);
+    }
+  }
+}
